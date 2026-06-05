@@ -1,0 +1,10 @@
+Flask>=3.0.0
+Flask-CORS>=4.0.0
+werkzeug>=3.0.0
+soundfile>=0.12.1
+textgrid>=1.5
+numpy>=2.0.0
+librosa>=0.10.0
+pypinyin>=0.50.0
+g2p-en>=2.1.0
+montreal-forced-aligner>=2.0.0
