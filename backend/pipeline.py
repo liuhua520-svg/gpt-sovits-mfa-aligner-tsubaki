@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from mfa_processor import MFAProcessor
-from tsubaki_processor import TsubakiProcessor
+from tsubaki_processor import TsubakiProcessor, AudioProcessingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,7 @@ class AudioProcessingPipeline:
         self.work_dir.mkdir(parents=True, exist_ok=True)
         
         self.mfa_processor = MFAProcessor()
-        self.tsubaki_processor = TsubakiProcessor(str(self.work_dir / "projects"))
+        self.tsubaki_processor = TsubakiProcessor(str(self.work_dir))
         
         logger.info(f"✓ 处理流程初始化，工作目录: {self.work_dir}")
 
@@ -46,7 +46,15 @@ class AudioProcessingPipeline:
         text: str,
         language: str = "cmn",
         output_format: str = "sv",
-        project_title: str = "Project"
+        project_title: str = "Project",
+        bpm: float = 120.0,
+        base_pitch: int = 60,
+        f0_method: str = 'dio',
+        f0_smooth: bool = True,
+        f0_smooth_window: int = 5,
+        use_double_precision: bool = False,
+        f0_floor: float = 71.0,
+        f0_ceil: float = 800.0,
     ) -> Dict:
         """
         完整处理流程
@@ -57,6 +65,14 @@ class AudioProcessingPipeline:
             language: 语言代码
             output_format: 输出工程格式 ('sv' 或 'utau')
             project_title: 工程文件标题
+            bpm: 每分钟节拍数
+            base_pitch: 基准音高（MIDI note）
+            f0_method: F0 提取方法 ('dio' 或 'harvest')
+            f0_smooth: 是否平滑 F0
+            f0_smooth_window: 平滑窗口大小
+            use_double_precision: 是否使用双精度浮点数
+            f0_floor: 最低 F0（Hz）
+            f0_ceil: 最高 F0（Hz）
             
         Returns:
             处理结果字典，包含:
@@ -120,7 +136,18 @@ class AudioProcessingPipeline:
             # 步骤 2: 音高提取
             logger.info("[ 步骤 2/3 ] 音高提取...")
             try:
-                audio_data = self.tsubaki_processor.process_audio_f0(wav_path, method='dio')
+                # 构建配置对象
+                config = AudioProcessingConfig(
+                    bpm=bpm,
+                    base_pitch=base_pitch,
+                    f0_floor=f0_floor,
+                    f0_ceil=f0_ceil,
+                    f0_method=f0_method,
+                    f0_smooth=f0_smooth,
+                    f0_smooth_window=f0_smooth_window,
+                    use_double_precision=use_double_precision,
+                )
+                audio_data = self.tsubaki_processor.process_audio_f0(wav_path, config)
                 if not audio_data:
                     logger.warning("⚠ F0 提取失败或 PyWORLD 未安装，继续处理")
             except Exception as e:
@@ -131,11 +158,24 @@ class AudioProcessingPipeline:
             # 步骤 3: 工程文件生成
             logger.info(f"[ 步骤 3/3 ] 生成 {output_format.upper()} 工程文件...")
             
+            # 构建配置对象
+            config = AudioProcessingConfig(
+                bpm=bpm,
+                base_pitch=base_pitch,
+                f0_floor=f0_floor,
+                f0_ceil=f0_ceil,
+                f0_method=f0_method,
+                f0_smooth=f0_smooth,
+                f0_smooth_window=f0_smooth_window,
+                use_double_precision=use_double_precision,
+            )
+            
             project_result = self.tsubaki_processor.process_full_pipeline(
                 wav_path=wav_path,
                 lab_path=lab_path,
                 output_format=output_format,
-                project_title=project_title
+                project_title=project_title,
+                config=config
             )
             
             if not project_result.get("success"):
@@ -169,6 +209,7 @@ class AudioProcessingPipeline:
                 'project_format': output_format,
                 'segments': project_result.get('segments', 0),
                 'processing_time': processing_time,
+                'config': config.to_dict(),
                 'message': f'完整处理完成: {project_result.get("segments", 0)} 个标注段'
             }
             
@@ -242,7 +283,15 @@ class AudioProcessingPipeline:
         wav_path: str,
         lab_path: str,
         output_format: str = "sv",
-        project_title: str = "Project"
+        project_title: str = "Project",
+        bpm: float = 120.0,
+        base_pitch: int = 60,
+        f0_method: str = 'dio',
+        f0_smooth: bool = True,
+        f0_smooth_window: int = 5,
+        use_double_precision: bool = False,
+        f0_floor: float = 71.0,
+        f0_ceil: float = 800.0,
     ) -> Dict:
         """
         仅执行工程文件生成（已有 WAV 和 LAB）
@@ -252,6 +301,14 @@ class AudioProcessingPipeline:
             lab_path: LAB 标注文件路径
             output_format: 输出格式
             project_title: 工程标题
+            bpm: 每分钟节拍数
+            base_pitch: 基准音高（MIDI note）
+            f0_method: F0 提取方法
+            f0_smooth: 是否平滑 F0
+            f0_smooth_window: 平滑窗口大小
+            use_double_precision: 是否使用双精度
+            f0_floor: 最低 F0（Hz）
+            f0_ceil: 最高 F0（Hz）
             
         Returns:
             工程文件生成结果
@@ -265,11 +322,23 @@ class AudioProcessingPipeline:
             logger.info(f"  标注: {lab_path}")
             logger.info(f"  格式: {output_format}")
             
+            config = AudioProcessingConfig(
+                bpm=bpm,
+                base_pitch=base_pitch,
+                f0_floor=f0_floor,
+                f0_ceil=f0_ceil,
+                f0_method=f0_method,
+                f0_smooth=f0_smooth,
+                f0_smooth_window=f0_smooth_window,
+                use_double_precision=use_double_precision,
+            )
+            
             result = self.tsubaki_processor.process_full_pipeline(
                 wav_path=wav_path,
                 lab_path=lab_path,
                 output_format=output_format,
-                project_title=project_title
+                project_title=project_title,
+                config=config
             )
             
             result['processing_time'] = int((time.time() - start_time) * 1000)
@@ -286,7 +355,12 @@ class AudioProcessingPipeline:
     def process_f0_only(
         self,
         wav_path: str,
-        method: str = 'dio'
+        method: str = 'dio',
+        f0_floor: float = 71.0,
+        f0_ceil: float = 800.0,
+        f0_smooth: bool = True,
+        f0_smooth_window: int = 5,
+        use_double_precision: bool = False,
     ) -> Dict:
         """
         仅执行 F0 提取
@@ -294,6 +368,11 @@ class AudioProcessingPipeline:
         Args:
             wav_path: 音频文件路径
             method: 提取方法 ('dio' 或 'harvest')
+            f0_floor: 最低 F0（Hz）
+            f0_ceil: 最高 F0（Hz）
+            f0_smooth: 是否平滑 F0
+            f0_smooth_window: 平滑窗口大小
+            use_double_precision: 是否使用双精度
             
         Returns:
             F0 提取结果
@@ -304,7 +383,16 @@ class AudioProcessingPipeline:
         try:
             logger.info("[ F0 模式 ] 提取音高")
             
-            audio_data = self.tsubaki_processor.process_audio_f0(wav_path, method=method)
+            config = AudioProcessingConfig(
+                f0_method=method,
+                f0_floor=f0_floor,
+                f0_ceil=f0_ceil,
+                f0_smooth=f0_smooth,
+                f0_smooth_window=f0_smooth_window,
+                use_double_precision=use_double_precision,
+            )
+            
+            audio_data = self.tsubaki_processor.process_audio_f0(wav_path, config)
             
             if audio_data:
                 logger.info(f"✓ F0 提取完成")

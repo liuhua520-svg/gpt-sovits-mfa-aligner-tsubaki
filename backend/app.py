@@ -103,7 +103,7 @@ def health():
     return jsonify({
         "status": "ok",
         "version": "2.0.0",
-        "app": "GPT-SOVITS MFA Aligner with Audio Processing"
+        "app": "Audio Processing Aligner with MFA + PyWORLD"
     }), 200
 
 
@@ -237,8 +237,18 @@ def pipeline_full_process():
         audio_file = request.files["audio_file"]
         text = request.form.get("text", "").strip()
         language = request.form.get("language", "cmn")
-        output_format = request.form.get("format", "sv")  # sv 或 utau
+        output_format = request.form.get("format", "sv")
         project_title = request.form.get("title", "Project")
+
+        # 获取高级处理配置
+        bpm = float(request.form.get("bpm", 120))
+        base_pitch = int(request.form.get("base_pitch", 60))
+        f0_method = request.form.get("f0_method", "dio")
+        f0_smooth = request.form.get("f0_smooth", "true").lower() == "true"
+        f0_smooth_window = int(request.form.get("f0_smooth_window", 5))
+        use_double_precision = request.form.get("precision", "single").lower() == "double"
+        f0_floor = float(request.form.get("f0_floor", 71.0))
+        f0_ceil = float(request.form.get("f0_ceil", 800.0))
 
         if not audio_file or not text:
             return jsonify({"error": "输入无效"}), 400
@@ -255,7 +265,15 @@ def pipeline_full_process():
             text=text,
             language=language,
             output_format=output_format,
-            project_title=project_title
+            project_title=project_title,
+            bpm=bpm,
+            base_pitch=base_pitch,
+            f0_method=f0_method,
+            f0_smooth=f0_smooth,
+            f0_smooth_window=f0_smooth_window,
+            use_double_precision=use_double_precision,
+            f0_floor=f0_floor,
+            f0_ceil=f0_ceil,
         )
 
         if result.get("success"):
@@ -463,23 +481,44 @@ def list_work_dir_files():
 def download_work_file(filename: str):
     """下载工作目录中的文件"""
     try:
-        file_path = WORK_DIR / filename
+        # 获取文件的相对路径和名称
+        filename = filename.replace('\\', '/')  # 规范化路径分隔符
         
-        # 安全检查：确保不能访问目录外的文件
-        if not str(file_path).startswith(str(WORK_DIR)):
-            return jsonify({"error": "无权访问该文件"}), 403
+        # 提取最后的文件名
+        basename = filename.split('/')[-1]
+        
+        # 构造完整路径
+        if 'projects' in filename:
+            # 来自 projects 子目录
+            file_path = WORK_DIR / 'projects' / basename
+        else:
+            # 来自工作目录
+            file_path = WORK_DIR / basename
+        
+        logger.info(f"下载请求: {filename} -> {file_path}")
+        
+        # 安全检查
+        try:
+            file_path = file_path.resolve()
+            work_dir_resolved = (WORK_DIR).resolve()
+            
+            if not str(file_path).startswith(str(work_dir_resolved)):
+                return jsonify({"error": "无权访问该文件"}), 403
+        except ValueError:
+            return jsonify({"error": "路径错误"}), 400
         
         if not file_path.exists():
-            return jsonify({"error": "文件不存在"}), 404
+            logger.error(f"文件不存在: {file_path}")
+            return jsonify({"error": f"文件不存在: {file_path}"}), 404
         
         if not file_path.is_file():
             return jsonify({"error": "不是文件"}), 400
         
-        logger.info(f"下载文件: {file_path}")
-        return send_from_directory(str(WORK_DIR), filename, as_attachment=True)
+        logger.info(f"下载文件成功: {file_path}")
+        return send_from_directory(str(file_path.parent), file_path.name, as_attachment=True)
         
     except Exception as e:
-        logger.error("下载文件失败: %s", e, exc_info=True)
+        logger.error(f"下载文件失败: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
@@ -518,7 +557,7 @@ def open_browser(host: str, port: int):
 
 def main(host: str = "127.0.0.1", port: int = 5000):
     print(f"\n{'=' * 60}")
-    print("🚀 启动 GPT-SOVITS MFA Aligner with Audio Processing")
+    print("🚀 启动 Audio Processing Aligner with MFA + PyWORLD")
     print(f"📍 访问地址: http://{host}:{port}")
     print(f"📂 工作目录: {WORK_DIR}")
     print(f"📂 前端目录: {FRONTEND_DIST}")

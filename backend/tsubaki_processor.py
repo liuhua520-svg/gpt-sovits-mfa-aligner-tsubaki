@@ -40,6 +40,42 @@ class LabelSegment:
     label: str
 
 
+@dataclass
+class AudioProcessingConfig:
+    """音频处理配置"""
+    # 基本参数
+    bpm: float = 120.0  # 每分钟节拍数
+    base_pitch: int = 60  # 基准音高（MIDI note）
+    
+    # F0 提取参数
+    f0_floor: float = 71.0      # 最低 F0（Hz）
+    f0_ceil: float = 800.0      # 最高 F0（Hz）
+    f0_method: str = 'dio'      # 'dio' 或 'harvest'
+    
+    # F0 细化参数
+    f0_smooth: bool = True      # 是否平滑 F0
+    f0_smooth_window: int = 5   # 平滑窗口大小
+    
+    # 精度设置
+    use_double_precision: bool = False  # 使用双精度浮点数
+    
+    # 大音频处理
+    chunk_size: int = 30 * 60 * 48000  # 30秒音频块大小（48kHz采样率）
+    
+    def to_dict(self) -> Dict:
+        """转换为字典"""
+        return {
+            'bpm': self.bpm,
+            'base_pitch': self.base_pitch,
+            'f0_floor': self.f0_floor,
+            'f0_ceil': self.f0_ceil,
+            'f0_method': self.f0_method,
+            'f0_smooth': self.f0_smooth,
+            'f0_smooth_window': self.f0_smooth_window,
+            'use_double_precision': self.use_double_precision,
+        }
+
+
 class TsubakiProcessor:
     """
     标注和音高处理器
@@ -48,6 +84,7 @@ class TsubakiProcessor:
     - 音频 F0 提取（使用 PyWORLD）
     - LAB 标注文件解析
     - 工程文件生成（Synthesizer V / OpenUtau 格式）
+    - 高级音频处理选项
     """
 
     # 支持的输出格式
@@ -56,7 +93,7 @@ class TsubakiProcessor:
         'utau': 'OpenUtau/UTAU',
     }
 
-    # WORLD 声码器参数
+    # WORLD 声码器默认参数
     WORLD_PARAMS = {
         'f0_floor': 71.0,      # 最低 F0（Hz）
         'f0_ceil': 800.0,      # 最高 F0（Hz）
@@ -79,14 +116,14 @@ class TsubakiProcessor:
     def process_audio_f0(
         self, 
         wav_path: str,
-        method: str = 'dio'
+        config: Optional[AudioProcessingConfig] = None
     ) -> Dict[str, np.ndarray]:
         """
         提取音频的基频（F0）
         
         Args:
             wav_path: 音频文件路径
-            method: 提取方法 ('dio' 或 'harvest')
+            config: 处理配置
             
         Returns:
             包含 f0、t（时间）、sp（频谱包络）、ap（非周期性）的字典
@@ -94,6 +131,9 @@ class TsubakiProcessor:
         if pw is None:
             logger.error("PyWORLD 未安装，无法提取 F0")
             return {}
+
+        if config is None:
+            config = AudioProcessingConfig()
 
         try:
             # 读取音频
@@ -103,26 +143,41 @@ class TsubakiProcessor:
             if audio.ndim > 1:
                 audio = np.mean(audio, axis=1)
             
-            audio = audio.astype(np.float64)
-            logger.info(f"✓ 加载音频: {wav_path} ({sr}Hz, {len(audio)} samples)")
+            # 精度设置
+            if config.use_double_precision:
+                audio = audio.astype(np.float64)
+            else:
+                audio = audio.astype(np.float32)
+            
+            logger.info(f"✓ 加载音频: {wav_path} ({sr}Hz, {len(audio)} samples, 精度: {'双' if config.use_double_precision else '单'})")
+            
+            # 处理大音频（分块）
+            if len(audio) > config.chunk_size:
+                logger.info(f"⚠ 检测到大音频，使用分块处理")
+                return self._process_large_audio(audio, sr, config)
             
             # 提取 F0
-            if method == 'harvest':
+            if config.f0_method == 'harvest':
                 _f0, t = pw.harvest(
                     audio, sr,
-                    f0_floor=self.WORLD_PARAMS['f0_floor'],
-                    f0_ceil=self.WORLD_PARAMS['f0_ceil']
+                    f0_floor=config.f0_floor,
+                    f0_ceil=config.f0_ceil
                 )
             else:  # dio (default)
                 _f0, t = pw.dio(
                     audio, sr,
-                    f0_floor=self.WORLD_PARAMS['f0_floor'],
-                    f0_ceil=self.WORLD_PARAMS['f0_ceil']
+                    f0_floor=config.f0_floor,
+                    f0_ceil=config.f0_ceil
                 )
             
             # 细化 F0
             f0 = pw.stonemask(audio, _f0, t, sr)
-            logger.info(f"✓ F0 提取完成 ({method}): {len(f0)} 帧")
+            logger.info(f"✓ F0 提取完成 ({config.f0_method}): {len(f0)} 帧")
+            
+            # F0 平滑处理
+            if config.f0_smooth:
+                f0 = self._smooth_f0(f0, config.f0_smooth_window)
+                logger.info(f"✓ F0 平滑完成（窗口大小: {config.f0_smooth_window}）")
             
             # 提取频谱参数
             sp = pw.cheaptrick(audio, f0, t, sr)
@@ -136,11 +191,120 @@ class TsubakiProcessor:
                 'ap': ap,
                 'sr': sr,
                 'audio': audio,
+                'config': config,
             }
             
         except Exception as e:
             logger.error(f"✗ F0 提取失败: {e}", exc_info=True)
             return {}
+
+    def _process_large_audio(
+        self,
+        audio: np.ndarray,
+        sr: int,
+        config: AudioProcessingConfig
+    ) -> Dict[str, np.ndarray]:
+        """
+        处理大音频文件（分块处理）
+        
+        Args:
+            audio: 音频数据
+            sr: 采样率
+            config: 处理配置
+            
+        Returns:
+            处理结果
+        """
+        chunk_samples = config.chunk_size
+        hop_samples = chunk_samples // 2  # 50% 重叠
+        
+        f0_list = []
+        t_list = []
+        sp_list = []
+        ap_list = []
+        
+        time_offset = 0
+        
+        for i in range(0, len(audio), hop_samples):
+            if i + chunk_samples > len(audio):
+                chunk = audio[i:]
+            else:
+                chunk = audio[i:i + chunk_samples]
+            
+            logger.info(f"  处理音频块 {i // hop_samples + 1}: [{i} - {i + len(chunk)}]")
+            
+            # 提取该块的 F0
+            if config.f0_method == 'harvest':
+                _f0, t = pw.harvest(
+                    chunk, sr,
+                    f0_floor=config.f0_floor,
+                    f0_ceil=config.f0_ceil
+                )
+            else:
+                _f0, t = pw.dio(
+                    chunk, sr,
+                    f0_floor=config.f0_floor,
+                    f0_ceil=config.f0_ceil
+                )
+            
+            f0 = pw.stonemask(chunk, _f0, t, sr)
+            sp = pw.cheaptrick(chunk, f0, t, sr)
+            ap = pw.d4c(chunk, f0, t, sr)
+            
+            # 时间偏移调整
+            t = t + (i / sr)
+            
+            f0_list.append(f0)
+            t_list.append(t)
+            sp_list.append(sp)
+            ap_list.append(ap)
+        
+        # 合并结果
+        f0 = np.concatenate(f0_list)
+        t = np.concatenate(t_list)
+        sp = np.concatenate(sp_list, axis=0)
+        ap = np.concatenate(ap_list, axis=0)
+        
+        logger.info(f"✓ 大音频处理完成: {len(f0)} 帧")
+        
+        return {
+            'f0': f0,
+            't': t,
+            'sp': sp,
+            'ap': ap,
+            'sr': sr,
+            'audio': audio,
+            'config': config,
+        }
+
+    @staticmethod
+    def _smooth_f0(
+        f0: np.ndarray,
+        window_size: int = 5
+    ) -> np.ndarray:
+        """
+        平滑 F0 曲线
+        
+        Args:
+            f0: F0 数据
+            window_size: 平滑窗口大小
+            
+        Returns:
+            平滑后的 F0
+        """
+        from scipy.signal import medfilt
+        
+        # 只平滑有效的 F0 值（非零）
+        voiced = f0 > 0
+        
+        if np.sum(voiced) == 0:
+            return f0
+        
+        # 中值滤波平滑
+        f0_smooth = f0.copy()
+        f0_smooth[voiced] = medfilt(f0[voiced], kernel_size=window_size if window_size % 2 == 1 else window_size + 1)
+        
+        return f0_smooth
 
     def parse_lab_file(self, lab_path: str) -> List[LabelSegment]:
         """
@@ -190,7 +354,8 @@ class TsubakiProcessor:
         wav_path: str,
         lab_path: str,
         output_path: str,
-        project_title: str = "Project"
+        project_title: str = "Project",
+        config: Optional[AudioProcessingConfig] = None
     ) -> Dict:
         """
         生成 Synthesizer V Studio 工程文件
@@ -200,13 +365,17 @@ class TsubakiProcessor:
             lab_path: LAB 标注文件路径
             output_path: 输出文件路径 (.ustx)
             project_title: 工程标题
+            config: 处理配置
             
         Returns:
             处理结果字典
         """
+        if config is None:
+            config = AudioProcessingConfig()
+
         try:
             # 提取音频 F0
-            audio_data = self.process_audio_f0(wav_path, method='dio')
+            audio_data = self.process_audio_f0(wav_path, config)
             if not audio_data:
                 return {'success': False, 'error': 'F0 提取失败'}
             
@@ -219,10 +388,9 @@ class TsubakiProcessor:
             t = audio_data['t']
             sr = audio_data['sr']
             
-            # ★ 生成基本 USTx 格式（简化版）
-            # 完整 USTx 需要 XML 格式，这里生成可导入的基础数据
+            # 生成基本 USTx 格式
             project_xml = self._build_sv_project_xml(
-                project_title, segments, f0, t, sr, wav_path
+                project_title, segments, f0, t, sr, wav_path, config
             )
             
             # 保存文件
@@ -236,6 +404,7 @@ class TsubakiProcessor:
                 'format': 'sv',
                 'output_path': output_path,
                 'segments': len(segments),
+                'config': config.to_dict(),
                 'message': f'生成 Synthesizer V 工程文件: {len(segments)} 个标注段'
             }
             
@@ -248,7 +417,8 @@ class TsubakiProcessor:
         wav_path: str,
         lab_path: str,
         output_path: str,
-        project_title: str = "Project"
+        project_title: str = "Project",
+        config: Optional[AudioProcessingConfig] = None
     ) -> Dict:
         """
         生成 OpenUtau/UTAU 工程文件
@@ -258,13 +428,17 @@ class TsubakiProcessor:
             lab_path: LAB 标注文件路径
             output_path: 输出文件路径 (.ustx)
             project_title: 工程标题
+            config: 处理配置
             
         Returns:
             处理结果字典
         """
+        if config is None:
+            config = AudioProcessingConfig()
+
         try:
             # 提取音频 F0
-            audio_data = self.process_audio_f0(wav_path, method='dio')
+            audio_data = self.process_audio_f0(wav_path, config)
             if not audio_data:
                 return {'success': False, 'error': 'F0 提取失败'}
             
@@ -279,7 +453,7 @@ class TsubakiProcessor:
             
             # 生成 UTAU/USTx 格式
             project_xml = self._build_utau_project_xml(
-                project_title, segments, f0, t, sr, wav_path
+                project_title, segments, f0, t, sr, wav_path, config
             )
             
             # 保存文件
@@ -293,6 +467,7 @@ class TsubakiProcessor:
                 'format': 'utau',
                 'output_path': output_path,
                 'segments': len(segments),
+                'config': config.to_dict(),
                 'message': f'生成 OpenUtau/UTAU 工程文件: {len(segments)} 个标注段'
             }
             
@@ -307,7 +482,8 @@ class TsubakiProcessor:
         f0: np.ndarray,
         t: np.ndarray,
         sr: int,
-        wav_path: str
+        wav_path: str,
+        config: AudioProcessingConfig
     ) -> str:
         """构建 Synthesizer V USTx XML"""
         xml_lines = [
@@ -320,6 +496,10 @@ class TsubakiProcessor:
             '  <voice>',
             '    <database name="default" />',
             '  </voice>',
+            '  <metadata>',
+            f'    <bpm>{config.bpm}</bpm>',
+            f'    <basePitch>{config.base_pitch}</basePitch>',
+            '  </metadata>',
             '  <script>',
         ]
         
@@ -357,7 +537,8 @@ class TsubakiProcessor:
         f0: np.ndarray,
         t: np.ndarray,
         sr: int,
-        wav_path: str
+        wav_path: str,
+        config: AudioProcessingConfig
     ) -> str:
         """构建 UTAU/USTx XML"""
         xml_lines = [
@@ -367,6 +548,10 @@ class TsubakiProcessor:
             '  <audio>',
             f'    <path>{self._escape_xml(str(Path(wav_path).absolute()))}</path>',
             '  </audio>',
+            '  <metadata>',
+            f'    <bpm>{config.bpm}</bpm>',
+            f'    <basePitch>{config.base_pitch}</basePitch>',
+            '  </metadata>',
             '  <notes>',
         ]
         
@@ -415,7 +600,8 @@ class TsubakiProcessor:
         wav_path: str,
         lab_path: str,
         output_format: str = 'sv',
-        project_title: str = "Project"
+        project_title: str = "Project",
+        config: Optional[AudioProcessingConfig] = None
     ) -> Dict:
         """
         完整处理流程：音频 → F0 → 标注 → 工程文件
@@ -425,6 +611,7 @@ class TsubakiProcessor:
             lab_path: LAB 标注文件路径
             output_format: 输出格式 ('sv' 或 'utau')
             project_title: 工程标题
+            config: 处理配置
             
         Returns:
             处理结果字典
@@ -435,15 +622,18 @@ class TsubakiProcessor:
                 'error': f"不支持的格式: {output_format}，支持: {', '.join(self.SUPPORTED_FORMATS.keys())}"
             }
         
+        if config is None:
+            config = AudioProcessingConfig()
+        
         # 确定输出文件名
         stem = Path(lab_path).stem
-        output_ext = '.ustx'
+        output_ext = '.svp' if output_format == 'sv' else '.ustx'
         output_path = str(self.work_dir / f"{stem}_{output_format}{output_ext}")
         
         # 调用相应的生成函数
         if output_format == 'sv':
-            return self.generate_sv_project(wav_path, lab_path, output_path, project_title)
+            return self.generate_sv_project(wav_path, lab_path, output_path, project_title, config)
         elif output_format == 'utau':
-            return self.generate_utau_project(wav_path, lab_path, output_path, project_title)
+            return self.generate_utau_project(wav_path, lab_path, output_path, project_title, config)
         
         return {'success': False, 'error': '未知格式'}
