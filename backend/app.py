@@ -14,6 +14,7 @@ from flask_cors import CORS
 
 from mfa_utils import MFAChecker
 from mfa_processor import MFAProcessor
+from pipeline import AudioProcessingPipeline
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,6 +34,7 @@ app.config["MAX_CONTENT_LENGTH"] = 512 * 1024 * 1024
 CORS(app, supports_credentials=True)
 
 mfa_processor = MFAProcessor()
+pipeline = AudioProcessingPipeline(str(WORK_DIR))
 
 
 def abs_norm(path: str) -> str:
@@ -100,8 +102,8 @@ def serve_frontend(path):
 def health():
     return jsonify({
         "status": "ok",
-        "version": "1.0.0",
-        "app": "GPT-SOVITS MFA Aligner"
+        "version": "2.0.0",
+        "app": "GPT-SOVITS MFA Aligner with Audio Processing"
     }), 200
 
 
@@ -120,8 +122,43 @@ def mfa_status():
     return jsonify(MFAChecker.get_status()), 200
 
 
+@app.route("/api/pipeline/status", methods=["GET"])
+def pipeline_status():
+    """获取处理流程的状态"""
+    try:
+        status = pipeline.get_status()
+        return jsonify({
+            "success": True,
+            "status": status
+        }), 200
+    except Exception as e:
+        logger.error(f"查询状态失败: {e}", exc_info=True)
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route("/api/pipeline/formats", methods=["GET"])
+def pipeline_formats():
+    """获取支持的输出格式"""
+    try:
+        formats = pipeline.get_supported_formats()
+        return jsonify({
+            "success": True,
+            "formats": formats
+        }), 200
+    except Exception as e:
+        logger.error(f"查询格式失败: {e}", exc_info=True)
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
 @app.route("/api/upload", methods=["POST"])
 def upload_wav_and_text():
+    """上传音频和文本（仅保存，不处理）"""
     try:
         if "audio_file" not in request.files:
             return jsonify({"error": "缺少 audio_file"}), 400
@@ -158,6 +195,7 @@ def upload_wav_and_text():
 
 @app.route("/api/mfa/process", methods=["POST"])
 def process_mfa():
+    """MFA 自动标注处理"""
     try:
         if "audio_file" not in request.files:
             return jsonify({"error": "缺少 audio_file"}), 400
@@ -187,10 +225,175 @@ def process_mfa():
         return jsonify({"error": f"处理出错: {str(e)}"}), 500
 
 
+@app.route("/api/pipeline/full", methods=["POST"])
+def pipeline_full_process():
+    """完整处理流程：MFA + F0 + 工程文件"""
+    try:
+        if "audio_file" not in request.files:
+            return jsonify({"error": "缺少 audio_file"}), 400
+        if "text" not in request.form:
+            return jsonify({"error": "缺少 text"}), 400
+
+        audio_file = request.files["audio_file"]
+        text = request.form.get("text", "").strip()
+        language = request.form.get("language", "cmn")
+        output_format = request.form.get("format", "sv")  # sv 或 utau
+        project_title = request.form.get("title", "Project")
+
+        if not audio_file or not text:
+            return jsonify({"error": "输入无效"}), 400
+
+        if output_format not in pipeline.get_supported_formats()['formats']:
+            return jsonify({
+                "error": f"不支持的格式: {output_format}",
+                "supported": pipeline.get_supported_formats()['formats']
+            }), 400
+
+        logger.info(f"完整处理流程启动: {output_format} 格式")
+        result = pipeline.process_full(
+            audio_file=audio_file,
+            text=text,
+            language=language,
+            output_format=output_format,
+            project_title=project_title
+        )
+
+        if result.get("success"):
+            return jsonify(result), 200
+
+        return jsonify({
+            "success": False,
+            "error": result.get("error", "处理失败"),
+            "stage": result.get("stage", "unknown"),
+            "processing_time": result.get("processing_time", 0)
+        }), 500
+
+    except Exception as e:
+        logger.error("完整处理流程异常: %s", e, exc_info=True)
+        return jsonify({"error": f"处理出错: {str(e)}"}), 500
+
+
+@app.route("/api/pipeline/mfa-only", methods=["POST"])
+def pipeline_mfa_only():
+    """仅执行 MFA 标注"""
+    try:
+        if "audio_file" not in request.files:
+            return jsonify({"error": "缺少 audio_file"}), 400
+        if "text" not in request.form:
+            return jsonify({"error": "缺少 text"}), 400
+
+        audio_file = request.files["audio_file"]
+        text = request.form.get("text", "").strip()
+        language = request.form.get("language", "cmn")
+
+        if not audio_file or not text:
+            return jsonify({"error": "输入无效"}), 400
+
+        logger.info("MFA 标注模式启动")
+        result = pipeline.process_mfa_only(audio_file, text, language)
+
+        if result.get("success"):
+            return jsonify(result), 200
+
+        return jsonify({
+            "success": False,
+            "error": result.get("error", "MFA 处理失败"),
+            "processing_time": result.get("processing_time", 0)
+        }), 500
+
+    except Exception as e:
+        logger.error("MFA 模式异常: %s", e, exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/pipeline/project-only", methods=["POST"])
+def pipeline_project_only():
+    """仅执行工程文件生成"""
+    try:
+        wav_path = request.form.get("wav_path")
+        lab_path = request.form.get("lab_path")
+        output_format = request.form.get("format", "sv")
+        project_title = request.form.get("title", "Project")
+
+        if not wav_path or not lab_path:
+            return jsonify({"error": "缺少 wav_path 或 lab_path"}), 400
+
+        if output_format not in pipeline.get_supported_formats()['formats']:
+            return jsonify({
+                "error": f"不支持的格式: {output_format}",
+                "supported": pipeline.get_supported_formats()['formats']
+            }), 400
+
+        # 验证文件存在
+        if not os.path.exists(wav_path):
+            return jsonify({"error": f"WAV 文件不存在: {wav_path}"}), 400
+        if not os.path.exists(lab_path):
+            return jsonify({"error": f"LAB 文件不存在: {lab_path}"}), 400
+
+        logger.info(f"工程文件生成模式启动: {output_format} 格式")
+        result = pipeline.process_project_only(
+            wav_path=wav_path,
+            lab_path=lab_path,
+            output_format=output_format,
+            project_title=project_title
+        )
+
+        if result.get("success"):
+            return jsonify(result), 200
+
+        return jsonify({
+            "success": False,
+            "error": result.get("error", "工程生成失败"),
+            "processing_time": result.get("processing_time", 0)
+        }), 500
+
+    except Exception as e:
+        logger.error("工程生成模式异常: %s", e, exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/pipeline/f0-only", methods=["POST"])
+def pipeline_f0_only():
+    """仅执行 F0 提取"""
+    try:
+        wav_path = request.form.get("wav_path")
+        method = request.form.get("method", "dio")
+
+        if not wav_path:
+            return jsonify({"error": "缺少 wav_path"}), 400
+
+        if method not in ["dio", "harvest"]:
+            return jsonify({
+                "error": f"不支持的方法: {method}",
+                "supported": ["dio", "harvest"]
+            }), 400
+
+        # 验证文件存在
+        if not os.path.exists(wav_path):
+            return jsonify({"error": f"WAV 文件不存在: {wav_path}"}), 400
+
+        logger.info(f"F0 提取模式启动: {method} 方法")
+        result = pipeline.process_f0_only(wav_path, method=method)
+
+        if result.get("success"):
+            return jsonify(result), 200
+
+        return jsonify({
+            "success": False,
+            "error": result.get("error", "F0 提取失败"),
+            "processing_time": result.get("processing_time", 0)
+        }), 500
+
+    except Exception as e:
+        logger.error("F0 提取模式异常: %s", e, exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/mfa/download-model/<language>", methods=["POST"])
 def download_mfa_model(language: str):
+    """下载 MFA 模型"""
     try:
-        valid_languages = ["cmn", "zh", "eng", "jpn", "kor", "yue"]
+        valid_languages = ["cmn", "zh", "eng", "en", "jpn", "ja", "kor", "ko", "yue"]
         if language not in valid_languages:
             return jsonify({"error": f"不支持的语言: {language}"}), 400
 
@@ -205,19 +408,122 @@ def download_mfa_model(language: str):
         return jsonify({"error": f"下载失败: {str(e)}"}), 500
 
 
+@app.route("/api/work-dir/files", methods=["GET"])
+def list_work_dir_files():
+    """列出工作目录中的文件"""
+    try:
+        files = []
+        
+        # 列出 WAV 文件
+        for wav_file in WORK_DIR.glob("*.wav"):
+            files.append({
+                "name": wav_file.name,
+                "path": str(wav_file),
+                "type": "audio",
+                "size": wav_file.stat().st_size,
+                "modified": wav_file.stat().st_mtime
+            })
+        
+        # 列出 LAB 文件
+        for lab_file in WORK_DIR.glob("*.lab"):
+            files.append({
+                "name": lab_file.name,
+                "path": str(lab_file),
+                "type": "label",
+                "size": lab_file.stat().st_size,
+                "modified": lab_file.stat().st_mtime
+            })
+        
+        # 列出工程文件
+        for project_file in WORK_DIR.glob("**/*.ustx"):
+            files.append({
+                "name": project_file.name,
+                "path": str(project_file),
+                "type": "project",
+                "size": project_file.stat().st_size,
+                "modified": project_file.stat().st_mtime
+            })
+        
+        # 按修改时间排序
+        files.sort(key=lambda x: x['modified'], reverse=True)
+        
+        return jsonify({
+            "success": True,
+            "work_dir": str(WORK_DIR),
+            "file_count": len(files),
+            "files": files
+        }), 200
+        
+    except Exception as e:
+        logger.error("列出文件失败: %s", e, exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/work-dir/download/<path:filename>", methods=["GET"])
+def download_work_file(filename: str):
+    """下载工作目录中的文件"""
+    try:
+        file_path = WORK_DIR / filename
+        
+        # 安全检查：确保不能访问目录外的文件
+        if not str(file_path).startswith(str(WORK_DIR)):
+            return jsonify({"error": "无权访问该文件"}), 403
+        
+        if not file_path.exists():
+            return jsonify({"error": "文件不存在"}), 404
+        
+        if not file_path.is_file():
+            return jsonify({"error": "不是文件"}), 400
+        
+        logger.info(f"下载文件: {file_path}")
+        return send_from_directory(str(WORK_DIR), filename, as_attachment=True)
+        
+    except Exception as e:
+        logger.error("下载文件失败: %s", e, exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/work-dir/clear", methods=["POST"])
+def clear_work_dir():
+    """清空工作目录"""
+    try:
+        import shutil
+        
+        # 只删除特定类型的文件
+        patterns = ["*.wav", "*.lab", "**/*.ustx", "*.txt", "*.TextGrid"]
+        
+        deleted_count = 0
+        for pattern in patterns:
+            for file_path in WORK_DIR.glob(pattern):
+                if file_path.is_file():
+                    file_path.unlink()
+                    deleted_count += 1
+        
+        logger.info(f"清空工作目录: 删除 {deleted_count} 个文件")
+        
+        return jsonify({
+            "success": True,
+            "message": f"已删除 {deleted_count} 个文件"
+        }), 200
+        
+    except Exception as e:
+        logger.error("清空工作目录失败: %s", e, exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
 def open_browser(host: str, port: int):
     sleep(2)
     webbrowser.open(f"http://{host}:{port}")
 
 
 def main(host: str = "127.0.0.1", port: int = 5000):
-    print(f"\n{'=' * 50}")
-    print("🚀 启动 GPT-SOVITS MFA Aligner")
+    print(f"\n{'=' * 60}")
+    print("🚀 启动 GPT-SOVITS MFA Aligner with Audio Processing")
     print(f"📍 访问地址: http://{host}:{port}")
     print(f"📂 工作目录: {WORK_DIR}")
     print(f"📂 前端目录: {FRONTEND_DIST}")
     print(f"⏹️  按 Ctrl+C 停止服务")
-    print(f"{'=' * 50}\n")
+    print(f"{'=' * 60}\n")
 
     Thread(target=open_browser, args=(host, port), daemon=True).start()
     app.run(host=host, port=port, debug=True, use_reloader=False)
