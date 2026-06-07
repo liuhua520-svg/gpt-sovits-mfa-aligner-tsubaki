@@ -21,7 +21,7 @@ class AudioProcessingPipeline:
     1. 音频上传
     2. MFA 自动标注 (生成 LAB 文件)
     3. 音高提取 (使用 PyWORLD)
-    4. 工程文件生成 (SV / UTAU)
+    4. 工程文件生成 (SV / USTX)
     """
 
     def __init__(self, work_dir: str):
@@ -111,13 +111,14 @@ class AudioProcessingPipeline:
 
             # 步骤 2: 音高提取
             logger.info("[ 步骤 2/3 ] 音高提取...")
-            audio_data = None
             try:
                 audio_data = self.tsubaki_processor.process_audio_f0(wav_path, config)
-                if not audio_data.get("success"):
-                    logger.warning(f"⚠ F0 提取失败或 PyWORLD 未安装: {audio_data.get('error', 'unknown')}")
+                if not audio_data:
+                    logger.warning("⚠ F0 提取失败或 PyWORLD 未安装，继续处理")
+                    audio_data = None
             except Exception as e:
                 logger.warning(f"⚠ 音高提取异常: {e}，继续处理")
+                audio_data = None
 
             logger.info("✓ 音高提取完成")
 
@@ -159,7 +160,8 @@ class AudioProcessingPipeline:
                 "lab_path": lab_path,
                 "lab_content": lab_content,
                 "project_path": project_path,
-                "project_format": output_format,
+                "project_format": project_result.get("format", output_format),
+                "requested_format": output_format,
                 "segments": project_result.get("segments", 0),
                 "processing_time": processing_time,
                 "config": config.to_dict(),
@@ -179,7 +181,7 @@ class AudioProcessingPipeline:
         self,
         audio_file,
         text: str,
-        language: str = "cmn",
+        language: str = "cmn"
     ) -> Dict:
         """仅执行 MFA 标注（不生成工程文件）"""
         import time
@@ -208,7 +210,7 @@ class AudioProcessingPipeline:
             else:
                 return {
                     **result,
-                    "processing_time": int((time.time() - start_time) * 1000),
+                    "processing_time": int((time.time() - start_time) * 1000)
                 }
 
         except Exception as e:
@@ -216,7 +218,7 @@ class AudioProcessingPipeline:
             return {
                 "success": False,
                 "error": str(e),
-                "processing_time": int((time.time() - start_time) * 1000),
+                "processing_time": int((time.time() - start_time) * 1000)
             }
 
     def process_project_only(
@@ -262,7 +264,7 @@ class AudioProcessingPipeline:
                 lab_path=lab_path,
                 output_format=output_format,
                 project_title=project_title,
-                config=config,
+                config=config
             )
 
             result["processing_time"] = int((time.time() - start_time) * 1000)
@@ -273,7 +275,7 @@ class AudioProcessingPipeline:
             return {
                 "success": False,
                 "error": str(e),
-                "processing_time": int((time.time() - start_time) * 1000),
+                "processing_time": int((time.time() - start_time) * 1000)
             }
 
     def process_f0_only(
@@ -304,7 +306,7 @@ class AudioProcessingPipeline:
 
             audio_data = self.tsubaki_processor.process_audio_f0(wav_path, config)
 
-            if audio_data.get("success"):
+            if audio_data:
                 logger.info("✓ F0 提取完成")
                 return {
                     "success": True,
@@ -312,13 +314,13 @@ class AudioProcessingPipeline:
                     "frames": len(audio_data.get("f0", [])),
                     "sample_rate": audio_data.get("sr", 0),
                     "processing_time": int((time.time() - start_time) * 1000),
-                    "message": f'F0 提取完成: {len(audio_data.get("f0", []))} 帧',
+                    "message": f'F0 提取完成: {len(audio_data.get("f0", []))} 帧'
                 }
             else:
                 return {
                     "success": False,
-                    "error": audio_data.get("error", "F0 提取失败"),
-                    "processing_time": int((time.time() - start_time) * 1000),
+                    "error": "F0 提取失败",
+                    "processing_time": int((time.time() - start_time) * 1000)
                 }
 
         except Exception as e:
@@ -326,13 +328,13 @@ class AudioProcessingPipeline:
             return {
                 "success": False,
                 "error": str(e),
-                "processing_time": int((time.time() - start_time) * 1000),
+                "processing_time": int((time.time() - start_time) * 1000)
             }
 
     def get_supported_formats(self) -> Dict:
         return {
             "formats": list(self.tsubaki_processor.SUPPORTED_FORMATS.keys()),
-            "details": self.tsubaki_processor.SUPPORTED_FORMATS,
+            "details": self.tsubaki_processor.SUPPORTED_FORMATS
         }
 
     def get_status(self) -> Dict:
@@ -347,6 +349,6 @@ class AudioProcessingPipeline:
             "mfa": mfa_status,
             "audio_processing": {
                 "pyworld_available": pyworld_available,
-                "supported_formats": list(self.tsubaki_processor.SUPPORTED_FORMATS.keys()),
-            },
+                "supported_formats": list(self.tsubaki_processor.SUPPORTED_FORMATS.keys())
+            }
         }

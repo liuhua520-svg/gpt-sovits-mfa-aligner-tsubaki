@@ -10,7 +10,7 @@ import logging
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import soundfile as sf
@@ -43,19 +43,20 @@ class LabelSegment:
 @dataclass
 class AudioProcessingConfig:
     """音频处理配置"""
-    bpm: float = 120.0          # 每分钟节拍数
-    base_pitch: int = 60        # 基准音高（MIDI note，60 = C4）
+    # 基本参数
+    bpm: float = 120.0
+    base_pitch: int = 60  # MIDI note，60 = C4
 
     # F0 提取参数
-    f0_floor: float = 71.0      # 最低 F0（Hz）
-    f0_ceil: float = 800.0      # 最高 F0（Hz）
-    f0_method: str = "dio"      # 'dio' 或 'harvest'
+    f0_floor: float = 71.0
+    f0_ceil: float = 800.0
+    f0_method: str = "dio"  # 'dio' 或 'harvest'
 
     # F0 细化参数
     f0_smooth: bool = True
     f0_smooth_window: int = 5
 
-    # 是否细化音高（控制 LAB 音符放置位置，不影响 F0 曲线写入）
+    # 是否细化音高（控制 LAB 音符音高，是否用 F0 平均音高决定 tone）
     refine_pitch: bool = False
 
     use_double_precision: bool = False
@@ -75,16 +76,118 @@ class AudioProcessingConfig:
 
 
 class TsubakiProcessor:
-    # 补充 pipeline.py 中 get_supported_formats() 需要用到的字典
+    """
+    工程文件生成器。
+
+    说明：
+    - Synthesizer V 的正确结构需要把音符放进 tracks[0].mainGroup.notes，
+      并让 tracks[0].mainRef.groupID 指向 mainGroup.uuid。
+    - OpenUtau 则输出标准 USTX。
+    """
+
     SUPPORTED_FORMATS = {
         "sv": "Synthesizer V Project (.svp)",
         "ustx": "OpenUtau Project (.ustx)",
+        "utau": "OpenUtau Project (.ustx) [alias]",
+    }
+
+    OUTPUT_ALIASES = {
+        "svp": "sv",
+        "synthv": "sv",
+        "synthesizer_v": "sv",
+        "synthesizerv": "sv",
+        "openutau": "ustx",
+        "utau": "ustx",
     }
 
     def __init__(self, work_dir: str):
         self.work_dir = Path(work_dir)
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
+    # ----------------------------
+    # 基础工具
+    # ----------------------------
+    @staticmethod
+    def _normalize_output_format(output_format: str) -> str:
+        fmt = (output_format or "").strip().lower()
+        fmt = TsubakiProcessor.OUTPUT_ALIASES.get(fmt, fmt)
+        return fmt
+
+    @staticmethod
+    def _midi_to_freq(midi_note: int) -> float:
+        return 440.0 * (2 ** ((midi_note - 69) / 12))
+
+    @staticmethod
+    def _freq_to_midi(freq: float) -> float:
+        return 69 + 12 * np.log2(float(freq) / 440.0)
+
+    @staticmethod
+    def _lab_time_to_seconds(lab_time: int) -> float:
+        return float(lab_time) / 10000000.0
+
+    @staticmethod
+    def _is_silence_label(label: str) -> bool:
+        return label.strip().lower() in {"pau", "sil", "sp", "br", "", "-", "spn"}
+
+    @staticmethod
+    def _safe_int(value) -> int:
+        try:
+            return int(round(float(value)))
+        except Exception:
+            return 0
+
+    def _read_audio_duration_sec(self, wav_path: str) -> float:
+        try:
+            info = sf.info(wav_path)
+            if info.samplerate <= 0:
+                return 0.0
+            return float(info.frames) / float(info.samplerate)
+        except Exception:
+            return 0.0
+
+    def _load_lab_segments(self, lab_path: str) -> List[LabelSegment]:
+        segments: List[LabelSegment] = []
+        with open(lab_path, "r", encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+
+                try:
+                    start_time = int(float(parts[0]))
+                    end_time = int(float(parts[1]))
+                except Exception:
+                    continue
+
+                label = " ".join(parts[2:]).strip()
+                segments.append(LabelSegment(start_time=start_time, end_time=end_time, label=label))
+
+        return segments
+
+    def _default_note(self, lyric: str, tone: int) -> Dict:
+        return {
+            "musicalType": "singing",
+            "onset": 0,
+            "duration": 0,
+            "lyrics": lyric,
+            "phonemes": "",
+            "accent": "",
+            "pitch": int(tone),
+            "detune": 0,
+            "instantMode": False,
+            "attributes": {"evenSyllableDuration": True},
+            "systemAttributes": {"evenSyllableDuration": True},
+            "pitchTakes": {"activeTakeId": 0, "takes": [{"id": 0, "expr": 0, "liked": False}]},
+            "timbreTakes": {"activeTakeId": 0, "takes": [{"id": 0, "expr": 0, "liked": False}]},
+        }
+
+    # ----------------------------
+    # F0 提取
+    # ----------------------------
     def process_audio_f0(self, audio_path: str, config: AudioProcessingConfig) -> Dict:
         """
         使用 PyWORLD 提取音频的 F0 基频曲线
@@ -96,7 +199,7 @@ class TsubakiProcessor:
 
             x, sr = sf.read(audio_path)
             if len(x.shape) > 1:
-                x = np.mean(x, axis=1)  # 双声道转单声道
+                x = np.mean(x, axis=1)
             x = x.astype(np.float64)
 
             if config.f0_method.lower() == "harvest":
@@ -106,9 +209,11 @@ class TsubakiProcessor:
                 f0 = pw.stonemask(x, f0, t, sr)
 
             if config.f0_smooth and config.f0_smooth_window > 1 and len(f0) > 0:
-                window = config.f0_smooth_window
+                window = int(config.f0_smooth_window)
                 if window % 2 == 0:
                     window += 1
+                window = max(3, window)
+
                 voiced_mask = f0 > 0
                 padded = np.pad(f0, window // 2, mode="edge")
                 smoothed = np.convolve(padded, np.ones(window) / window, mode="valid")
@@ -124,50 +229,139 @@ class TsubakiProcessor:
             logger.error(f"F0 基频提取过程中发生异常: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
-    def _is_silence_label(self, label: str) -> bool:
-        return label.lower() in ["pau", "sil", "sp", "br", ""]
-
-    def _lab_time_to_seconds(self, lab_time: int) -> float:
-        return lab_time / 10000000.0
-
-    def _load_lab_segments(self, lab_path: str) -> List[LabelSegment]:
+    # ----------------------------
+    # SVP 生成
+    # ----------------------------
+    def _build_svp_project_text(
+        self,
+        title: str,
+        segments: List[LabelSegment],
+        f0: Optional[np.ndarray],
+        t: Optional[np.ndarray],
+        sr: Optional[int],
+        wav_path: str,
+        config: AudioProcessingConfig,
+        audio_duration_sec: Optional[float] = None,
+    ) -> str:
         """
-        尽量兼容常见 LAB 格式：
-        1) start end label
-        2) start end ... label
-        3) start end
+        生成可被 Synthesizer V 正确识别的 SVP JSON 文本
+
+        关键点：
+        1. 音符必须放进 tracks[0].mainGroup.notes
+        2. tracks[0].mainRef.groupID 必须和 mainGroup.uuid 对应
+        3. pitch 曲线写入 tracks[0].mainGroup.parameters.pitchDelta.points
         """
-        segments: List[LabelSegment] = []
-        with open(lab_path, "r", encoding="utf-8") as f:
-            for raw_line in f:
-                line = raw_line.strip()
-                if not line:
+        if audio_duration_sec is None:
+            audio_duration_sec = 0.0
+
+        bpm = float(config.bpm)
+        blicks_per_sec = (bpm / 60.0) * 705600000  # 1 quarter = 705600000 blicks
+
+        notes: List[Dict] = []
+        pitch_data: List[float] = []
+
+        for seg in segments:
+            if self._is_silence_label(seg.label):
+                continue
+
+            start_sec = self._lab_time_to_seconds(seg.start_time)
+            end_sec = self._lab_time_to_seconds(seg.end_time)
+            if end_sec <= start_sec:
+                continue
+
+            onset = int(round(start_sec * blicks_per_sec))
+            end_onset = int(round(end_sec * blicks_per_sec))
+            duration = max(1, end_onset - onset)
+
+            tone = int(config.base_pitch)
+            if config.refine_pitch and t is not None and f0 is not None and len(f0) > 0:
+                mask = (t >= start_sec) & (t < end_sec)
+                seg_f0 = f0[mask]
+                voiced = seg_f0[seg_f0 > 0]
+                if len(voiced) > 0:
+                    avg_f0 = float(np.mean(voiced))
+                    tone = int(round(self._freq_to_midi(avg_f0)))
+                    tone = max(12, min(127, tone))
+
+            note = self._default_note(seg.label, tone)
+            note["onset"] = onset
+            note["duration"] = duration
+            notes.append(note)
+
+        # pitchDelta points：按 SV 的 blick 坐标写入
+        if t is not None and f0 is not None and len(f0) > 0:
+            for ti, f0i in zip(t, f0):
+                if f0i <= 0:
                     continue
 
-                parts = line.split()
-                if len(parts) < 2:
-                    continue
+                pos = int(round(float(ti) * blicks_per_sec))
 
-                try:
-                    start_time = int(parts[0])
-                    end_time = int(parts[1])
-                except ValueError:
-                    continue
+                nominal_pitch = int(config.base_pitch)
+                for note in notes:
+                    if note["onset"] <= pos <= (note["onset"] + note["duration"]):
+                        nominal_pitch = int(note["pitch"])
+                        break
 
-                label = " ".join(parts[2:]).strip() if len(parts) >= 3 else ""
-                segments.append(LabelSegment(start_time=start_time, end_time=end_time, label=label))
+                pitch_midi = self._freq_to_midi(float(f0i))
+                deviation_cents = int(round((pitch_midi - nominal_pitch) * 100))
 
-        return segments
+                pitch_data.append(pos)
+                pitch_data.append(deviation_cents)
 
-    def _read_audio_duration_sec(self, wav_path: str) -> float:
-        try:
-            info = sf.info(wav_path)
-            if info.samplerate > 0:
-                return float(info.frames) / float(info.samplerate)
-        except Exception:
-            pass
-        return 0.0
+        import uuid
 
+        group_uuid = str(uuid.uuid4()).lower()
+
+        main_group = {
+            "uuid": group_uuid,
+            "name": title,
+            "comment": "",
+            "trackNo": 0,
+            "notes": notes,
+            "parameters": {
+                "pitchDelta": {
+                    "definition": "pitchDelta",
+                    "points": pitch_data,
+                }
+            },
+        }
+
+        project = {
+            "version": 7,
+            "time": {
+                "bpm": bpm,
+                "meter": [{"index": 0, "numerator": 4, "denominator": 4}],
+                "tempo": [{"position": 0, "bpm": bpm}],
+            },
+            "library": [],
+            "tracks": [
+                {
+                    "name": title,
+                    "mainGroup": main_group,
+                    "mainRef": {
+                        "groupID": group_uuid,
+                        "voice": {
+                            "voter": "",
+                            "language": "",
+                            "name": "",
+                            "dF0Vbr": 0,
+                        },
+                        "audio": {
+                            "relativeFilename": str(Path(wav_path).name),
+                            "duration": float(audio_duration_sec),
+                        },
+                    },
+                    "refs": [],
+                }
+            ],
+            "renderConfig": {},
+        }
+
+        return json.dumps(project, ensure_ascii=False, indent=2)
+
+    # ----------------------------
+    # USTX 生成
+    # ----------------------------
     def _build_utau_project_text(
         self,
         title: str,
@@ -180,16 +374,16 @@ class TsubakiProcessor:
         audio_duration_sec: Optional[float] = None,
     ) -> str:
         """
-        生成规范的 USTX 工程文件内容
+        生成 USTX 工程文件内容
         """
-        from ruamel.yaml import YAML
-        from ruamel.yaml.comments import CommentedMap
-
         if audio_duration_sec is None:
             audio_duration_sec = 0.0
 
+        from ruamel.yaml import YAML
+        from ruamel.yaml.comments import CommentedMap
+
         resolution = 480
-        ticks_per_sec = (config.bpm / 60.0) * resolution
+        ticks_per_sec = (float(config.bpm) / 60.0) * resolution
 
         def make_default_pitch():
             return {
@@ -221,25 +415,24 @@ class TsubakiProcessor:
             if end_sec <= start_sec:
                 continue
 
-            pos = round(start_sec * ticks_per_sec)
-            end_pos = round(end_sec * ticks_per_sec)
+            pos = int(round(start_sec * ticks_per_sec))
+            end_pos = int(round(end_sec * ticks_per_sec))
             duration = max(1, end_pos - pos)
 
-            tone = config.base_pitch
-
+            tone = int(config.base_pitch)
             if config.refine_pitch and t is not None and f0 is not None and len(f0) > 0:
                 mask = (t >= start_sec) & (t < end_sec)
                 seg_f0 = f0[mask]
                 voiced = seg_f0[seg_f0 > 0]
                 if len(voiced) > 0:
                     avg_f0 = float(np.mean(voiced))
-                    tone = int(round(69 + 12 * np.log2(avg_f0 / 440.0)))
+                    tone = int(round(self._freq_to_midi(avg_f0)))
                     tone = max(12, min(127, tone))
 
             notes.append({
-                "position": int(pos),
-                "duration": int(duration),
-                "tone": int(tone),
+                "position": pos,
+                "duration": duration,
+                "tone": tone,
                 "lyric": seg.label,
                 "pitch": make_default_pitch(),
                 "vibrato": make_default_vibrato(),
@@ -255,13 +448,13 @@ class TsubakiProcessor:
                     continue
                 tick = int(round(float(ti) * ticks_per_sec))
 
-                nominal_pitch = config.base_pitch
+                nominal_pitch = int(config.base_pitch)
                 for note in notes:
                     if note["position"] <= tick <= (note["position"] + note["duration"]):
-                        nominal_pitch = note["tone"]
+                        nominal_pitch = int(note["tone"])
                         break
 
-                pitch_midi = 69 + 12 * np.log2(float(f0i) / 440.0)
+                pitch_midi = self._freq_to_midi(float(f0i))
                 deviation_cents = int(round((pitch_midi - nominal_pitch) * 100))
 
                 xs.append(tick)
@@ -341,111 +534,6 @@ class TsubakiProcessor:
         yaml.dump(project, stream)
         return stream.getvalue()
 
-    def _build_svp_project_text(
-        self,
-        title: str,
-        segments: List[LabelSegment],
-        f0: Optional[np.ndarray],
-        t: Optional[np.ndarray],
-        sr: Optional[int],
-        wav_path: str,
-        config: AudioProcessingConfig,
-        audio_duration_sec: Optional[float] = None,
-    ) -> str:
-        """
-        生成具有连续音高曲线的 SVP 工程文件内容
-        """
-        if audio_duration_sec is None:
-            audio_duration_sec = 0.0
-
-        blicks_per_sec = (config.bpm / 60.0) * 705600000
-
-        svp_notes = []
-        for seg in segments:
-            if self._is_silence_label(seg.label):
-                continue
-
-            start_sec = self._lab_time_to_seconds(seg.start_time)
-            end_sec = self._lab_time_to_seconds(seg.end_time)
-            if end_sec <= start_sec:
-                continue
-
-            onset = round(start_sec * blicks_per_sec)
-            end_onset = round(end_sec * blicks_per_sec)
-            duration = max(1, end_onset - onset)
-
-            tone = config.base_pitch
-
-            if config.refine_pitch and t is not None and f0 is not None and len(f0) > 0:
-                mask = (t >= start_sec) & (t < end_sec)
-                seg_f0 = f0[mask]
-                voiced = seg_f0[seg_f0 > 0]
-                if len(voiced) > 0:
-                    avg_f0 = float(np.mean(voiced))
-                    tone = int(round(69 + 12 * np.log2(avg_f0 / 440.0)))
-                    tone = max(12, min(127, tone))
-
-            svp_notes.append({
-                "onset": int(onset),
-                "duration": int(duration),
-                "lyrics": seg.label,
-                "phonemes": "",
-                "pitch": int(tone),
-                "attributes": {},
-            })
-
-        intervals = []
-        if t is not None and f0 is not None:
-            for ti, f0i in zip(t, f0):
-                if f0i <= 0:
-                    continue
-                pos = int(round(float(ti) * blicks_per_sec))
-
-                nominal_pitch = config.base_pitch
-                for note in svp_notes:
-                    if note["onset"] <= pos <= (note["onset"] + note["duration"]):
-                        nominal_pitch = note["pitch"]
-                        break
-
-                pitch_midi = 69 + 12 * np.log2(float(f0i) / 440.0)
-                deviation_cents = int(round((pitch_midi - nominal_pitch) * 100))
-
-                intervals.append({
-                    "pos": pos,
-                    "value": deviation_cents,
-                })
-
-        project = {
-            "version": 7,
-            "time": {
-                "bpm": float(config.bpm),
-                "meter": [{"index": 0, "numerator": 4, "denominator": 4}],
-            },
-            "library": [],
-            "tracks": [
-                {
-                    "name": title,
-                    "notes": svp_notes,
-                    "mainRef": {
-                        "voice": {"voter": "", "language": "", "name": ""},
-                        "parameters": {
-                            "pitchDelta": {
-                                "definition": "pitchDelta",
-                                "intervals": intervals,
-                            }
-                        },
-                        "audio": {
-                            "relativeFilename": str(Path(wav_path).name),
-                            "duration": float(audio_duration_sec),
-                        },
-                    },
-                    "refs": [],
-                }
-            ],
-            "renderConfig": {},
-        }
-        return json.dumps(project, ensure_ascii=False, indent=2)
-
     def _get_default_expressions(self) -> Dict:
         return {
             "dyn": {"name": "dynamics (curve)", "abbr": "dyn", "type": "Curve", "min": -240, "max": 120, "default_value": 0, "is_flag": False, "flag": ""},
@@ -467,6 +555,9 @@ class TsubakiProcessor:
             "shfc": {"name": "tone shift (curve)", "abbr": "shfc", "type": "Curve", "min": -1200, "max": 1200, "default_value": 0, "is_flag": False, "flag": ""},
         }
 
+    # ----------------------------
+    # 完整流程入口
+    # ----------------------------
     def process_full_pipeline(
         self,
         wav_path: str,
@@ -503,7 +594,8 @@ class TsubakiProcessor:
                 t = audio_f0_data.get("t")
                 sr = audio_f0_data.get("sr")
 
-            fmt = output_format.lower().strip()
+            fmt = self._normalize_output_format(output_format)
+
             if fmt == "sv":
                 project_text = self._build_svp_project_text(
                     title=project_title,
@@ -531,9 +623,13 @@ class TsubakiProcessor:
                 out_path = self.work_dir / f"{Path(wav_path).stem}.ustx"
 
             else:
-                return {"success": False, "error": f"不支持的格式: {output_format}"}
+                return {
+                    "success": False,
+                    "error": f"不支持的格式: {output_format}。支持: sv / ustx / utau",
+                }
 
             out_path.write_text(project_text, encoding="utf-8")
+
             return {
                 "success": True,
                 "output_path": str(out_path),
@@ -545,7 +641,3 @@ class TsubakiProcessor:
         except Exception as e:
             logger.error(f"工程文件生成失败: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
-
-    @staticmethod
-    def _escape_xml(text: str) -> str:
-        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&apos;")
