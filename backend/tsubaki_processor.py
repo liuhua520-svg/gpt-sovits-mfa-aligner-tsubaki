@@ -358,16 +358,6 @@ class TsubakiProcessor:
         # ── 步骤 2：检查并填补音符之间的空隙 ────────────────────────────────
         # （正常情况下 LAB 已连续，此步作为保险）
         all_notes.sort(key=lambda n: n["onset"])
-        gapfilled: List[Dict] = []
-        cursor = 0
-
-        for note in all_notes:
-            gap = note["onset"] - cursor
-            if gap > 0:
-                gapfilled.append(self._default_svp_note("-", base_tone, cursor, gap))
-            gapfilled.append(note)
-            cursor = note["onset"] + note["duration"]
-        all_notes = gapfilled
 
         # ── 步骤 3：pitchDelta points（float cents，cubic mode）──────────────
         pitch_data: List[float] = []
