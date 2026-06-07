@@ -1,11 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-MFA 处理核心模块 - 多语言增强版 v9.3
-特点：
-1. 多语言支持：中文、英语、日语、粤语、韩语
-2. IPA→Romaji/ARPABET/Hangul Jamo 自动转换
-3. Word Tier 优先对齐
-4. Phone Tier 精确phoneme处理
+MFA 处理核心模块 - 多语言增强版 v9.3 (已包含特定标点符号清洗规则)
 """
 from __future__ import annotations
 
@@ -143,6 +138,30 @@ class MFAProcessor:
         self.temp_dir: Optional[str] = None
 
     # =====================================================================
+    # 新增：文本标点符号规范化清洗
+    # =====================================================================
+    def _clean_input_text(self, text: str) -> str:
+        """
+        根据用户要求清洗文本标点符号：
+        1. 「」、""、“” 转换为忽略（替换为空字符串）
+        2. （）、《》、()、＜＞、<>、【】 视为逗号（替换为 ","）
+        """
+        if not text:
+            return ""
+        
+        # 步骤 1：忽略指定的引号和书名号
+        # 匹配 「 」 " “ ” 并删掉
+        ignore_pattern = r'[「」"“”]'
+        text = re.sub(ignore_pattern, "", text)
+        
+        # 步骤 2：把指定的括号、书名号、句号、尖括号视为逗号
+        # 匹配 （ ） 《 》  ( ) ＜ ＞ < > 【 】 并替换为逗号
+        comma_pattern = r'[（）《》()＜＞<>【】]'
+        text = re.sub(comma_pattern, ",", text)
+        
+        return text
+
+    # =====================================================================
     # 多语言环境检查
     # =====================================================================
     def _check_zh_environment(self) -> Tuple[bool, str]:
@@ -154,7 +173,7 @@ class MFAProcessor:
         except ImportError:
             return False, "❌ 缺失中文支持：pip install pypinyin"
         except Exception as e:
-            return False, f"❌ 中文��境错误：{str(e)}"
+            return False, f"❌ 中文环境错误：{str(e)}"
 
     def _check_en_environment(self) -> Tuple[bool, str]:
         """检查英语环境"""
@@ -379,7 +398,6 @@ class MFAProcessor:
         entries: List[Tuple[int, int, str]] = []
         
         for s, e, p in word_phones:
-            # ★ 关键：使用 convert_phoneme 进行 IPA → Romaji 转换
             romaji = convert_phoneme(p, 'ja')
             
             if romaji is None:
@@ -406,7 +424,6 @@ class MFAProcessor:
         entries: List[Tuple[int, int, str]] = []
         
         for s, e, p in word_phones:
-            # ★ 关键：使用 convert_phoneme 进行 IPA → Hangul Jamo 转换
             jamo = convert_phoneme(p, 'ko')
             
             if jamo is None:
@@ -773,21 +790,7 @@ class MFAProcessor:
         phone_items: List[Tuple[int, int, str]],
         text: str
     ) -> List[str]:
-        """处理韩语 Word Tier → 完整韩文字符 + "-" 初声标记
-
-        输出格式：保持完整韩文字符，对有初声的字符添加 "-" 标注
-
-        例如："도와드릴까요"
-        17900000 18583333 -   (도的初声标记)
-        18583333 19266666 도  (完整字)
-        19266666 20050000 와  (无初声，直接字)
-        20050000 20733333 -   (드的初声标记)
-        20733333 21416666 드  (完整字)
-        21416666 22100000 릴  (完整字)
-        22100000 22783333 -   (까의初声标记)
-        22783333 23466666 까  (完整字)
-        23466666 24150000 요  (无初声，直接字)
-        """
+        """处理韩语 Word Tier"""
         lines: List[str] = []
 
         for interval in word_tier:
@@ -811,7 +814,6 @@ class MFAProcessor:
                     lines.append(f"{start} {end} {mark.lower()}")
                 continue
 
-            # ★ 韩文处理：检查是否为韩文并分解
             if self._is_korean_text(mark):
                 syllable_entries = self._decompose_korean_syllable_with_onset(
                     start, end, mark, phone_items=phone_items
@@ -827,74 +829,38 @@ class MFAProcessor:
         return lines
 
     def _is_korean_text(self, text: str) -> bool:
-        """检测文本是否为韩文（包括完成型音节和 Jamo 字母）
-
-        覆盖范围：
-        - AC00–D7A3  完成型 Hangul syllables（도, 와, 릴 …）
-        - 3130–318F  Compatibility Jamo（ㄷ, ㅏ, ㄹ …）
-        - 1100–11FF  Hangul Jamo（ᄃ, ᅩ … Unicode Jamo）
-        """
+        """检测文本是否为韩文"""
         if not text:
             return False
         for char in text:
             code = ord(char)
-            if (0xAC00 <= code <= 0xD7A3   # composed syllables
-                    or 0x3130 <= code <= 0x318F   # compatibility Jamo
-                    or 0x1100 <= code <= 0x11FF):  # Hangul Jamo
+            if (0xAC00 <= code <= 0xD7A3   
+                    or 0x3130 <= code <= 0x318F   
+                    or 0x1100 <= code <= 0x11FF):  
                 return True
         return False
 
     def _get_korean_initial_consonant(self, char: str) -> Optional[str]:
-        """
-        从韩文字符提取初声（初声）。
-
-        韩文字符编码方式（完成型音节）：
-        code = 0xAC00 + (initial × 588) + (medial × 28) + final
-
-        初声索引：
-        0=ㄱ, 1=ㄲ, 2=ㄴ, 3=ㄷ, 4=ㄸ, 5=ㄹ, 6=ㅁ, 7=ㅂ, 8=ㅃ, 9=ㅄ, 10=ㅅ,
-        11=ㅆ, 12=ㅇ(零初声), 13=ㅈ, 14=ㅉ, 15=ㅊ, 16=ㅋ, 17=ㅌ, 18=ㅍ, 19=ㅎ
-
-        仅当 initial != 12（ㅇ）时，才认为有初声。
-
-        Jamo 兼容字符 (3131-318E) 已包含初声字母本身。
-        """
+        """从韩文字符提取初声"""
         if not char:
             return None
-
         code = ord(char)
-
-        # Case 1: 完成型音节 (AC00-D7A3)
         if 0xAC00 <= code <= 0xD7A3:
-            # 计算初声索引
             offset = code - 0xAC00
             initial_idx = offset // 588
-
-            # initial_idx == 12 是 ㅇ(零初声)，没有初声
             if initial_idx == 12:
                 return None
-
-            return "has_initial"  # 有初声标记
-
-        # Case 2: Jamo 兼容字符 (3131-318E)
-        # 这些是独立的音节字母，如 ㄱ, ㄴ, ㅏ, ㅠ 等
+            return "has_initial"  
         if 0x3131 <= code <= 0x318E:
-            # 3131-3164 是初声辅音
-            # 3165-318E 是中声元音或其他
             if 0x3131 <= code <= 0x3164:
-                # 这是初声字母本身
                 return "has_initial"
             else:
                 return None
-
-        # Case 3: Unicode Hangul Jamo (1100-11FF)
         if 0x1100 <= code <= 0x11FF:
-            # 1100-1112 是初声，1113-1114 是初声扩展
             if 0x1100 <= code <= 0x1114:
                 return "has_initial"
             else:
                 return None
-
         return None
 
     def _decompose_korean_syllable_with_onset(
@@ -904,54 +870,30 @@ class MFAProcessor:
         korean_text: str,
         phone_items: Optional[List[Tuple[int, int, str]]] = None,
     ) -> List[Tuple[int, int, str]]:
-        """
-        分解韩文字符：完整字符 + "-" 초성标记
-
-        核心规则：
-        - 有初声（初声 ≠ ㅇ）→ 输出 "-"(初声标记) + 完整字符
-        - 无初声或初声 = ㅇ    → 直接输出完整字符
-
-        时间分配策略：
-        1. 若 phone_items 含本 word 时间段内的完整音节 token，用其时间戳
-        2. 否则回退到等比均分
-
-        ★ 改进逻辑：
-        - 更准确的 Jamo 分解（使用 get_korean_initial_consonant）
-        - 更鲁棒的时间段聚合
-        - 完整字符作为主要输出单位
-        """
+        """分解韩文字符"""
         try:
             import jamo
-
             entries: List[Tuple[int, int, str]] = []
             if not korean_text:
                 return entries
 
-            # ── 1. 提取韩文字符及其初声信息 ──────────────────────────
-            korean_chars: List[Tuple[str, bool]] = []  # (char, has_initial)
+            korean_chars: List[Tuple[str, bool]] = []  
             for char in korean_text:
                 if not char or char == ' ':
                     continue
-
                 has_initial = False
                 try:
-                    # 使用改进的初声检测方法
                     initial_marker = self._get_korean_initial_consonant(char)
                     if initial_marker == "has_initial":
                         has_initial = True
                 except Exception as jamo_err:
                     logger.debug(f"Jamo 初声检测失败 {char}: {jamo_err}")
-
                 korean_chars.append((char, has_initial))
 
             if not korean_chars:
-                logger.debug(f"韩文 '{korean_text}': 无有效字符")
                 return entries
 
             n_chars = len(korean_chars)
-            logger.debug(f"韩文 '{korean_text}': {n_chars} 个字符，初声分布：{[hi for _, hi in korean_chars]}")
-
-            # ── 2. 尝试从 phone_items 中抽取本 word 内的音节时间段 ──
             syllable_time_ranges: List[Tuple[int, int]] = []
             if phone_items:
                 word_phones = [
@@ -962,18 +904,9 @@ class MFAProcessor:
                 ]
                 word_phones.sort(key=lambda x: x[0])
 
-                # Case A: phone tier 中的条目数恰好等于音节数
-                #         （MFA 直接输出整字）
                 if len(word_phones) == n_chars:
                     syllable_time_ranges = [(s, e) for s, e, _ in word_phones]
-                    logger.debug(
-                        f"韩文 '{korean_text}': 使用完整 phone_items 时间段 "
-                        f"({len(syllable_time_ranges)} 个)"
-                    )
-
-                # Case B: phone tier 中的条目是 Jamo 级别
                 elif len(word_phones) > n_chars:
-                    # 估算每个音节占几个 Jamo phone
                     jamo_counts = []
                     for char, _ in korean_chars:
                         try:
@@ -988,7 +921,6 @@ class MFAProcessor:
                         chunk = word_phones[idx: idx + n]
                         if chunk:
                             syl_start = chunk[0][0]
-                            # 最后一个音节一直到 word_end
                             syl_end = (
                                 word_end if i == n_chars - 1
                                 else (chunk[-1][1] if len(chunk) == n 
@@ -997,12 +929,6 @@ class MFAProcessor:
                             syllable_time_ranges.append((syl_start, syl_end))
                         idx += n
 
-                    logger.debug(
-                        f"韩文 '{korean_text}': 从 Jamo phone_items 聚合 "
-                        f"{len(syllable_time_ranges)} 个音节时间段"
-                    )
-
-            # ── 3. 回退：等比均分 ──────────────────────────────────────
             if len(syllable_time_ranges) != n_chars:
                 word_duration = word_end - word_start
                 total_units = sum(2 if hi else 1 for _, hi in korean_chars)
@@ -1019,42 +945,25 @@ class MFAProcessor:
                     syllable_time_ranges.append((cur, syl_end))
                     cur = syl_end
 
-                logger.debug(
-                    f"韩文 '{korean_text}': 等比均分回退，{n_chars} 个音节"
-                )
-
-            # ── 4. 生成 LAB 条目 ──────────────────────────────────────
             for i, ((char, has_initial), (syl_start, syl_end)) in enumerate(
                 zip(korean_chars, syllable_time_ranges)
             ):
                 syl_dur = max(syl_end - syl_start, 200000)
-
                 if has_initial:
-                    # 有初声："-"(初声) + 完整字符
-                    # 时间分配："-" 占 1/3，字占 2/3（最小各 60000）
                     dash_dur = max(syl_dur // 3, 60000)
                     dash_end = min(syl_start + dash_dur, syl_end - 60000)
-
                     entries.append((syl_start, dash_end, "-"))
-                    logger.debug(f"  [{syl_start}-{dash_end}] - (초성)")
-
                     entries.append((dash_end, syl_end, char))
-                    logger.debug(f"  [{dash_end}-{syl_end}] {char} (자)")
                 else:
-                    # 无初声：直接输出完整字符
                     entries.append((syl_start, syl_end, char))
-                    logger.debug(f"  [{syl_start}-{syl_end}] {char} (자)")
 
-            # 确保最后一个条目到达 word_end
             if entries and entries[-1][1] < word_end:
                 s, e, p = entries[-1]
                 entries[-1] = (s, word_end, p)
 
             return entries
-
         except ImportError:
             logger.error("jamo 库未安装，无法分解韩文字符")
-            logger.error("请运行：pip install jamo")
             return []
         except Exception as e:
             logger.error(f"韩文分解失败: {e}", exc_info=True)
@@ -1139,7 +1048,6 @@ class MFAProcessor:
         try:
             from textgrid import TextGrid
             tg = TextGrid.fromFile(textgrid_path)
-            logger.info(f"加载 TextGrid: {len(tg)} tiers")
             
             word_tier = None
             phone_tier = None
@@ -1155,40 +1063,26 @@ class MFAProcessor:
                 logger.error("未找到 Word Tier")
                 return ""
             
-            logger.info(f"✓ Word Tier 模式启动（多语言 + IPA转换）")
-            
             phone_items: List[Tuple[int, int, str]] = []
             if phone_tier is not None:
                 phone_items = self._extract_phone_items(phone_tier)
-                logger.info(f"✓ Phone Tier: {len(phone_items)} 个音素条目")
-            else:
-                logger.warning("未找到 Phone Tier")
             
             if lang in ('zh', 'cmn'):
-                logger.info("✓ 语言模式：中文普通话")
                 lines = self._process_zh_words(word_tier, phone_items, text)
             elif lang == 'en':
-                logger.info("✓ 语言模式：英语（ARPABET）")
                 lines = self._process_en_words(word_tier, phone_items, text)
             elif lang == 'ja':
-                logger.info("✓ 语言模式：日语（ROMAJI，IPA→Romaji 自动转换）")
                 lines = self._process_ja_words(word_tier, phone_items, text)
             elif lang == 'ko':
-                logger.info("✓ 语言模式：韩语（Hangul Jamo，初声 - 标记）★ ENHANCED!")
                 lines = self._process_ko_words(word_tier, phone_items, text)
             elif lang == 'yue':
-                logger.info("✓ 语言模式：粤语（粤拼）")
                 lines = self._process_yue_words(word_tier, phone_items, text)
             else:
-                logger.warning(f"未知语言 '{lang}'，使用英语模式")
                 lines = self._process_en_words(word_tier, phone_items, text)
             
-            result = "\n".join(lines)
-            logger.info(f"✓ 对齐完成（{len(lines)} 行）")
-            return result
+            return "\n".join(lines)
             
         except ImportError:
-            logger.warning("textgrid 未安装，启用手工解析")
             return self._parse_textgrid_manual(textgrid_path, text, lang)
         except Exception as e:
             logger.error(f"对齐失败: {e}", exc_info=True)
@@ -1235,9 +1129,6 @@ class MFAProcessor:
                 p_matches = re.findall(pattern, phone_tier_content, re.DOTALL)
                 phone_tier = [MockInterval(m[0], m[1], m[2]) for m in p_matches]
                 phone_items = self._extract_phone_items(phone_tier)
-                logger.info(f"手工解析：Word Tier {len(word_tier)} 项，Phone Tier {len(phone_items)} 个")
-            else:
-                logger.info(f"手工解析：Word Tier {len(word_tier)} 项，无 Phone Tier")
             
             if lang in ('zh', 'cmn'):
                 lines = self._process_zh_words(word_tier, phone_items, text)
@@ -1259,11 +1150,9 @@ class MFAProcessor:
             return ""
 
     def _textgrid_to_lab(self, textgrid_path: str, text: str, lang: str = 'zh') -> str:
-        """主入口"""
         return self._textgrid_to_lab_word_tier_primary(textgrid_path, text, lang)
 
     def _get_audio_duration(self, audio_path: str) -> int:
-        """获取音频时长（单位：100ns）"""
         try:
             import soundfile as sf
             data, sr = sf.read(audio_path)
@@ -1282,7 +1171,7 @@ class MFAProcessor:
                 return 0
 
     # =====================================================================
-    # 主流程
+    # 主流程（修改位置）
     # =====================================================================
     def process(self, audio_file, text: str, language: str = "cmn") -> Dict:
         """处理单个音频文件"""
@@ -1290,6 +1179,9 @@ class MFAProcessor:
         try:
             self.temp_dir = tempfile.mkdtemp(prefix="mfa_")
             raw_lang = (language or "cmn").lower().strip()
+
+            # ★ 关键新增点：在任何语言分支提取前，优先使用新规则统一清洗输入的原始文本
+            text = self._clean_input_text(text)
 
             if raw_lang in ("cmn", "zh", "zh-cn", "mandarin"):
                 lang = "zh"
@@ -1420,7 +1312,6 @@ class MFAProcessor:
             self._cleanup()
 
     def _cleanup(self):
-        """清理临时文件"""
         if self.temp_dir and os.path.exists(self.temp_dir):
             try:
                 shutil.rmtree(self.temp_dir)

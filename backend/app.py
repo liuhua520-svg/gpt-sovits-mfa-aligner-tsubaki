@@ -250,6 +250,10 @@ def pipeline_full_process():
         f0_floor = float(request.form.get("f0_floor", 71.0))
         f0_ceil = float(request.form.get("f0_ceil", 800.0))
 
+        # 从前端表单中安全获取并解析该布尔字段
+        refine_pitch_raw = request.form.get("refine_pitch", "false").lower()
+        refine_pitch = True if refine_pitch_raw == "true" else False
+
         if not audio_file or not text:
             return jsonify({"error": "输入无效"}), 400
 
@@ -274,6 +278,7 @@ def pipeline_full_process():
             use_double_precision=use_double_precision,
             f0_floor=f0_floor,
             f0_ceil=f0_ceil,
+            refine_pitch=refine_pitch  # 传入解算器
         )
 
         if result.get("success"):
@@ -361,7 +366,7 @@ def pipeline_project_only():
 
         return jsonify({
             "success": False,
-            "error": result.get("error", "工程生成失败"),
+            "error": "工程生成失败",
             "processing_time": result.get("processing_time", 0)
         }), 500
 
@@ -398,7 +403,7 @@ def pipeline_f0_only():
 
         return jsonify({
             "success": False,
-            "error": result.get("error", "F0 提取失败"),
+            "error": "F0 提取失败",
             "processing_time": result.get("processing_time", 0)
         }), 500
 
