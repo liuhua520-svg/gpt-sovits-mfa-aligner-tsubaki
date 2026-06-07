@@ -24,7 +24,6 @@
       </template>
 
       <el-form :model="formData" label-width="100px">
-        <!-- 音频上传 -->
         <el-form-item label="音频文件">
           <el-upload
             drag
@@ -50,7 +49,6 @@
           </div>
         </el-form-item>
 
-        <!-- 文本输入 -->
         <el-form-item label="输入文本">
           <el-input
             v-model="formData.text"
@@ -64,7 +62,6 @@
           </div>
         </el-form-item>
 
-        <!-- 语言选择 -->
         <el-form-item label="语言">
           <el-select v-model="formData.language" placeholder="选择语言">
             <el-option label="普通话 🇨🇳" value="cmn" />
@@ -75,7 +72,6 @@
           </el-select>
         </el-form-item>
 
-        <!-- 处理模式选择 -->
         <el-form-item label="处理模式">
           <el-radio-group v-model="processingMode">
             <el-radio value="mfa-only">仅标注 (快速)</el-radio>
@@ -91,15 +87,13 @@
           </div>
         </el-form-item>
 
-        <!-- 工程文件格式选择（完整模式才显示） -->
         <el-form-item v-if="processingMode === 'full'" label="输出格式">
           <el-select v-model="formData.outputFormat" placeholder="选择输出格式">
-            <el-option label="Synthesizer V Studio (.ustx)" value="sv" />
+            <el-option label="Synthesizer V Studio (.svp)" value="sv" />
             <el-option label="OpenUtau/UTAU (.ustx)" value="utau" />
           </el-select>
         </el-form-item>
 
-        <!-- 工程标题 -->
         <el-form-item v-if="processingMode === 'full'" label="工程标题">
           <el-input
             v-model="formData.projectTitle"
@@ -108,11 +102,9 @@
           />
         </el-form-item>
 
-        <!-- 高级设置部分（完整模式才显示） -->
         <el-collapse v-if="processingMode === 'full'" accordion>
           <el-collapse-item title="⚙️ 高级设置" name="advanced">
             <el-row :gutter="20">
-              <!-- BPM 设置 -->
               <el-col :xs="24" :sm="12">
                 <el-form-item label="BPM (节拍/分钟)">
                   <el-input-number
@@ -125,7 +117,6 @@
                 </el-form-item>
               </el-col>
 
-              <!-- 基准音高设置 -->
               <el-col :xs="24" :sm="12">
                 <el-form-item label="基准音高 (MIDI Note)">
                   <div class="pitch-input-group">
@@ -141,10 +132,37 @@
                 </el-form-item>
               </el-col>
 
-              <!-- F0 提取方法 -->
+              <el-col :xs="24">
+                <el-divider>📈 音高精细控制</el-divider>
+              </el-col>
+
+              <el-col :xs="24" :sm="12">
+                <el-form-item label="自动音符音高">
+                  <el-switch 
+                    v-model="advancedConfig.auto_note_pitch"
+                    active-text="自动对齐实际音高"
+                    inactive-text="固定在基准音高"
+                  />
+                </el-form-item>
+              </el-col>
+
+              <el-col :xs="24" :sm="12">
+                <el-form-item label="导出连续音高">
+                  <el-switch 
+                    v-model="advancedConfig.export_pitch_line"
+                    active-text="写入 F0 曲线参数"
+                    inactive-text="仅生成纯净音符"
+                  />
+                </el-form-item>
+              </el-col>
+
+              <el-col :xs="24">
+                <el-divider>F0 提取算法与范围</el-divider>
+              </el-col>
+
               <el-col :xs="24" :sm="12">
                 <el-form-item label="F0 提取方法">
-                  <el-radio-group v-model="advancedConfig.f0_method">
+                  <el-radio-group v-model="advancedConfig.f0_method" :disabled="!advancedConfig.export_pitch_line && !advancedConfig.auto_note_pitch">
                     <el-radio label="dio">
                       <span>DIO (快速)</span>
                       <el-icon class="icon-tip"><InfoFilled /></el-icon>
@@ -157,7 +175,6 @@
                 </el-form-item>
               </el-col>
 
-              <!-- 精度设置 -->
               <el-col :xs="24" :sm="12">
                 <el-form-item label="浮点精度">
                   <el-radio-group v-model="advancedConfig.precision">
@@ -167,18 +184,17 @@
                 </el-form-item>
               </el-col>
 
-              <!-- F0 平滑设置 -->
               <el-col :xs="24" :sm="12">
                 <el-form-item label="F0 平滑处理">
                   <el-switch 
                     v-model="advancedConfig.f0_smooth"
                     active-text="启用"
                     inactive-text="禁用"
+                    :disabled="!advancedConfig.export_pitch_line"
                   />
                 </el-form-item>
               </el-col>
 
-              <!-- F0 平滑窗口 -->
               <el-col v-if="advancedConfig.f0_smooth" :xs="24" :sm="12">
                 <el-form-item label="平滑窗口大小">
                   <el-input-number
@@ -187,14 +203,10 @@
                     :max="21"
                     :step="2"
                     controls-position="right"
+                    :disabled="!advancedConfig.export_pitch_line"
                   />
                   <span class="help-text">推荐值: 3-7 (越大越平滑)</span>
                 </el-form-item>
-              </el-col>
-
-              <!-- F0 范围设置 -->
-              <el-col :xs="24">
-                <el-divider>F0 频率范围</el-divider>
               </el-col>
 
               <el-col :xs="24" :sm="12">
@@ -225,16 +237,15 @@
             <el-alert type="info" :closable="false" show-icon class="settings-info">
               <template #title>💡 高级设置说明</template>
               <p><strong>BPM:</strong> 用于工程文件的节拍数，不影响实际处理速度</p>
-              <p><strong>基准音高:</strong> 工程文件的基准音（60 = C4）</p>
+              <p><strong>基准音高:</strong> 工程文件的默认基准音（60 = C4）</p>
+              <p><strong>自动音符音高:</strong> 音符块将自动放置在音频识别出的实际 MIDI 键位上</p>
+              <p><strong>导出连续音高:</strong> 是否将精细的基频起伏数据（F0）以参数线形式导入到工程底部</p>
               <p><strong>DIO vs Harvest:</strong> DIO 快速但可能不够精确；Harvest 慢但更精确</p>
-              <p><strong>精度:</strong> 双精度提供更高精度但耗时更长，适合专业用途</p>
-              <p><strong>F0 平滑:</strong> 使用中值滤波平滑 F0 曲线，消除噪音</p>
               <p><strong>F0 范围:</strong> 女声通常 150-300Hz，男声 80-150Hz，根据需要调整</p>
             </el-alert>
           </el-collapse-item>
         </el-collapse>
 
-        <!-- 处理按钮 -->
         <el-form-item style="margin-top: 20px">
           <el-button
             type="primary"
@@ -252,7 +263,6 @@
           </span>
         </el-form-item>
 
-        <!-- 进度条 -->
         <el-progress
           v-if="processing"
           :percentage="progressPercent"
@@ -261,7 +271,6 @@
         />
       </el-form>
 
-      <!-- 结果显示 -->
       <div v-if="result" class="result-section">
         <el-divider />
 
@@ -316,6 +325,8 @@
                   <ul v-if="result.config">
                     <li>BPM: {{ result.config.bpm }}</li>
                     <li>基准音高: {{ midiNoteToName(result.config.base_pitch) }} (MIDI {{ result.config.base_pitch }})</li>
+                    <li>自动音符音高: {{ result.config.auto_note_pitch ? '已启用' : '已禁用' }}</li>
+                    <li>导出连续音高: {{ result.config.export_pitch_line ? '已启用' : '已禁用' }}</li>
                     <li>F0 方法: {{ result.config.f0_method }}</li>
                     <li>精度: {{ result.config.use_double_precision ? '双精度 (Float64)' : '单精度 (Float32)' }}</li>
                   </ul>
@@ -340,7 +351,6 @@
           </el-tab-pane>
         </el-tabs>
 
-        <!-- 操作按钮 -->
         <div class="action-buttons">
           <el-button type="success" @click="downloadLab" size="large">
             📥 下载 LAB 文件
@@ -363,7 +373,6 @@
         </div>
       </div>
 
-      <!-- 错误提示 -->
       <div v-if="error" class="error-section">
         <el-alert
           :title="`错误: ${error}`"
@@ -375,7 +384,6 @@
       </div>
     </el-card>
 
-    <!-- 系统状态 -->
     <div v-if="systemStatus" class="status-box">
       <el-card shadow="hover">
         <template #header>
@@ -433,7 +441,6 @@
       </el-card>
     </div>
 
-    <!-- MFA未安装提示 -->
     <div v-if="systemStatus && !systemStatus.mfa?.installed" class="warning-box">
       <el-alert type="error" :closable="false" show-icon>
         <template #title>❌ MFA 未安装</template>
@@ -443,7 +450,6 @@
       </el-alert>
     </div>
 
-    <!-- 模块未就绪提示 -->
     <div v-if="systemStatus && systemStatus.mfa?.installed && !isReady" class="warning-box">
       <el-alert type="warning" :closable="false" show-icon>
         <template #title>⚠️ 警告: 组件未就绪</template>
@@ -471,6 +477,8 @@ interface FormData {
 interface AdvancedConfig {
   bpm: number
   base_pitch: number
+  auto_note_pitch: boolean    // 新增：自动音符音高控制
+  export_pitch_line: boolean  // 新增：导出连续音高曲线控制
   f0_method: 'dio' | 'harvest'
   precision: 'single' | 'double'
   f0_smooth: boolean
@@ -502,6 +510,8 @@ const formData = ref<FormData>({
 const advancedConfig = ref<AdvancedConfig>({
   bpm: 120,
   base_pitch: 60,
+  auto_note_pitch: true,    // 默认开启自动对齐实际音高
+  export_pitch_line: true,  // 默认开启导出 F0 曲线参数
   f0_method: 'harvest',
   precision: 'double',
   f0_smooth: true,
@@ -704,9 +714,11 @@ const processAudio = async () => {
       formDataObj.append('format', formData.value.outputFormat)
       formDataObj.append('title', formData.value.projectTitle)
       
-      // 传递高级配置
+      // 传递包含细化音高的全套高级配置到后端
       formDataObj.append('bpm', advancedConfig.value.bpm.toString())
       formDataObj.append('base_pitch', advancedConfig.value.base_pitch.toString())
+      formDataObj.append('auto_note_pitch', advancedConfig.value.auto_note_pitch.toString())
+      formDataObj.append('export_pitch_line', advancedConfig.value.export_pitch_line.toString())
       formDataObj.append('f0_method', advancedConfig.value.f0_method)
       formDataObj.append('precision', advancedConfig.value.precision)
       formDataObj.append('f0_smooth', advancedConfig.value.f0_smooth.toString())
@@ -742,13 +754,22 @@ const processAudio = async () => {
         projectPath: data.project_path,
         projectFormat: data.project_format,
         segments: data.segments,
-        config: data.config
+        config: data.config || { // 兜底防止后端未回传
+          bpm: advancedConfig.value.bpm,
+          base_pitch: advancedConfig.value.base_pitch,
+          auto_note_pitch: advancedConfig.value.auto_note_pitch,
+          export_pitch_line: advancedConfig.value.export_pitch_line,
+          f0_method: advancedConfig.value.f0_method,
+          use_double_precision: advancedConfig.value.precision === 'double'
+        }
       }
       
-      // 更新处理详情
+      // 根据勾选细化逻辑动态更新显示步骤状态
+      const isF0StepActive = processingMode.value === 'full' && (advancedConfig.value.export_pitch_line || advancedConfig.value.auto_note_pitch)
+      
       processingDetails.value = [
         { stage: '1. MFA 自动标注', status: '完成', message: `${data.segments || '?'} 个标注段` },
-        { stage: '2. F0 音高提取', status: processingMode.value === 'full' ? '完成' : '跳过', message: '基频信息已提取' },
+        { stage: '2. F0 音高提取', status: isF0StepActive ? '完成' : '跳过', message: isF0StepActive ? '基频信息已处理' : '配置已选择跳过提取' },
         { stage: '3. 工程文件生成', status: processingMode.value === 'full' ? '完成' : '跳过', message: data.project_format ? `${data.project_format.toUpperCase()} 格式` : '-' }
       ]
 
@@ -842,6 +863,7 @@ const newProcess = () => {
 </script>
 
 <style scoped>
+/* 样式部分保持不变 */
 .processor-container {
   width: 100%;
 }
