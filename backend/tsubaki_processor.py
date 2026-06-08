@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 import logging
 import numpy as np
+import multiprocessing as mp
+import traceback
 from scipy.interpolate import interp1d
 from scipy.signal import medfilt, savgol_filter
 from dataclasses import dataclass
@@ -66,6 +68,7 @@ class AudioProcessingConfig:
     export_pitch_line: bool = True
 
     use_double_precision: bool = False
+    enable_ap_check: bool = False
 
     def to_dict(self) -> Dict:
         return {
@@ -243,6 +246,9 @@ class TsubakiProcessor:
             "voice":      {},
         }
 
+    def process_full(self, *args, **kwargs):
+        return self.process_full_pipeline(*args, **kwargs)
+
     # ----------------------------
     # F0 后处理工具
     # ----------------------------
@@ -261,13 +267,15 @@ class TsubakiProcessor:
         )
         return np.median(windows, axis=1)
 
-    def _contiguous_runs(self, mask: np.ndarray) -> List[Tuple[int, int]]:
+    @staticmethod
+    def _contiguous_runs(mask: np.ndarray) -> List[Tuple[int, int]]:
         idx = np.flatnonzero(mask)
         if idx.size == 0:
             return []
         splits = np.where(np.diff(idx) > 1)[0] + 1
         groups = np.split(idx, splits)
         return [(int(g[0]), int(g[-1]) + 1) for g in groups if len(g) > 0]
+
 
     def _soft_reject_spikes(
         self,
@@ -291,22 +299,31 @@ class TsubakiProcessor:
             if valid.sum() < 3:
                 continue
 
-            local_med = float(np.nanmedian(seg[valid]))
+            half = max(1, local_win // 2)
             for i in range(s, e):
                 if not suspicious[i] or not np.isfinite(midi[i]):
                     continue
+                left = max(s, i - half)
+                right = min(e, i + half + 1)
+                win = midi[left:right]
+                win = win[np.isfinite(win)]
+                if win.size < 3:
+                    continue
+
+                local_med = float(np.nanmedian(win))
                 if abs(midi[i] - local_med) >= max_jump_semitones:
                     out[i] = 0.0
 
         return out
 
+
     def _post_process_f0(self, f0: np.ndarray, config: AudioProcessingConfig) -> np.ndarray:
         """
-        分段平滑版：
+        更稳的后处理：
         1. 清理非法值
-        2. 去掉孤立尖峰
-        3. 只补短空隙
-        4. 只对连续有声段做平滑
+        2. 压掉孤立尖峰
+        3. 只补 1~3 帧短断裂
+        4. 只在连续有声段内做平滑
         """
         f0 = np.asarray(f0, dtype=np.float64).copy()
         if f0.size == 0:
@@ -315,9 +332,9 @@ class TsubakiProcessor:
         f0[~np.isfinite(f0)] = 0.0
         f0[(f0 < config.f0_floor * 0.6) | (f0 > config.f0_ceil * 1.15)] = 0.0
 
-        # 先补很短的断裂，避免被切碎
         voiced = f0 > 0
         runs = self._contiguous_runs(voiced)
+
         for (s1, e1), (s2, e2) in zip(runs, runs[1:]):
             gap = s2 - e1
             if 1 <= gap <= 3 and f0[e1 - 1] > 0 and f0[s2] > 0:
@@ -335,13 +352,13 @@ class TsubakiProcessor:
                 out[s:e] = np.clip(seg, config.f0_floor, config.f0_ceil)
                 continue
 
-            # 先轻微中值滤波，压掉单帧毛刺
             if n >= 5:
                 seg = medfilt(seg, kernel_size=3)
 
             if config.f0_smooth and n >= 5:
                 win = int(config.f0_smooth_window)
-                win = max(5, min(win, n if n % 2 == 1 else n - 1))
+                win = min(win, n if n % 2 == 1 else n - 1)
+                win = max(5, win)
                 if win % 2 == 0:
                     win -= 1
 
@@ -360,11 +377,12 @@ class TsubakiProcessor:
     # ----------------------------
     # F0 提取
     # ----------------------------
+    # 替换 process_audio_f0
     def process_audio_f0(self, audio_path: str, config: AudioProcessingConfig) -> Dict:
         """
         稳定版 F0 提取：
-        - 保留 dio/harvest + stonemask
-        - d4c 只做软提示，不做硬门槛
+        - dio / harvest + stonemask
+        - d4c 仅作软提示，不做硬门槛
         - 后处理改成分段平滑
         """
         try:
@@ -387,9 +405,9 @@ class TsubakiProcessor:
 
             frame_period = 5.0
             if duration_sec > 600:
-                frame_period = 20.0
+                frame_period = 10.0
             if duration_sec > 3600:
-                frame_period = 40.0
+                frame_period = 20.0
 
             logger.info(f"当前设定的提取帧移 (frame_period) 为: {frame_period} ms")
 
@@ -421,14 +439,14 @@ class TsubakiProcessor:
             if total_samples <= chunk_size:
                 f0, t = _extract_block(x)
 
-                # d4c 只做软拒绝
-                try:
-                    ap = pw.d4c(x, f0, t, sr)
-                    ap0 = np.asarray(ap[:, 0], dtype=np.float64)
-                    suspicious = (ap0 > 0.82) & (f0 > 0)
-                    f0 = self._soft_reject_spikes(f0, suspicious, max_jump_semitones=3.0, local_win=5)
-                except Exception as e:
-                    logger.warning(f"d4c 检查失败，继续使用纯 F0 后处理: {e}")
+                if getattr(config, "enable_ap_check", False):
+                    try:
+                        ap = pw.d4c(x, f0, t, sr)
+                        ap0 = np.asarray(ap[:, 0], dtype=np.float64)
+                        suspicious = (ap0 > 0.82) & (f0 > 0)
+                        f0 = self._soft_reject_spikes(f0, suspicious, max_jump_semitones=3.0, local_win=5)
+                    except Exception as e:
+                        logger.warning(f"d4c 检查失败，跳过软提示: {e}")
 
             else:
                 logger.info("检测到超长音频，启动分块流式处理...")
@@ -448,13 +466,14 @@ class TsubakiProcessor:
 
                     f0_c, t_c = _extract_block(x_chunk)
 
-                    try:
-                        ap_c = pw.d4c(x_chunk, f0_c, t_c, sr)
-                        ap0_c = np.asarray(ap_c[:, 0], dtype=np.float64)
-                        suspicious_c = (ap0_c > 0.82) & (f0_c > 0)
-                        f0_c = self._soft_reject_spikes(f0_c, suspicious_c, max_jump_semitones=3.0, local_win=5)
-                    except Exception as e:
-                        logger.warning(f"分块 d4c 检查失败，继续处理: {e}")
+                    if getattr(config, "enable_ap_check", False):
+                        try:
+                            ap_c = pw.d4c(x_chunk, f0_c, t_c, sr)
+                            ap0_c = np.asarray(ap_c[:, 0], dtype=np.float64)
+                            suspicious_c = (ap0_c > 0.82) & (f0_c > 0)
+                            f0_c = self._soft_reject_spikes(f0_c, suspicious_c, max_jump_semitones=3.0, local_win=5)
+                        except Exception as e:
+                            logger.warning(f"分块 d4c 检查失败，跳过软提示: {e}")
 
                     t_c = t_c + (start_idx / sr)
                     f0_list.append(f0_c)
@@ -564,12 +583,21 @@ class TsubakiProcessor:
 
         # ── 步骤 3：pitchDelta points（float cents，cubic mode）──────────────
         pitch_data: List[float] = []
+        voiced_sample_count = 0
+
+        logger.info(
+            f"Pitch Export Debug: export_pitch_line={config.export_pitch_line}, "
+            f"f0_len={0 if f0 is None else len(f0)}, "
+            f"t_len={0 if t is None else len(t)}"
+        )
 
         if config.export_pitch_line and t is not None and f0 is not None and len(f0) > 0:
             for ti, f0i in zip(t, f0):
-                if f0i <= 0: # 或者是对齐 JS 的 f0i < 55
+                if not np.isfinite(f0i) or f0i <= 0:
                     continue
-                # 3. 音频时间（秒）转换公式重构
+
+                voiced_sample_count += 1
+
                 pos = int(float(ti) * offset_ratio)
 
                 nominal_tone = base_tone
@@ -578,11 +606,20 @@ class TsubakiProcessor:
                         nominal_tone = int(vn["pitch"])
                         break
 
-                pitch_midi       = self._freq_to_midi(float(f0i))
-                deviation_cents  = float((pitch_midi - nominal_tone) * 100)
+                pitch_midi = self._freq_to_midi(float(f0i))
+                deviation_cents = float((pitch_midi - nominal_tone) * 100)
 
-                pitch_data.append(pos)
-                pitch_data.append(deviation_cents)
+                pitch_data.extend([pos, deviation_cents])
+
+            logger.info(f"Pitch Export Debug: valid_f0={voiced_sample_count}, generated_points={len(pitch_data)//2}")
+
+            if not pitch_data:
+                logger.warning("pitchDelta 为空：导出前的 F0 基本被清空了。")
+
+                # 兜底：至少放入零线，保证 SVP 里有 pitchDelta
+                for note in all_notes:
+                    pitch_data.extend([note["onset"], 0.0])
+                    pitch_data.extend([note["onset"] + note["duration"], 0.0])
 
         # ── 步骤 4：组装 JSON ─────────────────────────────────────────────────
         main_uuid  = str(uuid.uuid4()).lower()
@@ -896,3 +933,73 @@ class TsubakiProcessor:
         except Exception as e:
             logger.error(f"工程文件生成失败: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
+
+def _f0_worker(audio_path: str, config_dict: dict, q: mp.Queue) -> None:
+    """
+    子进程里做 F0 提取。
+    目的：即使 pyworld 底层崩溃，也只崩子进程，不把主进程带走。
+    """
+    try:
+        import numpy as np
+        import soundfile as sf
+        try:
+            import pyworld as pw
+        except ImportError:
+            q.put({"success": False, "error": "PyWORLD not installed"})
+            return
+
+        class _Cfg:
+            pass
+
+        cfg = _Cfg()
+        for k, v in config_dict.items():
+            setattr(cfg, k, v)
+
+        x, sr = sf.read(audio_path)
+        if len(x.shape) > 1:
+            x = np.mean(x, axis=1)
+
+        x = np.nan_to_num(x, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        x = np.ascontiguousarray(x, dtype=np.float64)
+
+        duration_sec = len(x) / sr
+        frame_period = 5.0
+        if duration_sec > 600:
+            frame_period = 10.0
+        if duration_sec > 3600:
+            frame_period = 20.0
+
+        if cfg.f0_method.lower() == "harvest":
+            f0, t = pw.harvest(
+                x, sr,
+                f0_floor=cfg.f0_floor,
+                f0_ceil=cfg.f0_ceil,
+                frame_period=frame_period
+            )
+        else:
+            f0, t = pw.dio(
+                x, sr,
+                f0_floor=cfg.f0_floor,
+                f0_ceil=cfg.f0_ceil,
+                frame_period=frame_period
+            )
+            f0 = pw.stonemask(x, f0, t, sr)
+
+        f0 = np.asarray(f0, dtype=np.float64)
+        f0[~np.isfinite(f0)] = 0.0
+        f0[(f0 < cfg.f0_floor * 0.6) | (f0 > cfg.f0_ceil * 1.15)] = 0.0
+
+        # 软提示：只标记可疑尖峰，不要整帧硬清零
+        if getattr(cfg, "enable_ap_check", False):
+            try:
+                ap = pw.d4c(x, f0, t, sr)
+                ap0 = np.asarray(ap[:, 0], dtype=np.float64)
+                suspicious = (ap0 > 0.82) & (f0 > 0)
+                # 这里只做轻度去尖峰，不做硬切
+                f0 = np.where(suspicious, np.minimum(f0, cfg.f0_ceil * 0.98), f0)
+            except Exception:
+                pass
+
+        q.put({"success": True, "f0": f0, "t": t, "sr": sr})
+    except Exception as e:
+        q.put({"success": False, "error": f"{e}\n{traceback.format_exc()}"})
