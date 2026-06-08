@@ -59,7 +59,7 @@ class AudioProcessingConfig:
 
     # F0 细化参数
     f0_smooth: bool = True
-    f0_smooth_window: int = 11   # 11 frames × 5ms = 55ms — matches human pitch perception
+    f0_smooth_window: int = 11
 
     # 是否细化音高（控制 LAB 音符音高，是否用 F0 中位音高决定 tone）
     refine_pitch: bool = False
@@ -82,8 +82,8 @@ class AudioProcessingConfig:
             "refine_pitch": self.refine_pitch,
             "export_pitch_line": self.export_pitch_line,
             "use_double_precision": self.use_double_precision,
+            "enable_ap_check": self.enable_ap_check,
         }
-
 
 # ---------------------------------------------------------------------------
 # 100 nanosecond / blick 换算常量
@@ -615,8 +615,6 @@ class TsubakiProcessor:
 
             if not pitch_data:
                 logger.warning("pitchDelta 为空：导出前的 F0 基本被清空了。")
-
-                # 兜底：至少放入零线，保证 SVP 里有 pitchDelta
                 for note in all_notes:
                     pitch_data.extend([note["onset"], 0.0])
                     pitch_data.extend([note["onset"] + note["duration"], 0.0])

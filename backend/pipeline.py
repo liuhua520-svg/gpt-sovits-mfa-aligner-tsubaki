@@ -49,6 +49,7 @@ class AudioProcessingPipeline:
             f0_floor: float = 71.0,
             f0_ceil: float = 800.0,
             refine_pitch: bool = False,
+            export_pitch_line: bool = True,
         ) -> Dict:
             config = AudioProcessingConfig(
                 bpm=bpm,
@@ -57,6 +58,7 @@ class AudioProcessingPipeline:
                 f0_smooth=f0_smooth,
                 f0_smooth_window=f0_smooth_window,
                 refine_pitch=refine_pitch,
+                export_pitch_line=export_pitch_line,
                 use_double_precision=use_double_precision,
                 f0_floor=f0_floor,
                 f0_ceil=f0_ceil,

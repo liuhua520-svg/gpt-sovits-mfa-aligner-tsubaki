@@ -5,6 +5,8 @@ import sys
 import uuid
 import logging
 import webbrowser
+import threading
+threading.stack_size(32 * 1024 * 1024)  # <-- 就是加在这里！
 from threading import Thread
 from time import sleep
 from pathlib import Path
@@ -272,6 +274,7 @@ def run_pipeline_job(
     f0_floor: float,
     f0_ceil: float,
     refine_pitch: bool,
+    export_pitch_line: bool,
 ):
     try:
         set_job(
@@ -315,6 +318,7 @@ def run_pipeline_job(
             f0_floor=f0_floor,
             f0_ceil=f0_ceil,
             refine_pitch=refine_pitch,
+            export_pitch_line=export_pitch_line,
         )
 
         if result.get("success"):
@@ -382,8 +386,15 @@ def pipeline_full_process():
         f0_floor = float(request.form.get("f0_floor", 71.0))
         f0_ceil = float(request.form.get("f0_ceil", 800.0))
 
+        # 【修复】前端发送的是 auto_note_pitch，而非 refine_pitch
         refine_pitch = (
-            request.form.get("refine_pitch", "false").lower()
+            request.form.get("auto_note_pitch", "false").lower()
+            == "true"
+        )
+
+        # 【修复】前端发送的 export_pitch_line 决定是否将 F0 曲线写入工程文件
+        export_pitch_line = (
+            request.form.get("export_pitch_line", "true").lower()
             == "true"
         )
 
@@ -425,6 +436,7 @@ def pipeline_full_process():
                 f0_floor,
                 f0_ceil,
                 refine_pitch,
+                export_pitch_line,
             ),
         ).start()
 
