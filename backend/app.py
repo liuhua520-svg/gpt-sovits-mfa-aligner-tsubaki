@@ -35,7 +35,23 @@ CORS(app, supports_credentials=True)
 
 mfa_processor = MFAProcessor()
 pipeline = AudioProcessingPipeline(str(WORK_DIR))
+from threading import Thread, Lock
+from datetime import datetime
 
+JOB_LOCK = Lock()
+JOBS = {}
+
+def set_job(job_id: str, **kwargs):
+    with JOB_LOCK:
+        JOBS[job_id] = {
+            **JOBS.get(job_id, {}),
+            **kwargs,
+        }
+
+
+def get_job(job_id: str):
+    with JOB_LOCK:
+        return JOBS.get(job_id)
 
 def abs_norm(path: str) -> str:
     return os.path.abspath(os.path.normpath(path))
@@ -124,7 +140,6 @@ def mfa_status():
 
 @app.route("/api/pipeline/status", methods=["GET"])
 def pipeline_status():
-    """获取处理流程的状态"""
     try:
         status = pipeline.get_status()
         return jsonify({
@@ -137,6 +152,23 @@ def pipeline_status():
             "success": False,
             "error": str(e)
         }), 500
+
+
+# 新增
+@app.route("/api/pipeline/job/<job_id>", methods=["GET"])
+def pipeline_job_status(job_id):
+    job = get_job(job_id)
+
+    if not job:
+        return jsonify({
+            "success": False,
+            "error": "任务不存在"
+        }), 404
+
+    return jsonify({
+        "success": True,
+        "job": job
+    }), 200
 
 
 @app.route("/api/pipeline/formats", methods=["GET"])
@@ -224,48 +256,52 @@ def process_mfa():
         logger.error("处理错误: %s", e, exc_info=True)
         return jsonify({"error": f"处理出错: {str(e)}"}), 500
 
-
-@app.route("/api/pipeline/full", methods=["POST"])
-def pipeline_full_process():
-    """完整处理流程：MFA + F0 + 工程文件"""
+def run_pipeline_job(
+    job_id: str,
+    wav_path: str,
+    text: str,
+    language: str,
+    output_format: str,
+    project_title: str,
+    bpm: float,
+    base_pitch: int,
+    f0_method: str,
+    f0_smooth: bool,
+    f0_smooth_window: int,
+    use_double_precision: bool,
+    f0_floor: float,
+    f0_ceil: float,
+    refine_pitch: bool,
+):
     try:
-        if "audio_file" not in request.files:
-            return jsonify({"error": "缺少 audio_file"}), 400
-        if "text" not in request.form:
-            return jsonify({"error": "缺少 text"}), 400
+        set_job(
+            job_id,
+            status="running",
+            started_at=datetime.now().isoformat(),
+        )
 
-        audio_file = request.files["audio_file"]
-        text = request.form.get("text", "").strip()
-        language = request.form.get("language", "cmn")
-        output_format = request.form.get("format", "sv")
-        project_title = request.form.get("title", "Project")
+        # === 【新增：伪造 FileStorage 包装器】 ===
+        class FileStorageWrapper:
+            def __init__(self, local_path):
+                self.path = os.path.abspath(local_path)
+                self.filename = os.path.basename(local_path)
 
-        # 获取高级处理配置
-        bpm = float(request.form.get("bpm", 120))
-        base_pitch = int(request.form.get("base_pitch", 60))
-        f0_method = request.form.get("f0_method", "dio")
-        f0_smooth = request.form.get("f0_smooth", "true").lower() == "true"
-        f0_smooth_window = int(request.form.get("f0_smooth_window", 5))
-        use_double_precision = request.form.get("precision", "single").lower() == "double"
-        f0_floor = float(request.form.get("f0_floor", 71.0))
-        f0_ceil = float(request.form.get("f0_ceil", 800.0))
+            def save(self, dst):
+                # 如果目标路径和当前文件路径不同，则执行复制
+                import shutil
+                if os.path.abspath(dst) != self.path:
+                    shutil.copy(self.path, dst)
 
-        # 从前端表单中安全获取并解析该布尔字段
-        refine_pitch_raw = request.form.get("refine_pitch", "false").lower()
-        refine_pitch = True if refine_pitch_raw == "true" else False
+            def seek(self, *args, **kwargs):
+                # 兼容 pipeline.py 里的 audio_file.seek(0)
+                pass
 
-        if not audio_file or not text:
-            return jsonify({"error": "输入无效"}), 400
+        # 将路径字符串包装为兼容的对象
+        compat_audio_file = FileStorageWrapper(wav_path)
+        # ========================================
 
-        if output_format not in pipeline.get_supported_formats()['formats']:
-            return jsonify({
-                "error": f"不支持的格式: {output_format}",
-                "supported": pipeline.get_supported_formats()['formats']
-            }), 400
-
-        logger.info(f"完整处理流程启动: {output_format} 格式")
         result = pipeline.process_full(
-            audio_file=audio_file,
+            audio_file=compat_audio_file,  # 这里改为传入包装后的对象
             text=text,
             language=language,
             output_format=output_format,
@@ -278,23 +314,132 @@ def pipeline_full_process():
             use_double_precision=use_double_precision,
             f0_floor=f0_floor,
             f0_ceil=f0_ceil,
-            refine_pitch=refine_pitch  # 传入解算器
+            refine_pitch=refine_pitch,
         )
 
         if result.get("success"):
-            return jsonify(result), 200
-
-        return jsonify({
-            "success": False,
-            "error": result.get("error", "处理失败"),
-            "stage": result.get("stage", "unknown"),
-            "processing_time": result.get("processing_time", 0)
-        }), 500
+            set_job(
+                job_id,
+                status="done",
+                finished_at=datetime.now().isoformat(),
+                result=result,
+            )
+        else:
+            set_job(
+                job_id,
+                status="failed",
+                finished_at=datetime.now().isoformat(),
+                error=result.get("error"),
+                result=result,
+            )
 
     except Exception as e:
-        logger.error("完整处理流程异常: %s", e, exc_info=True)
-        return jsonify({"error": f"处理出错: {str(e)}"}), 500
+        logger.exception("后台任务异常")
 
+        set_job(
+            job_id,
+            status="failed",
+            finished_at=datetime.now().isoformat(),
+            error=str(e),
+        )
+
+
+@app.route("/api/pipeline/full", methods=["POST"])
+def pipeline_full_process():
+    """
+    MFA + F0 + 工程文件生成
+    异步后台任务版
+    """
+    try:
+        if "audio_file" not in request.files:
+            return jsonify({"error": "缺少 audio_file"}), 400
+
+        if "text" not in request.form:
+            return jsonify({"error": "缺少 text"}), 400
+
+        audio_file = request.files["audio_file"]
+        text = request.form.get("text", "").strip()
+
+        language = request.form.get("language", "cmn")
+        output_format = request.form.get("format", "sv")
+        project_title = request.form.get("title", "Project")
+
+        bpm = float(request.form.get("bpm", 120))
+        base_pitch = int(request.form.get("base_pitch", 60))
+
+        f0_method = request.form.get("f0_method", "dio")
+        f0_smooth = request.form.get("f0_smooth", "true").lower() == "true"
+
+        f0_smooth_window = int(
+            request.form.get("f0_smooth_window", 5)
+        )
+
+        use_double_precision = (
+            request.form.get("precision", "single").lower()
+            == "double"
+        )
+
+        f0_floor = float(request.form.get("f0_floor", 71.0))
+        f0_ceil = float(request.form.get("f0_ceil", 800.0))
+
+        refine_pitch = (
+            request.form.get("refine_pitch", "false").lower()
+            == "true"
+        )
+
+        stem, wav_path, lab_path = build_job_paths(
+            audio_file.filename or "audio.wav"
+        )
+
+        audio_file.save(str(wav_path))
+
+        lab_path.write_text(
+            text + "\n",
+            encoding="utf-8"
+        )
+
+        job_id = uuid.uuid4().hex
+
+        set_job(
+            job_id,
+            status="queued",
+            created_at=datetime.now().isoformat(),
+        )
+
+        Thread(
+            target=run_pipeline_job,
+            daemon=True,
+            args=(
+                job_id,
+                str(wav_path),
+                text,
+                language,
+                output_format,
+                project_title,
+                bpm,
+                base_pitch,
+                f0_method,
+                f0_smooth,
+                f0_smooth_window,
+                use_double_precision,
+                f0_floor,
+                f0_ceil,
+                refine_pitch,
+            ),
+        ).start()
+
+        return jsonify(
+            {
+                "success": True,
+                "job_id": job_id,
+                "status": "queued",
+            }
+        ), 202
+
+    except Exception as e:
+        logger.exception("完整流程启动失败")
+        return jsonify({"error": str(e)}), 500
+    
 
 @app.route("/api/pipeline/mfa-only", methods=["POST"])
 def pipeline_mfa_only():
@@ -570,7 +715,7 @@ def main(host: str = "127.0.0.1", port: int = 5000):
     print(f"{'=' * 60}\n")
 
     Thread(target=open_browser, args=(host, port), daemon=True).start()
-    app.run(host=host, port=port, debug=True, use_reloader=False)
+    app.run(host=host, port=port, debug=True, threaded=True, use_reloader=False)
 
 
 if __name__ == "__main__":
