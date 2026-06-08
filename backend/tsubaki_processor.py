@@ -7,6 +7,9 @@ from __future__ import annotations
 
 import json
 import logging
+import numpy as np
+from scipy.interpolate import interp1d
+from scipy.signal import medfilt, savgol_filter
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
@@ -54,10 +57,13 @@ class AudioProcessingConfig:
 
     # F0 细化参数
     f0_smooth: bool = True
-    f0_smooth_window: int = 5
+    f0_smooth_window: int = 11   # 11 frames × 5ms = 55ms — matches human pitch perception
 
-    # 是否细化音高（控制 LAB 音符音高，是否用 F0 平均音高决定 tone）
+    # 是否细化音高（控制 LAB 音符音高，是否用 F0 中位音高决定 tone）
     refine_pitch: bool = False
+
+    # 是否将 F0 曲线写入工程文件（False = 纯净音符模式，不写 pitchDelta/pitd 曲线）
+    export_pitch_line: bool = True
 
     use_double_precision: bool = False
 
@@ -71,6 +77,7 @@ class AudioProcessingConfig:
             "f0_smooth": self.f0_smooth,
             "f0_smooth_window": self.f0_smooth_window,
             "refine_pitch": self.refine_pitch,
+            "export_pitch_line": self.export_pitch_line,
             "use_double_precision": self.use_double_precision,
         }
 
@@ -237,97 +244,235 @@ class TsubakiProcessor:
         }
 
     # ----------------------------
+    # F0 后处理工具
+    # ----------------------------
+    @staticmethod
+    def _median_filter_1d(arr: np.ndarray, kernel_size: int) -> np.ndarray:
+        """纯 numpy 1D 中值滤波（无需 scipy），使用步进技巧。"""
+        n = len(arr)
+        if n == 0:
+            return arr
+        k = max(1, int(kernel_size))
+        half = k // 2
+        padded = np.pad(arr, half, mode="edge")
+        strides = (padded.strides[0], padded.strides[0])
+        windows = np.lib.stride_tricks.as_strided(
+            padded, shape=(n, k), strides=strides
+        )
+        return np.median(windows, axis=1)
+
+    def _contiguous_runs(self, mask: np.ndarray) -> List[Tuple[int, int]]:
+        idx = np.flatnonzero(mask)
+        if idx.size == 0:
+            return []
+        splits = np.where(np.diff(idx) > 1)[0] + 1
+        groups = np.split(idx, splits)
+        return [(int(g[0]), int(g[-1]) + 1) for g in groups if len(g) > 0]
+
+    def _soft_reject_spikes(
+        self,
+        f0: np.ndarray,
+        suspicious: np.ndarray,
+        max_jump_semitones: float = 3.0,
+        local_win: int = 5,
+    ) -> np.ndarray:
+        out = np.array(f0, dtype=np.float64, copy=True)
+        voiced = out > 0
+        if voiced.sum() < 3:
+            return out
+
+        midi = np.full(out.shape, np.nan, dtype=np.float64)
+        midi[voiced] = 69.0 + 12.0 * np.log2(np.maximum(out[voiced], 1e-12) / 440.0)
+
+        runs = self._contiguous_runs(voiced)
+        for s, e in runs:
+            seg = midi[s:e]
+            valid = np.isfinite(seg)
+            if valid.sum() < 3:
+                continue
+
+            local_med = float(np.nanmedian(seg[valid]))
+            for i in range(s, e):
+                if not suspicious[i] or not np.isfinite(midi[i]):
+                    continue
+                if abs(midi[i] - local_med) >= max_jump_semitones:
+                    out[i] = 0.0
+
+        return out
+
+    def _post_process_f0(self, f0: np.ndarray, config: AudioProcessingConfig) -> np.ndarray:
+        """
+        分段平滑版：
+        1. 清理非法值
+        2. 去掉孤立尖峰
+        3. 只补短空隙
+        4. 只对连续有声段做平滑
+        """
+        f0 = np.asarray(f0, dtype=np.float64).copy()
+        if f0.size == 0:
+            return f0
+
+        f0[~np.isfinite(f0)] = 0.0
+        f0[(f0 < config.f0_floor * 0.6) | (f0 > config.f0_ceil * 1.15)] = 0.0
+
+        # 先补很短的断裂，避免被切碎
+        voiced = f0 > 0
+        runs = self._contiguous_runs(voiced)
+        for (s1, e1), (s2, e2) in zip(runs, runs[1:]):
+            gap = s2 - e1
+            if 1 <= gap <= 3 and f0[e1 - 1] > 0 and f0[s2] > 0:
+                f0[e1:s2] = np.linspace(f0[e1 - 1], f0[s2], gap + 2)[1:-1]
+
+        voiced = f0 > 0
+        runs = self._contiguous_runs(voiced)
+        out = np.zeros_like(f0)
+
+        for s, e in runs:
+            seg = np.array(f0[s:e], dtype=np.float64, copy=True)
+            n = len(seg)
+
+            if n < 3:
+                out[s:e] = np.clip(seg, config.f0_floor, config.f0_ceil)
+                continue
+
+            # 先轻微中值滤波，压掉单帧毛刺
+            if n >= 5:
+                seg = medfilt(seg, kernel_size=3)
+
+            if config.f0_smooth and n >= 5:
+                win = int(config.f0_smooth_window)
+                win = max(5, min(win, n if n % 2 == 1 else n - 1))
+                if win % 2 == 0:
+                    win -= 1
+
+                poly = 3 if win >= 7 else 2
+                poly = min(poly, win - 1)
+
+                try:
+                    seg = savgol_filter(seg, win, poly)
+                except Exception as e:
+                    logger.warning(f"Savitzky-Golay 平滑失败，退回中值结果: {e}")
+
+            out[s:e] = np.clip(seg, config.f0_floor, config.f0_ceil)
+
+        return out
+
+    # ----------------------------
     # F0 提取
     # ----------------------------
     def process_audio_f0(self, audio_path: str, config: AudioProcessingConfig) -> Dict:
-            """使用 PyWORLD 提取音频的 F0 基频曲线。
-            已修复：针对超长音频进行了自动分块与动态帧移优化，防止 C++ 底层 OOM/卡死。
-            """
-            try:
-                if pw is None:
-                    logger.error("PyWORLD 未安装，无法提取 F0 基频。")
-                    return {"success": False, "error": "PyWORLD not installed"}
+        """
+        稳定版 F0 提取：
+        - 保留 dio/harvest + stonemask
+        - d4c 只做软提示，不做硬门槛
+        - 后处理改成分段平滑
+        """
+        try:
+            if pw is None:
+                logger.error("PyWORLD 未安装，无法提取 F0 基频。")
+                return {"success": False, "error": "PyWORLD not installed"}
 
-                logger.info(f"正在读取音频文件: {audio_path}")
-                x, sr = sf.read(audio_path)
-                if len(x.shape) > 1:
-                    x = np.mean(x, axis=1)
-                x = x.astype(np.float64)
+            logger.info(f"正在读取音频文件: {audio_path}")
+            x, sr = sf.read(audio_path)
 
-                total_samples = len(x)
-                duration_sec = total_samples / sr
-                logger.info(f"✓ 音频加载完成，总长度: {duration_sec:.2f} 秒 ({duration_sec/60:.2f} 分钟)")
+            if len(x.shape) > 1:
+                x = np.mean(x, axis=1)
 
-                # ── 优化 1：根据音频长度动态调整帧移 (frame_period, 单位 ms) ──
-                # 默认 5.0ms。长音频若坚持 5ms 会导致生成上百万个点，使 JSON 膨胀并导致软件无法打开。
-                frame_period = 5.0
-                if duration_sec > 600:   # 超过 10 分钟，放宽到 20ms
-                    frame_period = 20.0
-                if duration_sec > 3600:  # 超过 1 小时，放宽到 40ms
-                    frame_period = 40.0
-                
-                logger.info(f"当前设定的提取帧移 (frame_period) 为: {frame_period} ms")
+            x = np.nan_to_num(x, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            x = np.ascontiguousarray(x, dtype=np.float64)
 
-                # ── 优化 2：设定分块大小（每块 300 秒 = 5 分钟） ──
-                chunk_length_sec = 300
-                chunk_size = int(chunk_length_sec * sr)
+            total_samples = len(x)
+            duration_sec = total_samples / sr
+            logger.info(f"✓ 音频加载完成，总长度: {duration_sec:.2f} 秒 ({duration_sec/60:.2f} 分钟)")
 
-                if total_samples <= chunk_size:
-                    # 短音频：保持原流程直接单块处理
-                    if config.f0_method.lower() == "harvest":
-                        f0, t = pw.harvest(x, sr, f0_floor=config.f0_floor, f0_ceil=config.f0_ceil, frame_period=frame_period)
-                    else:
-                        f0, t = pw.dio(x, sr, f0_floor=config.f0_floor, f0_ceil=config.f0_ceil, frame_period=frame_period)
-                        f0 = pw.stonemask(x, f0, t, sr)
+            frame_period = 5.0
+            if duration_sec > 600:
+                frame_period = 20.0
+            if duration_sec > 3600:
+                frame_period = 40.0
+
+            logger.info(f"当前设定的提取帧移 (frame_period) 为: {frame_period} ms")
+
+            def _extract_block(x_block: np.ndarray):
+                if config.f0_method.lower() == "harvest":
+                    f0_b, t_b = pw.harvest(
+                        x_block, sr,
+                        f0_floor=config.f0_floor,
+                        f0_ceil=config.f0_ceil,
+                        frame_period=frame_period
+                    )
                 else:
-                    # 超长音频：启动分块循环提取
-                    logger.info(f"检测到超长音频，启动分块流式处理...")
-                    f0_list = []
-                    t_list = []
-                    
-                    for start_idx in range(0, total_samples, chunk_size):
-                        end_idx = min(start_idx + chunk_size, total_samples)
-                        x_chunk = x[start_idx:end_idx]
-                        
-                        if len(x_chunk) < 256:  # 样本过少无法提取则跳过
-                            continue
-                            
-                        current_chunk = start_idx // chunk_size + 1
-                        total_chunks = (total_samples + chunk_size - 1) // chunk_size
-                        logger.info(f" -> 正在提取音高曲线: 第 {current_chunk}/{total_chunks} 分块...")
+                    f0_b, t_b = pw.dio(
+                        x_block, sr,
+                        f0_floor=config.f0_floor,
+                        f0_ceil=config.f0_ceil,
+                        frame_period=frame_period
+                    )
+                    f0_b = pw.stonemask(x_block, f0_b, t_b, sr)
 
-                        if config.f0_method.lower() == "harvest":
-                            f0_c, t_c = pw.harvest(x_chunk, sr, f0_floor=config.f0_floor, f0_ceil=config.f0_ceil, frame_period=frame_period)
-                        else:
-                            f0_c, t_c = pw.dio(x_chunk, sr, f0_floor=config.f0_floor, f0_ceil=config.f0_ceil, frame_period=frame_period)
-                            f0_c = pw.stonemask(x_chunk, f0_c, t_c, sr)
-                        
-                        # 核心：将当前分块的时间轴 t 加上在全局音频中的真实时间偏移（秒）
-                        t_c = t_c + (start_idx / sr)
-                        
-                        f0_list.append(f0_c)
-                        t_list.append(t_c)
-                    
-                    # 安全拼接所有分块数据
-                    f0 = np.concatenate(f0_list)
-                    t = np.concatenate(t_list)
-                    logger.info("✓ 所有分块音高提取完毕，已成功无缝连接全局时间轴。")
+                f0_b = np.asarray(f0_b, dtype=np.float64)
+                f0_b[~np.isfinite(f0_b)] = 0.0
+                f0_b[(f0_b < config.f0_floor * 0.6) | (f0_b > config.f0_ceil * 1.15)] = 0.0
+                return f0_b, t_b
 
-                # ── 优化 3：对平滑窗大小进行安全保护 ──
-                if config.f0_smooth and config.f0_smooth_window > 1 and len(f0) > 0:
-                    window = int(config.f0_smooth_window)
-                    if window % 2 == 0:
-                        window += 1
-                    window = max(3, window)
-                    voiced_mask = f0 > 0
-                    padded = np.pad(f0, window // 2, mode="edge")
-                    smoothed = np.convolve(padded, np.ones(window) / window, mode="valid")
-                    f0 = np.where(voiced_mask, smoothed, 0.0)
+            chunk_length_sec = 300
+            chunk_size = int(chunk_length_sec * sr)
 
-                return {"success": True, "f0": f0, "t": t, "sr": sr}
-            except Exception as e:
-                logger.error(f"✗ F0 基频提取发生严重异常: {e}", exc_info=True)
-                return {"success": False, "error": str(e)}
+            if total_samples <= chunk_size:
+                f0, t = _extract_block(x)
+
+                # d4c 只做软拒绝
+                try:
+                    ap = pw.d4c(x, f0, t, sr)
+                    ap0 = np.asarray(ap[:, 0], dtype=np.float64)
+                    suspicious = (ap0 > 0.82) & (f0 > 0)
+                    f0 = self._soft_reject_spikes(f0, suspicious, max_jump_semitones=3.0, local_win=5)
+                except Exception as e:
+                    logger.warning(f"d4c 检查失败，继续使用纯 F0 后处理: {e}")
+
+            else:
+                logger.info("检测到超长音频，启动分块流式处理...")
+                f0_list = []
+                t_list = []
+
+                for start_idx in range(0, total_samples, chunk_size):
+                    end_idx = min(start_idx + chunk_size, total_samples)
+                    x_chunk = x[start_idx:end_idx]
+
+                    if len(x_chunk) < 256:
+                        continue
+
+                    current_chunk = start_idx // chunk_size + 1
+                    total_chunks = (total_samples + chunk_size - 1) // chunk_size
+                    logger.info(f" -> 正在提取音高曲线: 第 {current_chunk}/{total_chunks} 分块...")
+
+                    f0_c, t_c = _extract_block(x_chunk)
+
+                    try:
+                        ap_c = pw.d4c(x_chunk, f0_c, t_c, sr)
+                        ap0_c = np.asarray(ap_c[:, 0], dtype=np.float64)
+                        suspicious_c = (ap0_c > 0.82) & (f0_c > 0)
+                        f0_c = self._soft_reject_spikes(f0_c, suspicious_c, max_jump_semitones=3.0, local_win=5)
+                    except Exception as e:
+                        logger.warning(f"分块 d4c 检查失败，继续处理: {e}")
+
+                    t_c = t_c + (start_idx / sr)
+                    f0_list.append(f0_c)
+                    t_list.append(t_c)
+
+                if not f0_list:
+                    return {"success": False, "error": "未提取到任何有效 F0 分块"}
+
+                f0 = np.concatenate(f0_list)
+                t = np.concatenate(t_list)
+                logger.info("✓ 所有分块音高提取完毕，已成功无缝连接全局时间轴。")
+
+            f0 = self._post_process_f0(f0, config)
+            return {"success": True, "f0": f0, "t": t, "sr": sr}
+
+        except Exception as e:
+            logger.error(f"✗ F0 基频提取发生严重异常: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
 
     # ----------------------------
     # SVP 生成（完整修复版）
@@ -402,9 +547,10 @@ class TsubakiProcessor:
                 seg_f0    = f0[mask]
                 voiced    = seg_f0[seg_f0 > 0]
                 if len(voiced) > 0:
-                    avg_f0 = float(np.mean(voiced))
-                    tone   = int(round(self._freq_to_midi(avg_f0)))
-                    tone   = max(12, min(127, tone))
+                    # 在 MIDI（半音）空间取中位数，避免 Hz 域平均偏向高频
+                    midi_vals = 69.0 + 12.0 * np.log2(voiced / 440.0)
+                    tone      = int(round(float(np.median(midi_vals))))
+                    tone      = max(12, min(127, tone))
 
             # 原本就有的 "-" 标签由于不属于 _is_true_silence，会顺利走到这里，被正确保留为 "-" 音符
             note = self._default_svp_note(seg.label, tone, onset, dur)
@@ -419,7 +565,7 @@ class TsubakiProcessor:
         # ── 步骤 3：pitchDelta points（float cents，cubic mode）──────────────
         pitch_data: List[float] = []
 
-        if t is not None and f0 is not None and len(f0) > 0:
+        if config.export_pitch_line and t is not None and f0 is not None and len(f0) > 0:
             for ti, f0i in zip(t, f0):
                 if f0i <= 0: # 或者是对齐 JS 的 f0i < 55
                     continue
@@ -569,9 +715,10 @@ class TsubakiProcessor:
                 seg_f0 = f0[mask]
                 voiced = seg_f0[seg_f0 > 0]
                 if len(voiced) > 0:
-                    avg_f0 = float(np.mean(voiced))
-                    tone   = int(round(self._freq_to_midi(avg_f0)))
-                    tone   = max(0, min(127, tone))
+                    # 在 MIDI（半音）空间取中位数，避免 Hz 域平均偏向高频
+                    midi_vals = 69.0 + 12.0 * np.log2(voiced / 440.0)
+                    tone      = int(round(float(np.median(midi_vals))))
+                    tone      = max(0, min(127, tone))
 
             notes.append({
                 "position": pos,
@@ -591,7 +738,7 @@ class TsubakiProcessor:
 
         # ── 2. Pitch 偏移曲线 ────────────────────────────────────────────────
         xs, ys = [], []
-        if t is not None and f0 is not None:
+        if config.export_pitch_line and t is not None and f0 is not None:
             for ti, f0i in zip(t, f0):
                 if f0i <= 0:
                     continue
