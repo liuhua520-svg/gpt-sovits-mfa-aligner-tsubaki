@@ -94,10 +94,10 @@
           </el-select>
         </el-form-item>
 
-        <el-form-item v-if="processingMode === 'full'" label="工程标题">
+        <el-form-item v-if="processingMode === 'full'" label="音轨名">
           <el-input
             v-model="formData.projectTitle"
-            placeholder="输入工程文件标题"
+            placeholder="输入音轨名"
             maxlength="248"
           />
         </el-form-item>
