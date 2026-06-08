@@ -240,37 +240,94 @@ class TsubakiProcessor:
     # F0 提取
     # ----------------------------
     def process_audio_f0(self, audio_path: str, config: AudioProcessingConfig) -> Dict:
-        """使用 PyWORLD 提取音频的 F0 基频曲线。"""
-        try:
-            if pw is None:
-                logger.error("PyWORLD 未安装，无法提取 F0 基频。")
-                return {"success": False, "error": "PyWORLD not installed"}
+            """使用 PyWORLD 提取音频的 F0 基频曲线。
+            已修复：针对超长音频进行了自动分块与动态帧移优化，防止 C++ 底层 OOM/卡死。
+            """
+            try:
+                if pw is None:
+                    logger.error("PyWORLD 未安装，无法提取 F0 基频。")
+                    return {"success": False, "error": "PyWORLD not installed"}
 
-            x, sr = sf.read(audio_path)
-            if len(x.shape) > 1:
-                x = np.mean(x, axis=1)
-            x = x.astype(np.float64)
+                logger.info(f"正在读取音频文件: {audio_path}")
+                x, sr = sf.read(audio_path)
+                if len(x.shape) > 1:
+                    x = np.mean(x, axis=1)
+                x = x.astype(np.float64)
 
-            if config.f0_method.lower() == "harvest":
-                f0, t = pw.harvest(x, sr, f0_floor=config.f0_floor, f0_ceil=config.f0_ceil)
-            else:
-                f0, t = pw.dio(x, sr, f0_floor=config.f0_floor, f0_ceil=config.f0_ceil)
-                f0 = pw.stonemask(x, f0, t, sr)
+                total_samples = len(x)
+                duration_sec = total_samples / sr
+                logger.info(f"✓ 音频加载完成，总长度: {duration_sec:.2f} 秒 ({duration_sec/60:.2f} 分钟)")
 
-            if config.f0_smooth and config.f0_smooth_window > 1 and len(f0) > 0:
-                window = int(config.f0_smooth_window)
-                if window % 2 == 0:
-                    window += 1
-                window = max(3, window)
-                voiced_mask = f0 > 0
-                padded = np.pad(f0, window // 2, mode="edge")
-                smoothed = np.convolve(padded, np.ones(window) / window, mode="valid")
-                f0 = np.where(voiced_mask, smoothed, 0.0)
+                # ── 优化 1：根据音频长度动态调整帧移 (frame_period, 单位 ms) ──
+                # 默认 5.0ms。长音频若坚持 5ms 会导致生成上百万个点，使 JSON 膨胀并导致软件无法打开。
+                frame_period = 5.0
+                if duration_sec > 600:   # 超过 10 分钟，放宽到 20ms
+                    frame_period = 20.0
+                if duration_sec > 3600:  # 超过 1 小时，放宽到 40ms
+                    frame_period = 40.0
+                
+                logger.info(f"当前设定的提取帧移 (frame_period) 为: {frame_period} ms")
 
-            return {"success": True, "f0": f0, "t": t, "sr": sr}
-        except Exception as e:
-            logger.error(f"F0 基频提取异常: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+                # ── 优化 2：设定分块大小（每块 300 秒 = 5 分钟） ──
+                chunk_length_sec = 300
+                chunk_size = int(chunk_length_sec * sr)
+
+                if total_samples <= chunk_size:
+                    # 短音频：保持原流程直接单块处理
+                    if config.f0_method.lower() == "harvest":
+                        f0, t = pw.harvest(x, sr, f0_floor=config.f0_floor, f0_ceil=config.f0_ceil, frame_period=frame_period)
+                    else:
+                        f0, t = pw.dio(x, sr, f0_floor=config.f0_floor, f0_ceil=config.f0_ceil, frame_period=frame_period)
+                        f0 = pw.stonemask(x, f0, t, sr)
+                else:
+                    # 超长音频：启动分块循环提取
+                    logger.info(f"检测到超长音频，启动分块流式处理...")
+                    f0_list = []
+                    t_list = []
+                    
+                    for start_idx in range(0, total_samples, chunk_size):
+                        end_idx = min(start_idx + chunk_size, total_samples)
+                        x_chunk = x[start_idx:end_idx]
+                        
+                        if len(x_chunk) < 256:  # 样本过少无法提取则跳过
+                            continue
+                            
+                        current_chunk = start_idx // chunk_size + 1
+                        total_chunks = (total_samples + chunk_size - 1) // chunk_size
+                        logger.info(f" -> 正在提取音高曲线: 第 {current_chunk}/{total_chunks} 分块...")
+
+                        if config.f0_method.lower() == "harvest":
+                            f0_c, t_c = pw.harvest(x_chunk, sr, f0_floor=config.f0_floor, f0_ceil=config.f0_ceil, frame_period=frame_period)
+                        else:
+                            f0_c, t_c = pw.dio(x_chunk, sr, f0_floor=config.f0_floor, f0_ceil=config.f0_ceil, frame_period=frame_period)
+                            f0_c = pw.stonemask(x_chunk, f0_c, t_c, sr)
+                        
+                        # 核心：将当前分块的时间轴 t 加上在全局音频中的真实时间偏移（秒）
+                        t_c = t_c + (start_idx / sr)
+                        
+                        f0_list.append(f0_c)
+                        t_list.append(t_c)
+                    
+                    # 安全拼接所有分块数据
+                    f0 = np.concatenate(f0_list)
+                    t = np.concatenate(t_list)
+                    logger.info("✓ 所有分块音高提取完毕，已成功无缝连接全局时间轴。")
+
+                # ── 优化 3：对平滑窗大小进行安全保护 ──
+                if config.f0_smooth and config.f0_smooth_window > 1 and len(f0) > 0:
+                    window = int(config.f0_smooth_window)
+                    if window % 2 == 0:
+                        window += 1
+                    window = max(3, window)
+                    voiced_mask = f0 > 0
+                    padded = np.pad(f0, window // 2, mode="edge")
+                    smoothed = np.convolve(padded, np.ones(window) / window, mode="valid")
+                    f0 = np.where(voiced_mask, smoothed, 0.0)
+
+                return {"success": True, "f0": f0, "t": t, "sr": sr}
+            except Exception as e:
+                logger.error(f"✗ F0 基频提取发生严重异常: {e}", exc_info=True)
+                return {"success": False, "error": str(e)}
 
     # ----------------------------
     # SVP 生成（完整修复版）
@@ -291,8 +348,8 @@ class TsubakiProcessor:
 
         修复要点
         ────────
-        1. blicks = LAB 时间戳（100ns 单位）直接使用，即 blicks_per_second = 10,000,000。
-           不可使用 (bpm/60)*705600000 换算，那个公式会让时间偏移 141 倍。
+        1. blicks = LAB 时间戳（100ns 单位）不可使用，即 blicks_per_second = 10,000,000。
+           需要使用 (bpm/60)*705600000 换算，那个公式会让时间缩小 141 倍。
 
         2. 音符放入 library[0].notes，而非 mainGroup.notes：
            • '-' (consonant onset) 保留为实际音符（不跳过）
@@ -464,35 +521,20 @@ class TsubakiProcessor:
         audio_duration_sec: Optional[float] = None,
     ) -> str:
         """
-        生成 USTX 工程文件内容。
-
-        修复要点
-        ────────
-        • ruamel.yaml ≥ 0.18 已移除 yaml_set_tag()。
-          替换为：part.yaml_set_ctag(Tag(suffix="!UVoicePart"))
-          其中 Tag(suffix=...) 在 handle=None 时 trval = suffix，可直接序列化。
-
-        • USTX 不使用 '-' dash 音符（OpenUtau 用自己的 phonemizer 处理声母）。
-          只保留真正的有声音节，跳过 '-' 和静音。
-
-        • ticks 换算：ticks = lab_time_sec * (bpm/60) * resolution
-          USTX 的时间单位是 tick（与 BPM/resolution 相关），不是绝对 blick。
+        生成纯 MIDI 音轨的 USTX 文件内容（不包含原音频伴奏轨）。
         """
-        if audio_duration_sec is None:
-            audio_duration_sec = 0.0
-
         from ruamel.yaml import YAML
-        from ruamel.yaml.comments import CommentedMap
-        from ruamel.yaml.tag import Tag
+        from io import StringIO
 
-        resolution = 480
-        ticks_per_sec = (float(config.bpm) / 60.0) * float(resolution)
+        resolution    = 480
+        ticks_per_sec = (float(config.bpm) / 60.0) * resolution
 
+        # ── 工具函数 ─────────────────────────────────────────────────────────
         def make_default_pitch():
             return {
                 "data": [
                     {"x": -1, "y": 0, "shape": "io"},
-                    {"x": 1,  "y": 0, "shape": "io"},
+                    {"x":  1, "y": 0, "shape": "io"},
                 ],
                 "snap_first": True,
             }
@@ -503,10 +545,13 @@ class TsubakiProcessor:
                 "in": 10, "out": 10, "shift": 0, "drift": 0,
             }
 
+        # ── 1. 音符收集 ──────────────────────────────────────────────────────
         notes = []
         for seg in segments:
-            # USTX 跳过静音和 '-' dash（OpenUtau 自行处理声母）
-            if self._is_true_silence(seg.label) or seg.label.strip() == "-":
+            if seg.end_time <= seg.start_time:
+                continue
+            label = seg.label.strip()
+            if not label or self._is_true_silence(label):
                 continue
 
             start_sec = self._lab_time_to_seconds(seg.start_time)
@@ -516,131 +561,124 @@ class TsubakiProcessor:
 
             pos      = int(round(start_sec * ticks_per_sec))
             end_pos  = int(round(end_sec   * ticks_per_sec))
-            duration = max(1, end_pos - pos)
+            dur_tick = max(1, end_pos - pos)
 
             tone = int(config.base_pitch)
-            if config.refine_pitch and t is not None and f0 is not None and len(f0) > 0:
+            if config.refine_pitch and f0 is not None and t is not None:
                 mask   = (t >= start_sec) & (t < end_sec)
                 seg_f0 = f0[mask]
                 voiced = seg_f0[seg_f0 > 0]
                 if len(voiced) > 0:
                     avg_f0 = float(np.mean(voiced))
                     tone   = int(round(self._freq_to_midi(avg_f0)))
-                    tone   = max(12, min(127, tone))
+                    tone   = max(0, min(127, tone))
 
             notes.append({
-                "position":          pos,
-                "duration":          duration,
-                "tone":              tone,
-                "lyric":             seg.label,
-                "pitch":             make_default_pitch(),
-                "vibrato":           make_default_vibrato(),
+                "position": pos,
+                "duration": dur_tick,
+                "tone":     tone,
+                "lyric":    label,
+                "pitch":    make_default_pitch(),
+                "vibrato":  make_default_vibrato(),
                 "phoneme_expressions": [],
                 "phoneme_overrides":   [],
             })
 
-        xs: List[int] = []
-        ys: List[int] = []
+        voice_duration = max(
+            (n["position"] + n["duration"] for n in notes),
+            default=0,
+        )
+
+        # ── 2. Pitch 偏移曲线 ────────────────────────────────────────────────
+        xs, ys = [], []
         if t is not None and f0 is not None:
             for ti, f0i in zip(t, f0):
                 if f0i <= 0:
                     continue
-                tick = int(round(float(ti) * ticks_per_sec))
-
+                tick          = int(round(ti * ticks_per_sec))
                 nominal_pitch = int(config.base_pitch)
                 for note in notes:
                     if note["position"] <= tick <= (note["position"] + note["duration"]):
-                        nominal_pitch = int(note["tone"])
+                        nominal_pitch = note["tone"]
                         break
-
-                pitch_midi      = self._freq_to_midi(float(f0i))
-                deviation_cents = int(round((pitch_midi - nominal_pitch) * 100))
+                deviation = int(round((self._freq_to_midi(float(f0i)) - nominal_pitch) * 100))
                 xs.append(tick)
-                ys.append(deviation_cents)
+                ys.append(deviation)
 
-        # ── 修复：用 Tag(suffix=...) 替代已弃用的 yaml_set_tag() ─────────────
-        part = CommentedMap({
-            "name":      title,
-            "comment":   "",
-            "track_no":  0,
-            "position":  0,
-            "notes":     notes,
-            "curves": [{"xs": xs, "ys": ys, "abbr": "pitd"}],
-        })
-        part.yaml_set_ctag(Tag(suffix="!UVoicePart"))
+        # ── 3. 轨道配置（仅保留单轨，对应 track_no: 0） ──────────────────────────
+        def _make_track():
+            return {
+                "phonemizer":        "OpenUtau.Core.DefaultPhonemizer",
+                "renderer_settings": {},
+                "mute":   False,
+                "solo":   False,
+                "volume": 0,
+            }
 
-        wave_part = CommentedMap({
-            "name":              "Reference",
-            "track_no":          1,
-            "position":          0,
-            "relative_path":     str(Path(wav_path).name),
-            "file_duration_ms":  float(audio_duration_sec * 1000.0),
-        })
-        wave_part.yaml_set_ctag(Tag(suffix="!UWavePart"))
+        tracks = [_make_track()]
 
-        project = {
-            "name":         title,
-            "comment":      "",
-            "output_dir":   "Vocal",
-            "cache_dir":    "UCache",
+        # ── 4. Voice Part 配置 ──────────────────────────────────────────────
+        voice_part = {
+            "name":     title,
+            "comment":  "",
+            "duration": voice_duration,
+            "track_no": 0,
+            "position": 0,
+            "notes":    notes,
+            "curves":   [{"xs": xs, "ys": ys, "abbr": "pitd"}],
+        }
+
+        # ── 5. 顶层项目结构（wave_parts 固定为空） ───────────────────────────────
+        project_obj = {
+            "name":        title,
+            "comment":     "",
+            "output_dir":  "Vocal",
+            "cache_dir":   "UCache",
             "ustx_version": "0.6",
-            "resolution":   resolution,
-            "bpm":          int(config.bpm),
+            "resolution":  resolution,
+            "bpm":         float(config.bpm),
             "beat_per_bar": 4,
             "beat_unit":    4,
-            "expressions":  self._get_default_expressions(),
             "time_signatures": [{"bar_position": 0, "beat_per_bar": 4, "beat_unit": 4}],
-            "tempos":           [{"position": 0, "bpm": int(config.bpm)}],
-            "tracks": [
-                {
-                    "name":              "Singing Track",
-                    "comment":           "",
-                    "singer":            "",
-                    "phonemizer":        "OpenUtau.Core.DefaultPhonemizer",
-                    "renderer_settings": {"renderer": "", "resampler": "", "wavtool": ""},
-                    "mute": False, "solo": False, "volume": 0, "pan": 0,
-                },
-                {
-                    "name":              "Audio Track",
-                    "comment":           "",
-                    "singer":            "",
-                    "phonemizer":        "OpenUtau.Core.DefaultPhonemizer",
-                    "renderer_settings": {"renderer": "", "resampler": "", "wavtool": ""},
-                    "mute": False, "solo": False, "volume": 0, "pan": 0,
-                },
-            ],
-            "parts": [part, wave_part],
+            "tempos":          [{"position": 0, "bpm": float(config.bpm)}],
+            "expressions":      self._get_default_expressions(),
+            "tracks":          tracks,       
+            "voice_parts":     [voice_part], 
+            "wave_parts":      [],           # 彻底移除音频轨
         }
 
         yaml = YAML()
-        yaml.default_flow_style = False
-        yaml.allow_unicode = True
+        yaml.default_flow_style               = False
+        yaml.allow_unicode                  = True
         yaml.sort_base_mapping_type_on_output = False
 
         stream = StringIO()
-        yaml.dump(project, stream)
+        yaml.dump(project_obj, stream)
         return stream.getvalue()
 
     def _get_default_expressions(self) -> Dict:
-        return {
-            "dyn":  {"name": "dynamics (curve)",        "abbr": "dyn",  "type": "Curve",     "min": -240,  "max": 120,  "default_value": 0,   "is_flag": False, "flag": ""},
-            "pitd": {"name": "pitch deviation (curve)", "abbr": "pitd", "type": "Curve",     "min": -1200, "max": 1200, "default_value": 0,   "is_flag": False, "flag": ""},
-            "clr":  {"name": "voice color",             "abbr": "clr",  "type": "Options",   "min": 0,     "max": -1,   "default_value": 0,   "is_flag": False, "options": []},
-            "eng":  {"name": "resampler engine",        "abbr": "eng",  "type": "Options",   "min": 0,     "max": 1,    "default_value": 0,   "is_flag": False, "options": ["", "worldline"]},
-            "vel":  {"name": "velocity",                "abbr": "vel",  "type": "Numerical", "min": 0,     "max": 200,  "default_value": 100, "is_flag": False, "flag": ""},
-            "vol":  {"name": "volume",                  "abbr": "vol",  "type": "Numerical", "min": 0,     "max": 200,  "default_value": 100, "is_flag": False, "flag": ""},
-            "atk":  {"name": "attack",                  "abbr": "atk",  "type": "Numerical", "min": 0,     "max": 200,  "default_value": 100, "is_flag": False, "flag": ""},
-            "dec":  {"name": "decay",                   "abbr": "dec",  "type": "Numerical", "min": 0,     "max": 100,  "default_value": 0,   "is_flag": False, "flag": ""},
-            "gen":  {"name": "gender",                  "abbr": "gen",  "type": "Numerical", "min": -100,  "max": 100,  "default_value": 0,   "is_flag": True,  "flag": "g"},
-            "genc": {"name": "gender (curve)",          "abbr": "genc", "type": "Curve",     "min": -100,  "max": 100,  "default_value": 0,   "is_flag": False, "flag": ""},
-            "bre":  {"name": "breath",                  "abbr": "bre",  "type": "Numerical", "min": 0,     "max": 100,  "default_value": 0,   "is_flag": True,  "flag": "B"},
-            "brec": {"name": "breathiness (curve)",     "abbr": "brec", "type": "Curve",     "min": -100,  "max": 100,  "default_value": 0,   "is_flag": False, "flag": ""},
-            "lpf":  {"name": "lowpass",                 "abbr": "lpf",  "type": "Numerical", "min": 0,     "max": 100,  "default_value": 0,   "is_flag": True,  "flag": "H"},
-            "mod":  {"name": "modulation",              "abbr": "mod",  "type": "Numerical", "min": 0,     "max": 200,  "default_value": 100, "is_flag": False, "flag": ""},
-            "alt":  {"name": "alternate",               "abbr": "alt",  "type": "Numerical", "min": 0,     "max": 16,   "default_value": 0,   "is_flag": False, "flag": ""},
-            "shft": {"name": "tone shift",              "abbr": "shft", "type": "Numerical", "min": -36,   "max": 36,   "default_value": 0,   "is_flag": False, "flag": ""},
-            "shfc": {"name": "tone shift (curve)",      "abbr": "shfc", "type": "Curve",     "min": -1200, "max": 1200, "default_value": 0,   "is_flag": False, "flag": ""},
-        }
+            """补齐了样本文件中定义的所有弯曲控制和核心包络表达式"""
+            return {
+                "dyn":  {"name": "dynamics (curve)",        "abbr": "dyn",  "type": "Curve",     "min": -240,  "max": 120,  "default_value": 0,   "is_flag": False, "flag": ""},
+                "pitd": {"name": "pitch deviation (curve)", "abbr": "pitd", "type": "Curve",     "min": -1200, "max": 1200, "default_value": 0,   "is_flag": False, "flag": ""},
+                "clr":  {"name": "voice color",             "abbr": "clr",  "type": "Options",   "min": 0,     "max": -1,   "default_value": 0,   "is_flag": False, "options": []},
+                "eng":  {"name": "resampler engine",        "abbr": "eng",  "type": "Options",   "min": 0,     "max": 1,    "default_value": 0,   "is_flag": False, "options": ["", "worldline"]},
+                "vel":  {"name": "velocity",                "abbr": "vel",  "type": "Numerical", "min": 0,     "max": 200,  "default_value": 100, "is_flag": False, "flag": ""},
+                "vol":  {"name": "volume",                  "abbr": "vol",  "type": "Numerical", "min": 0,     "max": 200,  "default_value": 100, "is_flag": False, "flag": ""},
+                "atk":  {"name": "attack",                  "abbr": "atk",  "type": "Numerical", "min": 0,     "max": 200,  "default_value": 100, "is_flag": False, "flag": ""},
+                "dec":  {"name": "decay",                   "abbr": "dec",  "type": "Numerical", "min": 0,     "max": 100,  "default_value": 0,   "is_flag": False, "flag": ""},
+                "gen":  {"name": "gender",                  "abbr": "gen",  "type": "Numerical", "min": -100,  "max": 100,  "default_value": 0,   "is_flag": True,  "flag": "g"},
+                "genc": {"name": "gender (curve)",          "abbr": "genc", "type": "Curve",     "min": -100,  "max": 100,  "default_value": 0,   "is_flag": False, "flag": ""},
+                "bre":  {"name": "breath",                  "abbr": "bre",  "type": "Numerical", "min": 0,     "max": 100,  "default_value": 0,   "is_flag": True,  "flag": "B"},
+                "brec": {"name": "breathiness (curve)",     "abbr": "brec", "type": "Curve",     "min": -100,  "max": 100,  "default_value": 0,   "is_flag": False, "flag": ""},
+                "lpf":  {"name": "lowpass",                 "abbr": "lpf",  "type": "Numerical", "min": 0,     "max": 100,  "default_value": 0,   "is_flag": True,  "flag": "H"},
+                "mod":  {"name": "modulation",              "abbr": "mod",  "type": "Numerical", "min": 0,     "max": 100,  "default_value": 0,   "is_flag": False, "flag": ""},
+                "alt":  {"name": "alternate",               "abbr": "alt",  "type": "Numerical", "min": 0,     "max": 16,   "default_value": 0,   "is_flag": False, "flag": ""},
+                "shft": {"name": "tone shift",              "abbr": "shft", "type": "Numerical", "min": -36,   "max": 36,   "default_value": 0,   "is_flag": False, "flag": ""},
+                "shfc": {"name": "tone shift (curve)",      "abbr": "shfc", "type": "Curve",     "min": -1200, "max": 1200, "default_value": 0,   "is_flag": False, "flag": ""},
+                "tenc": {"name": "tension (curve)",         "abbr": "tenc", "type": "Curve",     "min": -100,  "max": 100,  "default_value": 0,   "is_flag": False, "flag": ""},
+                "voic": {"name": "voicing (curve)",         "abbr": "voic", "type": "Curve",     "min": 0,     "max": 100,  "default_value": 100, "is_flag": False, "flag": ""},
+            }
 
     # ----------------------------
     # 完整流程入口
