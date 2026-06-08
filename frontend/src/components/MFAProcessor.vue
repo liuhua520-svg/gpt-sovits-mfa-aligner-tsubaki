@@ -477,8 +477,8 @@ interface FormData {
 interface AdvancedConfig {
   bpm: number
   base_pitch: number
-  auto_note_pitch: boolean    // 新增：自动音符音高控制
-  export_pitch_line: boolean  // 新增：导出连续音高曲线控制
+  auto_note_pitch: boolean
+  export_pitch_line: boolean
   f0_method: 'dio' | 'harvest'
   precision: 'single' | 'double'
   f0_smooth: boolean
@@ -510,8 +510,8 @@ const formData = ref<FormData>({
 const advancedConfig = ref<AdvancedConfig>({
   bpm: 120,
   base_pitch: 60,
-  auto_note_pitch: true,    // 默认开启自动对齐实际音高
-  export_pitch_line: true,  // 默认开启导出 F0 曲线参数
+  auto_note_pitch: true,
+  export_pitch_line: true,
   f0_method: 'harvest',
   precision: 'double',
   f0_smooth: true,
@@ -548,12 +548,14 @@ const systemStatus = ref<SystemStatus>({
 })
 
 const processingDetails = ref<any[]>([
-  { stage: '1. MFA 自动标注', status: '等待', message: '準备進行音頻對齐' },
+  { stage: '1. MFA 自动标注', status: '等待', message: '准备进行音频对齐' },
   { stage: '2. F0 音高提取', status: '等待', message: '提取音频基频信息' },
   { stage: '3. 工程文件生成', status: '等待', message: '生成 Synthesizer V / OpenUtau 工程文件' }
 ])
 
-// 防御性计算属性
+const currentJobId = ref<string>('')
+let jobPollTimer: number | null = null
+
 const normalizedModels = computed(() => {
   const defaultModels = {
     cmn: false,
@@ -562,24 +564,23 @@ const normalizedModels = computed(() => {
     kor: false,
     yue: false
   }
-  
+
   if (!systemStatus.value.mfa?.models || typeof systemStatus.value.mfa.models !== 'object') {
     return defaultModels
   }
-  
+
   return { ...defaultModels, ...systemStatus.value.mfa.models }
 })
 
 const isReady = computed(() => {
-  return systemStatus.value.mfa?.installed && 
-         normalizedModels.value[formData.value.language as keyof typeof normalizedModels.value]
+  return systemStatus.value.mfa?.installed &&
+    normalizedModels.value[formData.value.language as keyof typeof normalizedModels.value]
 })
 
 onMounted(() => {
   checkSystemStatus()
 })
 
-// MIDI 音符转换为音名
 const midiNoteToName = (note: number): string => {
   const notes = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
   const octave = Math.floor(note / 12) - 1
@@ -587,7 +588,6 @@ const midiNoteToName = (note: number): string => {
   return `${noteName}${octave}`
 }
 
-// 格式化文件大小
 const formatFileSize = (bytes: number): string => {
   if (bytes === 0) return '0 Bytes'
   const k = 1024
@@ -596,24 +596,130 @@ const formatFileSize = (bytes: number): string => {
   return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i]
 }
 
-// 格式化时间
 const formatTime = (ms: number): string => {
   const seconds = Math.floor(ms / 1000)
   const minutes = Math.floor(seconds / 60)
   const hours = Math.floor(minutes / 60)
-  
-  if (hours > 0) {
-    return `${hours}h ${minutes % 60}m ${seconds % 60}s`
-  } else if (minutes > 0) {
-    return `${minutes}m ${seconds % 60}s`
-  } else {
-    return `${seconds}s`
+
+  if (hours > 0) return `${hours}h ${minutes % 60}m ${seconds % 60}s`
+  if (minutes > 0) return `${minutes}m ${seconds % 60}s`
+  return `${seconds}s`
+}
+
+const getFileName = (path: string): string => {
+  return path.split(/[\\/]/).pop() || path
+}
+
+const clearJobPolling = () => {
+  if (jobPollTimer !== null) {
+    window.clearTimeout(jobPollTimer)
+    jobPollTimer = null
   }
 }
 
-// 获取文件名
-const getFileName = (path: string): string => {
-  return path.split(/[\\/]/).pop() || path
+const resetProcessingSteps = () => {
+  processingDetails.value = [
+    { stage: '1. MFA 自动标注', status: '等待', message: '准备进行音频对齐' },
+    { stage: '2. F0 音高提取', status: '等待', message: '提取音频基频信息' },
+    { stage: '3. 工程文件生成', status: '等待', message: '生成 Synthesizer V / OpenUtau 工程文件' }
+  ]
+}
+
+const updateProcessingStep = (index: number, status: string, message: string) => {
+  if (!processingDetails.value[index]) return
+  processingDetails.value[index] = {
+    ...processingDetails.value[index],
+    status,
+    message
+  }
+}
+
+const extractProjectPath = (payload: any): string => {
+  return (
+    payload?.project_file ||
+    payload?.projectPath ||
+    payload?.project_path ||
+    payload?.svp_path ||
+    payload?.ustx_path ||
+    ''
+  )
+}
+
+const normalizeResult = (payload: any) => {
+  const projectPath = extractProjectPath(payload)
+
+  return {
+    labContent: payload?.lab_content || payload?.labContent || '',
+    processingTime: payload?.processing_time || payload?.processingTime || 0,
+    labPath: payload?.lab_path || payload?.labPath || '',
+    projectPath,
+    projectFormat: payload?.project_format || payload?.projectFormat || formData.value.outputFormat,
+    segments: payload?.segments || 0,
+    config: payload?.config || {
+      bpm: advancedConfig.value.bpm,
+      base_pitch: advancedConfig.value.base_pitch,
+      auto_note_pitch: advancedConfig.value.auto_note_pitch,
+      export_pitch_line: advancedConfig.value.export_pitch_line,
+      f0_method: advancedConfig.value.f0_method,
+      use_double_precision: advancedConfig.value.precision === 'double'
+    }
+  }
+}
+
+const waitForJobFinished = (jobId: string): Promise<any> => {
+  clearJobPolling()
+  currentJobId.value = jobId
+
+  return new Promise((resolve, reject) => {
+    const tick = async () => {
+      try {
+        const res = await fetch(`/api/pipeline/job/${jobId}`)
+        const data = await res.json()
+
+        if (!res.ok || !data.success) {
+          throw new Error(data.error || '获取任务状态失败')
+        }
+
+        const job = data.job || {}
+
+        if (job.status === 'queued') {
+          updateProcessingStep(0, '等待', '任务已提交，等待后台执行')
+          updateProcessingStep(1, '等待', '等待 F0 提取')
+          updateProcessingStep(2, '等待', '等待工程文件生成')
+        } else if (job.status === 'running') {
+          updateProcessingStep(0, '进行中', 'MFA / 后续处理正在执行')
+        } else if (job.status === 'done') {
+          const payload = job.result || job
+          const projectPath =
+            payload?.project_path ||
+            payload?.projectPath ||
+            payload?.project_file ||
+            payload?.svp_path ||
+            payload?.ustx_path ||
+            ''
+
+          if (!projectPath) {
+            throw new Error('任务已完成，但未找到工程文件输出')
+          }
+
+          updateProcessingStep(0, '完成', 'MFA 已完成')
+          updateProcessingStep(1, '完成', 'F0 提取已完成')
+          updateProcessingStep(2, '完成', `工程文件已生成: ${getFileName(projectPath)}`)
+
+          resolve(payload)
+          return
+        } else if (job.status === 'failed') {
+          throw new Error(job.error || '处理失败')
+        }
+
+        jobPollTimer = window.setTimeout(tick, 1500)
+      } catch (e) {
+        reject(e)
+      }
+    }
+
+    tick()
+  })
 }
 
 const checkSystemStatus = async () => {
@@ -621,7 +727,7 @@ const checkSystemStatus = async () => {
   try {
     const res = await fetch('/api/pipeline/status')
     const data = await res.json()
-    
+
     if (data.success) {
       systemStatus.value = data.status
     } else {
@@ -645,7 +751,7 @@ const openGitHub = () => {
   window.open('https://github.com/liuhua520-svg/gpt-sovits-mfa-aligner', '_blank')
 }
 
-const handleExceed = (files: File[]) => {
+const handleExceed = () => {
   ElMessage.error('只能上传一个文件')
 }
 
@@ -690,19 +796,23 @@ const processAudio = async () => {
     return
   }
 
-  // 检查音频文件大小
-  const maxSize = 512 * 1024 * 1024 // 512MB
+  const maxSize = 512 * 1024 * 1024
   if (formData.value.audioFile.size > maxSize) {
     ElMessage.warning('音频文件过大（>512MB），建议分割后再处理')
   }
 
+  clearJobPolling()
   processing.value = true
   progressPercent.value = 0
   error.value = ''
-  processingDetails.value = processingDetails.value.map(d => ({
-    ...d,
-    status: '等待'
-  }))
+  result.value = null
+  currentJobId.value = ''
+  resetProcessingSteps()
+  updateProcessingStep(0, '等待', '任务准备中')
+  updateProcessingStep(1, '等待', '等待开始 F0 提取')
+  updateProcessingStep(2, '等待', '等待开始工程生成')
+
+  let progressTimer: number | null = null
 
   try {
     const formDataObj = new FormData()
@@ -713,8 +823,6 @@ const processAudio = async () => {
     if (processingMode.value === 'full') {
       formDataObj.append('format', formData.value.outputFormat)
       formDataObj.append('title', formData.value.projectTitle)
-      
-      // 传递包含细化音高的全套高级配置到后端
       formDataObj.append('bpm', advancedConfig.value.bpm.toString())
       formDataObj.append('base_pitch', advancedConfig.value.base_pitch.toString())
       formDataObj.append('auto_note_pitch', advancedConfig.value.auto_note_pitch.toString())
@@ -723,16 +831,17 @@ const processAudio = async () => {
       formDataObj.append('precision', advancedConfig.value.precision)
       formDataObj.append('f0_smooth', advancedConfig.value.f0_smooth.toString())
       formDataObj.append('f0_smooth_window', advancedConfig.value.f0_smooth_window.toString())
+      formDataObj.append('f0_floor', advancedConfig.value.f0_floor.toString())
+      formDataObj.append('f0_ceil', advancedConfig.value.f0_ceil.toString())
     }
 
-    // 模拟进度
-    const progressInterval = setInterval(() => {
-      if (progressPercent.value < 95) {
-        progressPercent.value += Math.random() * 10
+    progressTimer = window.setInterval(() => {
+      if (progressPercent.value < 90) {
+        progressPercent.value += 3
       }
-    }, 500)
+    }, 400)
 
-    const endpoint = processingMode.value === 'full' 
+    const endpoint = processingMode.value === 'full'
       ? '/api/pipeline/full'
       : '/api/pipeline/mfa-only'
 
@@ -741,47 +850,70 @@ const processAudio = async () => {
       body: formDataObj
     })
 
-    clearInterval(progressInterval)
-    progressPercent.value = 100
-
     const data = await res.json()
 
-    if (data.success) {
-      result.value = {
-        labContent: data.lab_content || '',
-        processingTime: data.processing_time || data.processing_time_ms || 0,
-        labPath: data.lab_path,
-        projectPath: data.project_path,
-        projectFormat: data.project_format,
-        segments: data.segments,
-        config: data.config || { // 兜底防止后端未回传
-          bpm: advancedConfig.value.bpm,
-          base_pitch: advancedConfig.value.base_pitch,
-          auto_note_pitch: advancedConfig.value.auto_note_pitch,
-          export_pitch_line: advancedConfig.value.export_pitch_line,
-          f0_method: advancedConfig.value.f0_method,
-          use_double_precision: advancedConfig.value.precision === 'double'
-        }
-      }
-      
-      // 根据勾选细化逻辑动态更新显示步骤状态
-      const isF0StepActive = processingMode.value === 'full' && (advancedConfig.value.export_pitch_line || advancedConfig.value.auto_note_pitch)
-      
-      processingDetails.value = [
-        { stage: '1. MFA 自动标注', status: '完成', message: `${data.segments || '?'} 个标注段` },
-        { stage: '2. F0 音高提取', status: isF0StepActive ? '完成' : '跳过', message: isF0StepActive ? '基频信息已处理' : '配置已选择跳过提取' },
-        { stage: '3. 工程文件生成', status: processingMode.value === 'full' ? '完成' : '跳过', message: data.project_format ? `${data.project_format.toUpperCase()} 格式` : '-' }
-      ]
-
-      ElMessage.success('✅ 处理成功！')
-    } else {
-      error.value = data.error || '处理失败'
-      ElMessage.error(`❌ ${error.value}`)
+    if (!res.ok) {
+      throw new Error(data.error || '提交失败')
     }
-  } catch (e) {
-    error.value = String(e)
-    ElMessage.error(`❌ 错误: ${e}`)
+
+    if (processingMode.value === 'full') {
+      const projectPathFromResponse =
+        data.project_path ||
+        data.projectPath ||
+        data.project_file ||
+        data.svp_path ||
+        data.ustx_path ||
+        ''
+
+      if (data.job_id) {
+        progressPercent.value = 92
+        updateProcessingStep(0, '进行中', '任务已提交，等待后台处理')
+
+        const finalPayload = await waitForJobFinished(data.job_id)
+        const normalized = normalizeResult(finalPayload)
+
+        if (!normalized.projectPath) {
+          throw new Error('工程文件未生成，无法视为处理成功')
+        }
+
+        result.value = normalized
+        progressPercent.value = 100
+        ElMessage.success('✅ 处理成功！')
+        return
+      }
+
+      if (data.success && projectPathFromResponse) {
+        const normalized = normalizeResult(data)
+        result.value = normalized
+        progressPercent.value = 100
+        ElMessage.success('✅ 处理成功！')
+        return
+      }
+
+      throw new Error(data.error || '工程文件未生成，无法视为处理成功')
+    }
+
+    if (!data.success) {
+      throw new Error(data.error || 'MFA 处理失败')
+    }
+
+    const normalized = normalizeResult(data)
+    result.value = normalized
+    progressPercent.value = 100
+
+    updateProcessingStep(0, '完成', `${data.segments || '?'} 个标注段`)
+    updateProcessingStep(1, '跳过', '仅标注模式未执行 F0 提取')
+    updateProcessingStep(2, '跳过', '仅标注模式未生成工程文件')
+
+    ElMessage.success('✅ 处理成功！')
+  } catch (e: any) {
+    error.value = e?.message || String(e)
+    ElMessage.error(`❌ ${error.value}`)
   } finally {
+    if (progressTimer !== null) {
+      window.clearInterval(progressTimer)
+    }
+    clearJobPolling()
     processing.value = false
   }
 }
@@ -808,7 +940,7 @@ const downloadProject = async () => {
   try {
     const filename = result.value.projectPath.split(/[\\/]/).pop()
     const response = await fetch(`/api/work-dir/download/${encodeURIComponent(filename)}`)
-    
+
     if (!response.ok) {
       ElMessage.error('下载失败')
       return
@@ -842,6 +974,7 @@ const copyLabToClipboard = () => {
 }
 
 const reset = () => {
+  clearJobPolling()
   formData.value = {
     audioFile: null,
     text: '',
@@ -851,10 +984,9 @@ const reset = () => {
   }
   result.value = null
   error.value = ''
-  processingDetails.value = processingDetails.value.map(d => ({
-    ...d,
-    status: '等待'
-  }))
+  progressPercent.value = 0
+  currentJobId.value = ''
+  resetProcessingSteps()
 }
 
 const newProcess = () => {
