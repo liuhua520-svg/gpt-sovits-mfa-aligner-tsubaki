@@ -512,7 +512,7 @@ const advancedConfig = ref<AdvancedConfig>({
   base_pitch: 60,
   auto_note_pitch: true,
   export_pitch_line: true,
-  f0_method: 'harvest',
+  f0_method: 'dio',
   precision: 'double',
   f0_smooth: true,
   f0_smooth_window: 5,
@@ -748,7 +748,7 @@ const refreshStatus = async () => {
 }
 
 const openGitHub = () => {
-  window.open('https://github.com/liuhua520-svg/gpt-sovits-mfa-aligner', '_blank')
+  window.open('https://github.com/liuhua520-svg/gpt-sovits-mfa-aligner-tsubaki', '_blank')
 }
 
 const handleExceed = () => {
