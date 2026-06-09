@@ -98,7 +98,7 @@ class TsubakiProcessor:
     """
     工程文件生成器。
 
-    SVP 正确结构（参照 Synthesizer V 实际格式 / koharu-label 参考文件）：
+    SVP 正确结构（参照 Synthesizer V 实际格式）：
     ─────────────────────────────────────────────────────────────────────
     • library[0]
         uuid   = group_uuid
