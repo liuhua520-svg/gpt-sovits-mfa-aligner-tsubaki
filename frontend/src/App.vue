@@ -4,7 +4,7 @@
     <el-header class="app-header">
       <div class="header-content">
         <div class="header-left">
-          <h1>🎤 音频标注处理工具</h1>
+          <h1>歌声合成 Lab 标注工具 - SVS Lab Aligner</h1>
           <p class="subtitle">MFA自动标注 + 音高提取 + 工程文件生成</p>
         </div>
         <div class="header-right">

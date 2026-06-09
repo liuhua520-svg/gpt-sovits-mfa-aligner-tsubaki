@@ -49,7 +49,27 @@
           </div>
         </el-form-item>
 
-        <el-form-item label="输入文本">
+        <el-form-item v-if="processingMode === 'project-only'" label="LAB 文件">
+          <el-upload
+            drag
+            action="#"
+            :auto-upload="false"
+            :limit="1"
+            :on-exceed="handleExceed"
+            @change="handleLabSelect"
+            accept=".lab"
+          >
+            <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
+            <div class="el-upload__text">
+              拖拽或<em>点击选择</em> LAB 标注文件
+            </div>
+          </el-upload>
+          <div v-if="formData.labFile" class="file-info">
+            ✓ {{ formData.labFile.name }} ({{ formatFileSize(formData.labFile.size) }})
+          </div>
+        </el-form-item>
+
+        <el-form-item v-if="processingMode !== 'project-only'" label="输入文本">
           <el-input
             v-model="formData.text"
             type="textarea"
@@ -62,7 +82,7 @@
           </div>
         </el-form-item>
 
-        <el-form-item label="语言">
+        <el-form-item v-if="processingMode !== 'project-only'" label="语言">
           <el-select v-model="formData.language" placeholder="选择语言">
             <el-option label="普通话 🇨🇳" value="cmn" />
             <el-option label="英语 🇬🇧" value="eng" />
@@ -76,25 +96,29 @@
           <el-radio-group v-model="processingMode">
             <el-radio value="mfa-only">仅标注 (快速)</el-radio>
             <el-radio value="full">完整处理 (标注+F0+工程文件)</el-radio>
+            <el-radio value="project-only">仅生成工程 (WAV + LAB)</el-radio>
           </el-radio-group>
           <div class="mode-help">
             <small v-if="processingMode === 'mfa-only'">
               只进行 MFA 自动标注，生成 LAB 文件
             </small>
-            <small v-else>
+            <small v-else-if="processingMode === 'full'">
               执行完整流程：标注 → F0提取 → 工程文件生成
+            </small>
+            <small v-else>
+              直接整合现有 WAV 和 LAB 文件生成工程文件，跳过 MFA 自动标注
             </small>
           </div>
         </el-form-item>
 
-        <el-form-item v-if="processingMode === 'full'" label="输出格式">
+        <el-form-item v-if="processingMode === 'full' || processingMode === 'project-only'" label="输出格式">
           <el-select v-model="formData.outputFormat" placeholder="选择输出格式">
             <el-option label="Synthesizer V Studio (.svp)" value="sv" />
             <el-option label="OpenUtau/UTAU (.ustx)" value="utau" />
           </el-select>
         </el-form-item>
 
-        <el-form-item v-if="processingMode === 'full'" label="音轨名">
+        <el-form-item v-if="processingMode === 'full' || processingMode === 'project-only'" label="音轨名">
           <el-input
             v-model="formData.projectTitle"
             placeholder="输入音轨名"
@@ -102,7 +126,7 @@
           />
         </el-form-item>
 
-        <el-collapse v-if="processingMode === 'full'" accordion>
+        <el-collapse v-if="processingMode === 'full' || processingMode === 'project-only'" accordion>
           <el-collapse-item title="⚙️ 高级设置" name="advanced">
             <el-row :gutter="20">
               <el-col :xs="24" :sm="12">
@@ -252,13 +276,13 @@
             size="large"
             :loading="processing"
             @click="processAudio"
-            :disabled="!formData.audioFile || !formData.text || !isReady"
+            :disabled="isSubmitDisabled"
           >
             <span v-if="!processing">🚀 开始处理</span>
             <span v-else>处理中... {{ progressPercent }}%</span>
           </el-button>
           <el-button @click="reset" :disabled="processing">🔄 重置</el-button>
-          <span v-if="!isReady" class="disabled-text">
+          <span v-if="!isReady && processingMode !== 'project-only'" class="disabled-text">
             (系统未就绪或语言模型未下载)
           </span>
         </el-form-item>
@@ -289,7 +313,7 @@
         </div>
 
         <el-tabs>
-          <el-tab-pane label="LAB 标注内容">
+          <el-tab-pane v-if="result.labContent" label="LAB 标注内容">
             <el-input
               v-model="result.labContent"
               type="textarea"
@@ -310,7 +334,7 @@
           <el-tab-pane v-if="result.projectPath" label="文件信息">
             <div class="file-info-box">
               <el-row :gutter="20">
-                <el-col :xs="24">
+                <el-col :xs="24" v-if="result.labPath">
                   <p><strong>LAB 标注文件:</strong></p>
                   <code>{{ result.labPath }}</code>
                 </el-col>
@@ -320,7 +344,7 @@
                 </el-col>
                 <el-col :xs="24">
                   <p><strong>输出格式:</strong> {{ result.projectFormat === 'sv' ? 'Synthesizer V Studio' : 'OpenUtau/UTAU' }}</p>
-                  <p><strong>标注段数:</strong> {{ result.segments }}</p>
+                  <p v-if="result.segments"><strong>标注段数:</strong> {{ result.segments }}</p>
                   <p v-if="result.config"><strong>处理配置:</strong></p>
                   <ul v-if="result.config">
                     <li>BPM: {{ result.config.bpm }}</li>
@@ -342,6 +366,7 @@
                 <el-table-column prop="status" label="状态" width="100">
                   <template #default="{ row }">
                     <el-tag v-if="row.status === '完成'" type="success">{{ row.status }}</el-tag>
+                    <el-tag v-else-if="row.status === '跳过'" type="warning">{{ row.status }}</el-tag>
                     <el-tag v-else type="info">{{ row.status }}</el-tag>
                   </template>
                 </el-table-column>
@@ -352,7 +377,7 @@
         </el-tabs>
 
         <div class="action-buttons">
-          <el-button type="success" @click="downloadLab" size="large">
+          <el-button v-if="result.labContent" type="success" @click="downloadLab" size="large">
             📥 下载 LAB 文件
           </el-button>
           <el-button 
@@ -364,7 +389,7 @@
           >
             📥 下载工程文件
           </el-button>
-          <el-button @click="copyLabToClipboard" size="large">
+          <el-button v-if="result.labContent" @click="copyLabToClipboard" size="large">
             📋 复制 LAB 内容
           </el-button>
           <el-button type="info" @click="newProcess" size="large">
@@ -450,10 +475,10 @@
       </el-alert>
     </div>
 
-    <div v-if="systemStatus && systemStatus.mfa?.installed && !isReady" class="warning-box">
+    <div v-if="systemStatus && systemStatus.mfa?.installed && !isReady && processingMode !== 'project-only'" class="warning-box">
       <el-alert type="warning" :closable="false" show-icon>
         <template #title>⚠️ 警告: 组件未就绪</template>
-        <p>请下载所需的语言模型或检查系统状态。</p>
+        <p>请 download 所需的语言模型或检查系统状态。</p>
       </el-alert>
     </div>
   </div>
@@ -461,13 +486,16 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
 import { UploadFilled, InfoFilled } from '@element-plus/icons-vue'
 
 const emit = defineEmits(['status-changed'])
 
+type ProcessingMode = 'mfa-only' | 'full' | 'project-only'
+
 interface FormData {
   audioFile: File | null
+  labFile: File | null
   text: string
   language: string
   outputFormat: string
@@ -499,8 +527,12 @@ interface SystemStatus {
   }
 }
 
+// 核心表单与模式状态（合并唯一声明）
+const processingMode = ref<ProcessingMode>('mfa-only')
+
 const formData = ref<FormData>({
   audioFile: null,
+  labFile: null,
   text: '',
   language: 'cmn',
   outputFormat: 'sv',
@@ -520,7 +552,6 @@ const advancedConfig = ref<AdvancedConfig>({
   f0_ceil: 800
 })
 
-const processingMode = ref('mfa-only')
 const processing = ref(false)
 const progressPercent = ref(0)
 const result = ref<any>(null)
@@ -533,13 +564,7 @@ const systemStatus = ref<SystemStatus>({
   mfa: {
     installed: false,
     version: 'unknown',
-    models: {
-      cmn: false,
-      eng: false,
-      jpn: false,
-      kor: false,
-      yue: false
-    }
+    models: { cmn: false, eng: false, jpn: false, kor: false, yue: false }
   },
   audio_processing: {
     pyworld_available: false,
@@ -556,36 +581,36 @@ const processingDetails = ref<any[]>([
 const currentJobId = ref<string>('')
 let jobPollTimer: number | null = null
 
+// 计算属性
 const normalizedModels = computed(() => {
-  const defaultModels = {
-    cmn: false,
-    eng: false,
-    jpn: false,
-    kor: false,
-    yue: false
-  }
-
+  const defaultModels = { cmn: false, eng: false, jpn: false, kor: false, yue: false }
   if (!systemStatus.value.mfa?.models || typeof systemStatus.value.mfa.models !== 'object') {
     return defaultModels
   }
-
   return { ...defaultModels, ...systemStatus.value.mfa.models }
 })
 
 const isReady = computed(() => {
-  return systemStatus.value.mfa?.installed &&
-    normalizedModels.value[formData.value.language as keyof typeof normalizedModels.value]
+  return !!(systemStatus.value.mfa?.installed && normalizedModels.value[formData.value.language as keyof typeof normalizedModels.value])
+})
+
+// 根据不同模式控制提交按钮的禁用状态
+const isSubmitDisabled = computed(() => {
+  if (processingMode.value === 'project-only') {
+    return !formData.value.audioFile || !formData.value.labFile
+  }
+  return !formData.value.audioFile || !formData.value.text.trim() || !isReady.value
 })
 
 onMounted(() => {
   checkSystemStatus()
 })
 
+// 辅助工具函数
 const midiNoteToName = (note: number): string => {
   const notes = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
   const octave = Math.floor(note / 12) - 1
-  const noteName = notes[note % 12]
-  return `${noteName}${octave}`
+  return `${notes[note % 12]}${octave}`
 }
 
 const formatFileSize = (bytes: number): string => {
@@ -600,7 +625,6 @@ const formatTime = (ms: number): string => {
   const seconds = Math.floor(ms / 1000)
   const minutes = Math.floor(seconds / 60)
   const hours = Math.floor(minutes / 60)
-
   if (hours > 0) return `${hours}h ${minutes % 60}m ${seconds % 60}s`
   if (minutes > 0) return `${minutes}m ${seconds % 60}s`
   return `${seconds}s`
@@ -627,27 +651,15 @@ const resetProcessingSteps = () => {
 
 const updateProcessingStep = (index: number, status: string, message: string) => {
   if (!processingDetails.value[index]) return
-  processingDetails.value[index] = {
-    ...processingDetails.value[index],
-    status,
-    message
-  }
+  processingDetails.value[index] = { ...processingDetails.value[index], status, message }
 }
 
 const extractProjectPath = (payload: any): string => {
-  return (
-    payload?.project_file ||
-    payload?.projectPath ||
-    payload?.project_path ||
-    payload?.svp_path ||
-    payload?.ustx_path ||
-    ''
-  )
+  return payload?.project_file || payload?.projectPath || payload?.project_path || payload?.svp_path || payload?.ustx_path || ''
 }
 
 const normalizeResult = (payload: any) => {
   const projectPath = extractProjectPath(payload)
-
   return {
     labContent: payload?.lab_content || payload?.labContent || '',
     processingTime: payload?.processing_time || payload?.processingTime || 0,
@@ -666,6 +678,7 @@ const normalizeResult = (payload: any) => {
   }
 }
 
+// 异步任务轮询
 const waitForJobFinished = (jobId: string): Promise<any> => {
   clearJobPolling()
   currentJobId.value = jobId
@@ -687,18 +700,12 @@ const waitForJobFinished = (jobId: string): Promise<any> => {
           updateProcessingStep(1, '等待', '等待 F0 提取')
           updateProcessingStep(2, '等待', '等待工程文件生成')
         } else if (job.status === 'running') {
-          updateProcessingStep(0, '进行中', 'MFA / 后续处理正在执行')
+          updateProcessingStep(0, '进行中', 'MFA / 后续处理正在执行...')
         } else if (job.status === 'done') {
           const payload = job.result || job
-          const projectPath =
-            payload?.project_path ||
-            payload?.projectPath ||
-            payload?.project_file ||
-            payload?.svp_path ||
-            payload?.ustx_path ||
-            ''
+          const projectPath = extractProjectPath(payload)
 
-          if (!projectPath) {
+          if (!projectPath && processingMode.value === 'full') {
             throw new Error('任务已完成，但未找到工程文件输出')
           }
 
@@ -717,21 +724,18 @@ const waitForJobFinished = (jobId: string): Promise<any> => {
         reject(e)
       }
     }
-
     tick()
   })
 }
 
+// 后端 API 交互
 const checkSystemStatus = async () => {
   checkingStatus.value = true
   try {
     const res = await fetch('/api/pipeline/status')
     const data = await res.json()
-
     if (data.success) {
       systemStatus.value = data.status
-    } else {
-      console.warn('获取状态失败:', data.error)
     }
     emit('status-changed')
   } catch (e) {
@@ -748,21 +752,26 @@ const refreshStatus = async () => {
 }
 
 const openGitHub = () => {
-  window.open('https://github.com/liuhua520-svg/gpt-sovits-mfa-aligner-tsubaki', '_blank')
+  window.open('https://github.com/liuhua520-svg/gpt-sovits-mfa-aligner', '_blank')
 }
 
 const handleExceed = () => {
   ElMessage.error('只能上传一个文件')
 }
 
+const handleAudioSelect = (file: any) => {
+  formData.value.audioFile = file.raw || null
+}
+
+const handleLabSelect = (file: any) => {
+  formData.value.labFile = file.raw || null
+}
+
 const downloadModel = async (lang: string) => {
   downloadingLangs.value.push(lang)
   try {
-    const res = await fetch(`/api/mfa/download-model/${lang}`, {
-      method: 'POST'
-    })
+    const res = await fetch(`/api/mfa/download-model/${lang}`, { method: 'POST' })
     const data = await res.json()
-
     if (data.success) {
       ElMessage.success(`模型 ${lang} 下载成功`)
       await checkSystemStatus()
@@ -776,21 +785,94 @@ const downloadModel = async (lang: string) => {
   }
 }
 
-const handleAudioSelect = (file: any) => {
-  formData.value.audioFile = file.raw
-}
-
+// 核心核心控制逻辑：开始处理
 const processAudio = async () => {
+  // ============================================================
+  // 分支 1) 仅工程文件模式：WAV + LAB -> 直接转工程文件
+  // ============================================================
+  if (processingMode.value === 'project-only') {
+    if (!formData.value.audioFile) {
+      ElMessage.warning('请选择 WAV 文件')
+      return
+    }
+    if (!formData.value.labFile) {
+      ElMessage.warning('请选择 LAB 文件')
+      return
+    }
+
+    clearJobPolling()
+    processing.value = true
+    progressPercent.value = 0
+    error.value = ''
+    result.value = null
+    currentJobId.value = ''
+    resetProcessingSteps()
+    updateProcessingStep(0, '完成', '工程文件模式：已跳过 MFA 自动标注')
+    updateProcessingStep(1, '进行中', '准备生成工程文件...')
+    updateProcessingStep(2, '等待', '等待开始工程文件生成')
+
+    let progressTimer: number | null = null
+
+    try {
+      const formDataObj = new FormData()
+      formDataObj.append('wav_file', formData.value.audioFile)
+      formDataObj.append('lab_file', formData.value.labFile)
+      formDataObj.append('format', formData.value.outputFormat)
+      formDataObj.append('title', formData.value.projectTitle)
+      formDataObj.append('bpm', advancedConfig.value.bpm.toString())
+      formDataObj.append('base_pitch', advancedConfig.value.base_pitch.toString())
+      formDataObj.append('f0_method', advancedConfig.value.f0_method)
+      formDataObj.append('f0_smooth', advancedConfig.value.f0_smooth.toString())
+      formDataObj.append('f0_smooth_window', advancedConfig.value.f0_smooth_window.toString())
+      formDataObj.append('precision', advancedConfig.value.precision)
+      formDataObj.append('f0_floor', advancedConfig.value.f0_floor.toString())
+      formDataObj.append('f0_ceil', advancedConfig.value.f0_ceil.toString())
+      formDataObj.append('auto_note_pitch', advancedConfig.value.auto_note_pitch.toString())
+      formDataObj.append('export_pitch_line', advancedConfig.value.export_pitch_line.toString())
+
+      progressTimer = window.setInterval(() => {
+        if (progressPercent.value < 90) progressPercent.value += 3
+      }, 400)
+
+      const res = await fetch('/api/pipeline/project-only', {
+        method: 'POST',
+        body: formDataObj,
+      })
+      const data = await res.json()
+
+      if (!res.ok) throw new Error(data.error || '提交失败')
+
+      const normalized = normalizeResult(data)
+      if (!data.success) throw new Error(data.error || '工程文件生成失败')
+
+      result.value = normalized
+      progressPercent.value = 100
+      updateProcessingStep(0, '跳过', '工程文件模式不需要 MFA 标注')
+      updateProcessingStep(1, '完成', 'F0 提取已完成')
+      updateProcessingStep(2, '完成', `工程文件已生成: ${getFileName(normalized.projectPath || '')}`)
+      ElMessage.success('✅ 工程文件生成成功！')
+    } catch (e: any) {
+      error.value = e?.message || String(e)
+      ElMessage.error(`❌ ${error.value}`)
+    } {{
+      if (progressTimer !== null) window.clearInterval(progressTimer)
+      clearJobPolling()
+      processing.value = false
+    }}
+    return
+  }
+
+  // ============================================================
+  // 分支 2) 其他传统模式：需要输入文本和模型校验
+  // ============================================================
   if (!formData.value.audioFile) {
     ElMessage.warning('请选择音频文件')
     return
   }
-
   if (!formData.value.text.trim()) {
     ElMessage.warning('请输入文本')
     return
   }
-
   if (!isReady.value) {
     ElMessage.error('系统未准备好或语言模型未下载')
     return
@@ -808,9 +890,6 @@ const processAudio = async () => {
   result.value = null
   currentJobId.value = ''
   resetProcessingSteps()
-  updateProcessingStep(0, '等待', '任务准备中')
-  updateProcessingStep(1, '等待', '等待开始 F0 提取')
-  updateProcessingStep(2, '等待', '等待开始工程生成')
 
   let progressTimer: number | null = null
 
@@ -825,94 +904,62 @@ const processAudio = async () => {
       formDataObj.append('title', formData.value.projectTitle)
       formDataObj.append('bpm', advancedConfig.value.bpm.toString())
       formDataObj.append('base_pitch', advancedConfig.value.base_pitch.toString())
-      formDataObj.append('auto_note_pitch', advancedConfig.value.auto_note_pitch.toString())
-      formDataObj.append('export_pitch_line', advancedConfig.value.export_pitch_line.toString())
       formDataObj.append('f0_method', advancedConfig.value.f0_method)
-      formDataObj.append('precision', advancedConfig.value.precision)
       formDataObj.append('f0_smooth', advancedConfig.value.f0_smooth.toString())
       formDataObj.append('f0_smooth_window', advancedConfig.value.f0_smooth_window.toString())
+      formDataObj.append('precision', advancedConfig.value.precision)
       formDataObj.append('f0_floor', advancedConfig.value.f0_floor.toString())
       formDataObj.append('f0_ceil', advancedConfig.value.f0_ceil.toString())
+      formDataObj.append('auto_note_pitch', advancedConfig.value.auto_note_pitch.toString())
+      formDataObj.append('export_pitch_line', advancedConfig.value.export_pitch_line.toString())
     }
 
     progressTimer = window.setInterval(() => {
-      if (progressPercent.value < 90) {
-        progressPercent.value += 3
-      }
+      if (progressPercent.value < 90) progressPercent.value += 3
     }, 400)
 
-    const endpoint = processingMode.value === 'full'
-      ? '/api/pipeline/full'
-      : '/api/pipeline/mfa-only'
-
-    const res = await fetch(endpoint, {
-      method: 'POST',
-      body: formDataObj
-    })
-
+    const endpoint = processingMode.value === 'full' ? '/api/pipeline/full' : '/api/pipeline/mfa-only'
+    const res = await fetch(endpoint, { method: 'POST', body: formDataObj })
     const data = await res.json()
 
-    if (!res.ok) {
-      throw new Error(data.error || '提交失败')
-    }
+    if (!res.ok) throw new Error(data.error || '提交失败')
 
     if (processingMode.value === 'full') {
-      const projectPathFromResponse =
-        data.project_path ||
-        data.projectPath ||
-        data.project_file ||
-        data.svp_path ||
-        data.ustx_path ||
-        ''
-
       if (data.job_id) {
         progressPercent.value = 92
-        updateProcessingStep(0, '进行中', '任务已提交，等待后台处理')
-
         const finalPayload = await waitForJobFinished(data.job_id)
         const normalized = normalizeResult(finalPayload)
-
-        if (!normalized.projectPath) {
-          throw new Error('工程文件未生成，无法视为处理成功')
-        }
-
+        if (!normalized.projectPath) throw new Error('工程文件未生成，无法视为处理成功')
         result.value = normalized
         progressPercent.value = 100
         ElMessage.success('✅ 处理成功！')
         return
       }
 
-      if (data.success && projectPathFromResponse) {
-        const normalized = normalizeResult(data)
+      const normalized = normalizeResult(data)
+      if (data.success && normalized.projectPath) {
         result.value = normalized
         progressPercent.value = 100
         ElMessage.success('✅ 处理成功！')
         return
       }
-
       throw new Error(data.error || '工程文件未生成，无法视为处理成功')
     }
 
-    if (!data.success) {
-      throw new Error(data.error || 'MFA 处理失败')
-    }
-
+    // 仅标注模式
+    if (!data.success) throw new Error(data.error || 'MFA 处理失败')
     const normalized = normalizeResult(data)
     result.value = normalized
     progressPercent.value = 100
-
     updateProcessingStep(0, '完成', `${data.segments || '?'} 个标注段`)
     updateProcessingStep(1, '跳过', '仅标注模式未执行 F0 提取')
     updateProcessingStep(2, '跳过', '仅标注模式未生成工程文件')
-
     ElMessage.success('✅ 处理成功！')
   } catch (e: any) {
     error.value = e?.message || String(e)
     ElMessage.error(`❌ ${error.value}`)
   } finally {
-    if (progressTimer !== null) {
-      window.clearInterval(progressTimer)
-    }
+    if (progressTimer !== null) window.clearInterval(progressTimer)
     clearJobPolling()
     processing.value = false
   }
@@ -920,12 +967,8 @@ const processAudio = async () => {
 
 const downloadLab = () => {
   if (!result.value?.labContent) return
-
   const element = document.createElement('a')
-  element.setAttribute(
-    'href',
-    'data:text/plain;charset=utf-8,' + encodeURIComponent(result.value.labContent)
-  )
+  element.setAttribute('href', 'data:text/plain;charset=utf-8,' + encodeURIComponent(result.value.labContent))
   element.setAttribute('download', `alignment_${Date.now()}.lab`)
   document.body.appendChild(element)
   element.click()
@@ -935,17 +978,14 @@ const downloadLab = () => {
 
 const downloadProject = async () => {
   if (!result.value?.projectPath) return
-
   downloadingProject.value = true
   try {
     const filename = result.value.projectPath.split(/[\\/]/).pop()
     const response = await fetch(`/api/work-dir/download/${encodeURIComponent(filename)}`)
-
     if (!response.ok) {
       ElMessage.error('下载失败')
       return
     }
-
     const blob = await response.blob()
     const url = window.URL.createObjectURL(blob)
     const element = document.createElement('a')
@@ -965,7 +1005,6 @@ const downloadProject = async () => {
 
 const copyLabToClipboard = () => {
   if (!result.value?.labContent) return
-
   navigator.clipboard.writeText(result.value.labContent).then(() => {
     ElMessage.success('已复制到剪贴板')
   }).catch(() => {
@@ -977,6 +1016,7 @@ const reset = () => {
   clearJobPolling()
   formData.value = {
     audioFile: null,
+    labFile: null,
     text: '',
     language: 'cmn',
     outputFormat: 'sv',
