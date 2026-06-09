@@ -1081,10 +1081,13 @@ const newProcess = () => {
   margin-top: 5px;
 }
 
+/* 确保模式帮助文本在 Element 表单条目中强制换行，不向右侧外溢 */
 .mode-help {
+  width: 100%;
+  display: block;
   color: #909399;
   font-size: 12px;
-  margin-top: 8px;
+  margin-top: 6px;
 }
 
 .pitch-input-group {

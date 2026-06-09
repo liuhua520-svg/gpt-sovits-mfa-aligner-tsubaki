@@ -65,18 +65,29 @@ const checkSystemStatus = async () => {
 </script>
 
 <style scoped>
+/* 全局防溢出基础设置 */
+* {
+  box-sizing: border-box;
+}
+
 .app-container {
   display: flex;
   flex-direction: column;
   min-height: 100vh;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  background: linear-gradient(135deg, #3b4175 0%, #1e1b4b 100%);
+  overflow-x: hidden;
 }
 
 .app-header {
-  background: rgba(255, 255, 255, 0.98);
-  padding: 20px;
-  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.15);
+  background: rgba(255, 255, 255, 0.85);
+  padding: 15px 20px;
+  box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
   backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+  
+  /* 🔥 核心修复：强制解除 el-header 默认的 60px 限制，允许随文字高度自适应 */
+  height: auto !important; 
 }
 
 .header-content {
@@ -95,18 +106,18 @@ const checkSystemStatus = async () => {
 
 .header-left h1 {
   margin: 0;
-  font-size: 28px;
-  font-weight: bold;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  font-size: 26px;
+  font-weight: 700;
+  background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
 }
 
 .subtitle {
-  margin: 5px 0 0 0;
-  color: #909399;
-  font-size: 14px;
+  margin: 6px 0 0 0;
+  color: #64748b;
+  font-size: 13px;
 }
 
 .header-right {
@@ -124,10 +135,15 @@ const checkSystemStatus = async () => {
 }
 
 .app-footer {
-  background: rgba(0, 0, 0, 0.85);
-  color: white;
+  background: rgba(15, 12, 30, 0.95);
+  color: rgba(255, 255, 255, 0.7);
   text-align: center;
   padding: 20px;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+  margin-top: auto;
+  
+  /* 🔥 核心修复：强制解除 el-footer 默认的 60px 限制，防止底部 GitHub 链接溢出被裁切 */
+  height: auto !important; 
 }
 
 .footer-content {
@@ -141,19 +157,20 @@ const checkSystemStatus = async () => {
 }
 
 .footer-content a {
-  color: #67c23a;
+  color: #a7f3d0;
   text-decoration: none;
   transition: color 0.3s;
 }
 
 .footer-content a:hover {
-  color: #85ce61;
+  color: #34d399;
 }
 
 @media (max-width: 768px) {
   .header-content {
     flex-direction: column;
     align-items: flex-start;
+    gap: 15px;
   }
 
   .header-left h1 {
