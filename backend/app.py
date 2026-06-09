@@ -590,7 +590,12 @@ def pipeline_project_only():
         use_double_precision = request.form.get("precision", "single").lower() == "double"
         f0_floor = float(request.form.get("f0_floor", 71.0))
         f0_ceil = float(request.form.get("f0_ceil", 800.0))
+
+        # 是否根据 F0 细化音高
         refine_pitch = request.form.get("auto_note_pitch", "false").lower() == "true"
+
+        # 是否导出音高线到工程文件
+        export_pitch_line = request.form.get("export_pitch_line", "false").lower() == "true"
 
         # 兼容两种输入：
         # 1) 前端上传文件：wav_file + lab_file
@@ -644,6 +649,7 @@ def pipeline_project_only():
             f0_floor=f0_floor,
             f0_ceil=f0_ceil,
             refine_pitch=refine_pitch,
+            export_pitch_line=export_pitch_line,
         )
 
         if result.get("success"):
