@@ -1,58 +1,55 @@
 # -*- coding: utf-8 -*-
-"""MFA 处理核心模块 - 可直接替换版
-
-说明：
-- 保留你当前仓库里已经在用的 MFAChecker / convert_phoneme 入口。
-- 内置你要的 lab 后处理：纯辅音段转 "-"，按“左侧附近有元音则视为并入左侧”来记录决策。
-- 内置英语 IPA → ARPAbet 归一化，避免 d̪ / pʲ / vʲ / ɝ / ʉː 这类漏转。
 """
-
+MFA 处理核心模块 - 多语言增强版 v9.3 (已包含特定标点符号清洗规则)
+"""
 from __future__ import annotations
 
-import json
-import logging
 import os
 import re
-import shutil
 import subprocess
 import tempfile
+import shutil
+import logging
 import time
-import unicodedata
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Tuple, Optional, Set
 
-from pypinyin import Style, lazy_pinyin
-
+from pypinyin import lazy_pinyin, Style
 from mfa_utils import MFAChecker
-from phoneme_converter import convert_phoneme
+from phoneme_converter import convert_phoneme, build_ja_hiragana_lab, merge_lab_silence
 
 logger = logging.getLogger(__name__)
 
-
-@dataclass
-class LabRow:
-    start: int
-    end: int
-    phone: str
-    decision: str = ""  # keep / merged_left / deleted / keep_special
+# ── Module-level cache: SudachiPy dict loads in ~4 min on first call.
+# Caching it here means subsequent requests reuse the same object. ──────────
+_ja_tokenizer: Optional[object] = None
 
 
 class MFAProcessor:
-    """Montreal Forced Aligner 处理器 - 多语言增强版"""
+    """Montreal Forced Aligner 处理器 - 多语言增强版 v9.3"""
 
     INITIALS_EXTENDED = [
-        "zh", "ch", "sh", "b", "p", "d", "t", "g", "k", "f", "h",
-        "j", "q", "x", "z", "c", "s", "m", "n", "l", "r", "y", "w",
+        "zh", "ch", "sh",
+        "b", "p", "d", "t", "g", "k",
+        "f", "h", "j", "q", "x", "z", "c", "s",
+        "m", "n", "l", "r",
+        "y", "w",
     ]
     INITIALS = set(INITIALS_EXTENDED)
 
     CON_INITIALS = {
-        "zh", "ch", "sh", "b", "p", "d", "t", "g", "k",
-        "f", "h", "j", "q", "x", "z", "c", "s", "m", "n", "l", "r",
+        "zh", "ch", "sh",
+        "b", "p", "d", "t", "g", "k",
+        "f", "h", "j", "q", "x", "z", "c", "s",
+        "m", "n", "l", "r",
     }
+
     YUE_CON_INITIALS = {
-        "b", "p", "m", "f", "d", "t", "n", "l", "g", "k", "ng", "h", "gw", "kw", "z", "c", "s",
+        "b", "p", "m", "f",
+        "d", "t", "n", "l",
+        "g", "k", "ng", "h",
+        "gw", "kw",
+        "z", "c", "s",
     }
 
     FINALS_EXTENDED = {
@@ -64,7 +61,7 @@ class MFAProcessor:
     }
 
     SIL_PHONES = {"sp", "spn", "sil", "silence", "pau", "breath", "noise", "ap", "blank"}
-    IGNORE_PHONES = {"", ""}
+    IGNORE_PHONES = {"", "<eps>"}
 
     SPECIAL_SYLLABLES = {
         "zhi", "chi", "shi", "ri", "zi", "ci", "si",
@@ -75,11 +72,12 @@ class MFAProcessor:
 
     LONG_FINAL_HINTS = {
         "iang", "iong", "uang", "uai", "iao",
-        "ang", "eng", "ing", "ong", "ian", "uan", "uen", "van", "üan",
+        "ang", "eng", "ing", "ong",
+        "ian", "uan", "uen", "van", "üan",
     }
-
     SHORT_FINAL_HINTS = {
-        "ai", "ei", "ui", "ao", "ou", "an", "en", "in", "un", "vn", "ün",
+        "ai", "ei", "ui", "ao", "ou",
+        "an", "en", "in", "un", "vn", "ün",
         "a", "o", "e", "i", "u", "v", "ü", "er",
     }
 
@@ -87,480 +85,1289 @@ class MFAProcessor:
     SILENCE_THRESHOLD_100NS = 2000000
 
     PHONEME_TABLES = {
-        "zh": {
-            "vowels": {
-                "a", "o", "e", "i", "u", "v", "ü", "er", "ai", "ei", "ui", "ao", "ou", "iu", "ie",
-                "uo", "üe", "ve", "an", "en", "in", "un", "ün", "vn", "ang", "eng", "ing", "ong",
-                "iao", "ian", "iang", "iong", "uai", "uan", "uang", "üan", "van",
+        'zh': {
+            'vowels': {
+                'a', 'o', 'e', 'i', 'u', 'v', 'ü', 'er',
+                'ai', 'ei', 'ui', 'ao', 'ou', 'iu', 'ie', 'uo', 'üe', 've',
+                'an', 'en', 'in', 'un', 'ün', 'vn',
+                'ang', 'eng', 'ing', 'ong',
+                'iao', 'ian', 'iang', 'iong', 'uai', 'uan', 'uang', 'üan', 'van'
             },
-            "stops": {"b", "p", "d", "t", "g", "k"},
-            "fricatives": {"f", "h", "j", "q", "x", "zh", "ch", "sh", "z", "c", "s", "r"},
-            "nasals_glides": {"m", "n", "l", "y", "w"},
+            'stops': {'b', 'p', 'd', 't', 'g', 'k'},
+            'fricatives': {'f', 'h', 'j', 'q', 'x', 'zh', 'ch', 'sh', 'z', 'c', 's', 'r'},
+            'nasals_glides': {'m', 'n', 'l', 'y', 'w'}
         },
-        "en": {
-            "vowels": {
-                "aa", "ae", "ah", "ao", "aw", "ay", "eh", "er",
-                "ey", "ih", "iy", "ow", "oy", "uh", "uw", "ax",
+        'en': {
+            'vowels': {
+                'aa', 'ae', 'ah', 'ao', 'aw', 'ay', 'eh', 'er', 'ey', 'ih', 'iy', 
+                'ow', 'oy', 'uh', 'uw'
             },
-            "stops": {"b", "d", "g", "k", "p", "t"},
-            "fricatives": {"ch", "dh", "f", "hh", "jh", "s", "sh", "th", "v", "z", "zh"},
-            "nasals_glides": {"l", "m", "n", "ng", "r", "w", "y"},
+            'stops': {'b', 'd', 'g', 'k', 'p', 't'},
+            'fricatives': {'ch', 'dh', 'f', 'hh', 'jh', 's', 'sh', 'th', 'v', 'z', 'zh'},
+            'nasals_glides': {'l', 'm', 'n', 'ng', 'r', 'w', 'y'}
         },
-        "ja": {
-            "vowels": {"a", "i", "u", "e", "o", "n"},
-            "stops": {"k", "g", "t", "d", "b", "p"},
-            "fricatives": {"s", "z", "h", "ts", "ch", "sh"},
-            "nasals_glides": {"m", "n", "y", "r", "w"},
-        },
+        'ja': {
+            'vowels': {'a', 'i', 'u', 'e', 'o', 'n'},
+            'stops': {'k', 'g', 't', 'd', 'b', 'p'},
+            'fricatives': {'s', 'z', 'h', 'ts', 'ch', 'sh'},
+            'nasals_glides': {'m', 'n', 'y', 'r', 'w'}
+        }
     }
 
     PRE_ROLL_LIMITS = {
-        "stops": 300000,
-        "fricatives": 800000,
-        "nasals_glides": 500000,
-        "vowels": 0,
+        'stops': 300000,
+        'fricatives': 800000,
+        'nasals_glides': 500000,
+        'vowels': 0
     }
 
     DIGIT_PINYIN = {
-        "0": "ling", "1": "yi", "2": "er", "3": "san", "4": "si",
-        "5": "wu", "6": "liu", "7": "qi", "8": "ba", "9": "jiu",
+        '0': 'ling', '1': 'yi',  '2': 'er',  '3': 'san', '4': 'si',
+        '5': 'wu',   '6': 'liu', '7': 'qi',  '8': 'ba',  '9': 'jiu',
     }
+    
     DIGIT_JYUTPING = {
-        "0": "ling", "1": "jat", "2": "ji", "3": "saam", "4": "sei",
-        "5": "ng", "6": "luk", "7": "cat", "8": "baat", "9": "gau",
+        '0': 'ling', '1': 'jat', '2': 'ji',   '3': 'saam', '4': 'sei',
+        '5': 'ng',   '6': 'luk', '7': 'cat',  '8': 'baat', '9': 'gau',
     }
 
     JA_PHONE_DISPLAY = {
-        "cl": "q",
-        "N": "N",
-        "pau": "sil",
-        "sp": "sil",
+        'cl':  'q',
+        'N':   'N',
+        'pau': 'sil',
+        'sp':  'sil',
     }
-
-    EN_VOWELS = {
-        "aa", "ae", "ah", "ao", "aw", "ax", "ay",
-        "eh", "er", "ey", "ih", "iy", "ow", "oy", "uh", "uw",
-    }
-
-    EN_IPA_TO_ARPABET = {
-        "iː": "iy", "i": "iy", "ɪ": "ih", "eɪ": "ey", "ɛ": "eh", "e": "eh", "æ": "ae",
-        "ɑː": "aa", "ɑ": "aa", "ɔː": "ao", "ɔ": "ao", "oʊ": "ow", "ʊ": "uh", "uː": "uw",
-        "u": "uw", "ʌ": "ah", "ɜː": "er", "ɜ": "er", "ɝ": "er", "ɚ": "er", "ə": "ax",
-        "aɪ": "ay", "aʊ": "aw", "ɔɪ": "oy", "ɨ": "ih", "ʉ": "uw", "ʉː": "uw",
-        "p": "p", "b": "b", "t": "t", "d": "d", "k": "k", "g": "g", "ɡ": "g",
-        "f": "f", "v": "v", "θ": "th", "ð": "dh", "s": "s", "z": "z",
-        "ʃ": "sh", "ʒ": "zh", "h": "hh", "ɦ": "hh", "tʃ": "ch", "dʒ": "jh",
-        "m": "m", "n": "n", "ŋ": "ng", "l": "l", "ɹ": "r", "r": "r",
-        "w": "w", "j": "y", "ʔ": "",
-        "ch": "ch", "dh": "dh", "dx": "dx", "dr": "dr", "tr": "tr",
-        "hh": "hh", "jh": "jh", "ng": "ng", "sh": "sh", "th": "th", "zh": "zh",
-    }
-
-    IPA_DIACRITIC_CHARS = set("ːʲʷʰ̪̟̠̚˞̩̯̃ˈˌˠˤˀˡˢ")
-    GENERIC_VOWEL_CHARS = set("aeiouüvɑæɐɒɜɝɚɪʊʉəɛɔɯɨ")
-
-    LINE_RE = re.compile(r"^\s*(\d+)\s+(\d+)\s+(.+?)\s*$")
 
     def __init__(self):
         self.temp_dir: Optional[str] = None
-        self.checker = MFAChecker() if "MFAChecker" in globals() else None
 
-    # ------------------------------------------------------------------
-    # 文本清洗
-    # ------------------------------------------------------------------
+    # =====================================================================
+    # 新增：文本标点符号规范化清洗
+    # =====================================================================
     def _clean_input_text(self, text: str) -> str:
+        """
+        根据用户要求清洗文本标点符号：
+        1. 「」、""、“” 转换为忽略（替换为空字符串）
+        2. （）、《》、()、＜＞、<>、【】 视为逗号（替换为 ","）
+        """
         if not text:
             return ""
+        
+        # 步骤 1：忽略指定的引号和书名号
+        # 匹配 「 」 " “ ” 并删掉
+        ignore_pattern = r'[「」"“”]'
+        text = re.sub(ignore_pattern, "", text)
+        
+        # 步骤 2：把指定的括号、书名号、句号、尖括号视为逗号
+        # 匹配 （ ） 《 》  ( ) ＜ ＞ < > 【 】 并替换为逗号
+        comma_pattern = r'[（）《》()＜＞<>【】]'
+        text = re.sub(comma_pattern, ",", text)
+        
+        return text
 
-        replacements = {
-            "「": "",
-            "」": "",
-            "“": "",
-            "”": "",
-            '"': "",
-            "'": "",
-            "【": "",
-            "】": "",
-        }
-        for src, dst in replacements.items():
-            text = text.replace(src, dst)
+    # =====================================================================
+    # 多语言环境检查
+    # =====================================================================
+    def _check_zh_environment(self) -> Tuple[bool, str]:
+        """检查中文（普通话）环境"""
+        try:
+            from pypinyin import lazy_pinyin, Style
+            lazy_pinyin("测试", style=Style.NORMAL)
+            return True, "✓ 中文环境就绪（pypinyin已安装）"
+        except ImportError:
+            return False, "❌ 缺失中文支持：pip install pypinyin"
+        except Exception as e:
+            return False, f"❌ 中文环境错误：{str(e)}"
 
-        text = text.replace("\u3000", " ")
-        text = re.sub(r"[ \t]+", " ", text)
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        return text.strip()
-
-    def _strip_diacritics(self, token: str) -> str:
-        token = unicodedata.normalize("NFC", token)
-        token = "".join(ch for ch in token if ch not in self.IPA_DIACRITIC_CHARS)
-        token = re.sub(r"[\u0300-\u036f]", "", token)
-        return token
-
-    def _normalize_token(self, token: str) -> str:
-        return self._strip_diacritics(token.strip()).lower()
-
-    def _normalize_en_phone(self, phone: str) -> str:
-        p = self._normalize_token(phone)
-        if p in self.EN_IPA_TO_ARPABET:
-            return self.EN_IPA_TO_ARPABET[p]
-        p2 = re.sub(r"[^a-zɑæɐɒɜɝɚɪʊʉəɛɔŋθðʃʒ]", "", p)
-        return self.EN_IPA_TO_ARPABET.get(p2, p2 or p)
-
-    def _normalize_phone(self, phone: str, lang: str = "auto") -> str:
-        p = phone.strip()
-        if not p or p in self.SIL_PHONES:
-            return "-"
-        if lang == "en":
-            return self._normalize_en_phone(p)
-        return p
-
-    def _looks_like_syllable(self, token: str) -> bool:
-        low = token.lower()
-        if any(ch in self.GENERIC_VOWEL_CHARS for ch in low):
-            return True
-        return any(
-            ("\u3040" <= ch <= "\u30ff") or ("\u4e00" <= ch <= "\u9fff")
-            for ch in token
-        )
-
-    def _detect_lang(self, rows: List[LabRow]) -> str:
-        phones = [r.phone.strip().lower() for r in rows if r.phone.strip()]
-        if any(any(ch in "ぁあぃいぅうぇえぉおァアィイゥウェエォオ" for ch in p) for p in phones):
-            return "ja"
-        if any(
-            p in self.EN_IPA_TO_ARPABET
-            or any(ch in p for ch in ["ː", "ʲ", "ʷ", "ʰ", "̪", "ɝ", "ɚ", "ə", "ɪ", "ʊ", "θ", "ð", "ʃ", "ʒ"])
-            for p in phones
-        ):
-            return "en"
-        return "zh"
-
-    # ------------------------------------------------------------------
-    # lab 解析与后处理
-    # ------------------------------------------------------------------
-    def _parse_lab_text(self, text: str) -> List[LabRow]:
-        rows: List[LabRow] = []
-        for line in text.splitlines():
-            if not line.strip():
-                continue
-            m = self.LINE_RE.match(line)
-            if not m:
-                continue
-            rows.append(LabRow(int(m.group(1)), int(m.group(2)), m.group(3).strip()))
-        return rows
-
-    def _next_significant_phone(self, rows: List[LabRow], idx: int, lang: str) -> Optional[str]:
-        for r in rows[idx + 1:]:
-            raw = r.phone.strip()
-            if not raw or raw in self.SIL_PHONES:
-                continue
-            return self._normalize_phone(raw, lang)
-        return None
-
-    def _should_keep_and_surface(
-        self,
-        i: int,
-        rows: List[LabRow],
-        lang: str,
-        norm_phone: str,
-    ) -> Tuple[bool, str, str]:
-        if norm_phone == "-":
-            return False, ("deleted" if i == 0 else "merged_left"), "-"
-
-        if lang == "en":
-            if norm_phone in self.EN_VOWELS:
-                return True, "keep", norm_phone
-            return False, ("deleted" if i == 0 else "merged_left"), "-"
-
-        if lang == "ja":
-            low = norm_phone.lower()
-            if low in {"ん", "N"}:
-                return True, "keep_special", "ん"
-
-            if low in {"m", "n", "ng", "ɴ"}:
-                nxt = self._next_significant_phone(rows, i, lang)
-                if nxt is None or not self._looks_like_syllable(nxt):
-                    return True, "keep_special", "ん"
-                return False, ("deleted" if i == 0 else "merged_left"), "-"
-
-            if self._looks_like_syllable(norm_phone):
-                return True, "keep", norm_phone
-
-            return False, ("deleted" if i == 0 else "merged_left"), "-"
-
-        if self._looks_like_syllable(norm_phone):
-            return True, "keep", norm_phone
-
-        return False, ("deleted" if i == 0 else "merged_left"), "-"
-
-    def process_lab_text(self, text: str, lang: str = "auto", write_meta: bool = False):
-        rows = self._parse_lab_text(text)
-        if lang == "auto":
-            lang = self._detect_lang(rows)
-
-        processed: List[LabRow] = []
-        for i, row in enumerate(rows):
-            norm = self._normalize_phone(row.phone, lang)
-            keep, decision, surface = self._should_keep_and_surface(i, rows, lang, norm)
-            row.phone = surface if keep else "-"
-            row.decision = decision
-            processed.append(row)
-
-        out_text = "\n".join(f"{r.start} {r.end} {r.phone}" for r in processed)
-
-        if not write_meta:
-            return out_text
-
-        meta = [
-            {"start": r.start, "end": r.end, "phone": r.phone, "decision": r.decision}
-            for r in processed
-        ]
-        return out_text, meta
-
-    def process_lab_file(
-        self,
-        input_path: str | Path,
-        output_path: str | Path,
-        lang: str = "auto",
-        meta_path: str | Path | None = None,
-    ) -> None:
-        input_path = Path(input_path)
-        output_path = Path(output_path)
-
-        text = input_path.read_text(encoding="utf-8", errors="ignore")
-        result = self.process_lab_text(text, lang=lang, write_meta=meta_path is not None)
-
-        if meta_path is not None:
-            out_text, meta = result
-        else:
-            out_text = result
-            meta = None
-
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(out_text, encoding="utf-8")
-
-        if meta_path is not None and meta is not None:
-            meta_path = Path(meta_path)
-            meta_path.parent.mkdir(parents=True, exist_ok=True)
-            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    # ------------------------------------------------------------------
-    # 文字到音素的辅助转换
-    # ------------------------------------------------------------------
-    def _is_ascii_word(self, text: str) -> bool:
-        return bool(re.fullmatch(r"[A-Za-z0-9'’\- ]+", text.strip()))
-
-    def _contains_japanese(self, text: str) -> bool:
-        return any("\u3040" <= ch <= "\u30ff" for ch in text)
-
-    def _contains_chinese(self, text: str) -> bool:
-        return any("\u4e00" <= ch <= "\u9fff" for ch in text)
-
-    def _contains_korean(self, text: str) -> bool:
-        return any("\uac00" <= ch <= "\ud7af" for ch in text)
-
-    def _contains_cantonese_hint(self, text: str) -> bool:
-        return bool(re.search(r"[粤廣廣]|jyut|jyutping", text, re.I))
-
-    def _split_text_chunks(self, text: str) -> List[str]:
-        text = self._clean_input_text(text)
-        if not text:
-            return []
-        chunks = re.split(r"[。！？!?；;，,、\n]+", text)
-        return [c.strip() for c in chunks if c.strip()]
-
-    def _segment_chinese_to_pinyin(self, text: str) -> List[str]:
-        tokens = lazy_pinyin(text, style=Style.NORMAL, neutral_tone_with_five=False)
-        return [t for t in tokens if t]
-
-    def _segment_text_to_phones(self, text: str, lang: str = "auto") -> List[str]:
-        text = self._clean_input_text(text)
-        if not text:
-            return []
-
-        if lang == "auto":
-            if self._contains_japanese(text):
-                lang = "ja"
-            elif self._contains_korean(text):
-                lang = "ko"
-            elif self._contains_cantonese_hint(text):
-                lang = "yue"
-            elif self._contains_chinese(text):
-                lang = "zh"
-            elif self._is_ascii_word(text):
-                lang = "en"
+    def _check_en_environment(self) -> Tuple[bool, str]:
+        """检查英语环境"""
+        try:
+            mfa_ok, mfa_msg = MFAChecker.check_mfa_installed()
+            if mfa_ok:
+                return True, "✓ 英语环境就绪（MFA已安装）"
             else:
-                lang = "zh"
+                return False, f"❌ MFA未安装：{mfa_msg}"
+        except Exception as e:
+            return False, f"❌ 英语环境错误：{str(e)}"
 
-        phones: List[str] = []
+    def _check_ja_environment(self) -> Tuple[bool, str]:
+        """检查日语环境（首次调用时加载字典，后续直接复用缓存，避免每次重复 ~4 min 加载）"""
+        global _ja_tokenizer
+        try:
+            from sudachipy import Dictionary
+            if _ja_tokenizer is None:
+                _ja_tokenizer = Dictionary().create()
+            # 轻量冒烟测试，复用已缓存的 tokenizer
+            test_result = _ja_tokenizer.tokenize("テスト")
+            if test_result and len(test_result) > 0:
+                return True, "✓ 日语环境就绪（sudachipy + 字典已就绪）"
+            else:
+                return False, "❌ 日语字典初始化失败"
+        except ImportError:
+            return False, "❌ 缺失日语支持（sudachipy未安装）\n   请运行：pip install sudachipy sudachidict-core"
+        except Exception as e:
+            error_msg = str(e)
+            if "dictionary" in error_msg.lower():
+                return False, "❌ 日语字典资源不可用\n   请重新安装：pip install --force-reinstall sudachidict-core"
+            else:
+                return False, f"❌ 日语环境错误：{error_msg}"
 
-        if lang == "zh":
-            for chunk in self._split_text_chunks(text):
-                phones.extend(self._segment_chinese_to_pinyin(chunk))
-        elif lang == "en":
-            for token in re.findall(r"[A-Za-z0-9'’\-]+", text):
-                phones.append(token.lower())
-        elif lang == "ja":
-            for token in re.findall(r"[\u3040-\u30ff\u31f0-\u31ff\u4e00-\u9fffA-Za-z0-9]+", text):
-                phones.append(token)
-        elif lang == "ko":
-            for token in re.findall(r"[\uac00-\ud7afA-Za-z0-9]+", text):
-                phones.append(token)
-        elif lang == "yue":
-            for token in re.findall(r"[A-Za-z0-9'’\-]+", text):
-                phones.append(token.lower())
+    def _check_ko_environment(self) -> Tuple[bool, str]:
+        """检查韩语环境"""
+        try:
+            mfa_ok, mfa_msg = MFAChecker.check_mfa_installed()
+            if not mfa_ok:
+                return False, f"❌ MFA未安装：{mfa_msg}"
+            try:
+                import jamo
+                return True, "✓ 韩语环境就绪（MFA + jamo已安装）"
+            except ImportError:
+                return False, "❌ 缺失韩语支持（jamo）\n   请运行：pip install jamo"
+        except Exception as e:
+            return False, f"❌ 韩语环境错误：{str(e)}"
+
+    def _check_yue_environment(self) -> Tuple[bool, str]:
+        """检查粤语环境"""
+        try:
+            import pycantonese
+            return True, "✓ 粤语环境就绪（pycantonese已安装）"
+        except ImportError:
+            return False, "❌ 缺失粤语支持（pycantonese）\n   请运行：pip install pycantonese"
+        except Exception as e:
+            return False, f"❌ 粤语环境错误：{str(e)}"
+
+    def _check_language_environment(self, lang: str) -> Tuple[bool, str]:
+        """统一的语言环境检查"""
+        logger.info(f"\n{'='*60}\n检查语言环境：{lang.upper()}\n{'='*60}")
+        
+        if lang in ('zh', 'cmn'):
+            ok, msg = self._check_zh_environment()
+        elif lang == 'en':
+            ok, msg = self._check_en_environment()
+        elif lang == 'ja':
+            ok, msg = self._check_ja_environment()
+        elif lang == 'ko':
+            ok, msg = self._check_ko_environment()
+        elif lang == 'yue':
+            ok, msg = self._check_yue_environment()
         else:
-            phones = re.findall(r"\S+", text)
+            logger.warning(f"未知语言代码：{lang}")
+            return True, f"未知语言：{lang}（跳过环境检查）"
+        
+        logger.info(msg)
+        return ok, msg
 
-        normalized = []
-        for p in phones:
-            cp = convert_phoneme(p, lang)
-            if cp and cp not in self.SIL_PHONES:
-                normalized.append(cp)
-        return normalized
-
-    # ------------------------------------------------------------------
-    # 对外接口：给外部调用
-    # ------------------------------------------------------------------
-    def convert_text_to_phone_string(self, text: str, lang: str = "auto") -> str:
-        phones = self._segment_text_to_phones(text, lang=lang)
+    # =====================================================================
+    # 文本处理
+    # =====================================================================
+    def _text_to_pinyin_notone(self, text: str) -> str:
+        """中文文本转无声调拼音"""
+        phones = lazy_pinyin(text, style=Style.NORMAL, errors="ignore")
+        phones = [p.strip().lower() for p in phones if p and p.strip()]
         return " ".join(phones)
 
-    def build_lab_from_text(self, text: str, start: int, step: int = 1000000, lang: str = "auto") -> str:
-        """
-        把文本转为一个非常简化的 lab 结构。
-        适合没有外部 MFA 输出时做调试。
-        """
-        phones = self._segment_text_to_phones(text, lang=lang)
-        if not phones:
+    def _text_to_jyutping(self, text: str) -> str:
+        """粤语文本转粤拼（无声调）"""
+        try:
+            import pycantonese
+            result = pycantonese.characters_to_jyutping(text)
+            syls: List[str] = []
+            for _char, jyut in result:
+                if jyut:
+                    jyut_no_tone = re.sub(r'[0-9]+$', '', jyut).strip().lower()
+                    if jyut_no_tone:
+                        syls.append(jyut_no_tone)
+            return " ".join(syls)
+        except (ImportError, Exception) as e:
+            logger.warning(f"粤语转换失败: {e}")
             return ""
 
-        cur = start
-        lines = []
-        for p in phones:
-            nxt = cur + step
-            lines.append(f"{cur} {nxt} {p}")
-            cur = nxt
-        return "\n".join(lines)
+    def _normalize_no_tone_pinyin(self, text: str) -> List[str]:
+        """无声调拼音文本转音节列表"""
+        if not text:
+            return []
+        tokens: List[str] = []
+        for part in text.split():
+            p = part.strip().lower()
+            if p:
+                p = re.sub(r"[^a-züv]+", "", p)
+                if p:
+                    tokens.append(p)
+        return tokens
 
-    def clean_and_postprocess_lab_text(self, lab_text: str, lang: str = "auto") -> str:
-        return self.process_lab_text(lab_text, lang=lang, write_meta=False)
+    def _normalize_jyutping(self, text: str) -> List[str]:
+        """粤拼文本转音节列表"""
+        if not text:
+            return []
+        tokens: List[str] = []
+        for part in text.split():
+            p = part.strip().lower()
+            if p:
+                p = re.sub(r"[^a-z]+", "", p)
+                if p:
+                    tokens.append(p)
+        return tokens
 
-    # ------------------------------------------------------------------
-    # MFA 命令层：保留一个可用的 shell 调用入口
-    # ------------------------------------------------------------------
-    def _run_command(self, cmd: List[str], cwd: Optional[str] = None, timeout: Optional[int] = None) -> Tuple[int, str, str]:
-        logger.info("Running command: %s", " ".join(cmd))
-        proc = subprocess.Popen(
-            cmd,
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-        )
-        try:
-            out, err = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            out, err = proc.communicate()
-            raise TimeoutError(f"Command timeout: {' '.join(cmd)}")
-        return proc.returncode, out, err
+    def _segment_to_syllables(self, segment: str) -> List[str]:
+        """文本片段 -> 拼音音节列表"""
+        return self._normalize_no_tone_pinyin(self._text_to_pinyin_notone(segment))
 
-    def check_mfa(self) -> Dict[str, object]:
-        result = {
-            "installed": False,
-            "version": "unknown",
-            "models": {},
-        }
+    def _segment_to_jyutping(self, segment: str) -> List[str]:
+        """文本片段 -> 粤拼音节列表"""
+        return self._normalize_jyutping(self._text_to_jyutping(segment))
 
-        if self.checker is not None:
-            try:
-                checker_result = self.checker.check()
-                if isinstance(checker_result, dict):
-                    result.update(checker_result)
-            except Exception as e:
-                logger.warning("MFAChecker check failed: %s", e)
+    # =====================================================================
+    # 语言/词语类型检测
+    # =====================================================================
+    def _is_english_word(self, word: str) -> bool:
+        """检测是否为英语单词"""
+        return bool(re.match(r"^[a-zA-Z''\-]+$", word.strip()))
 
-        try:
-            code, out, err = self._run_command(["mfa", "--version"], timeout=10)
-            if code == 0:
-                result["installed"] = True
-                result["version"] = (out or err).strip().splitlines()[0]
-        except Exception as e:
-            logger.debug("mfa --version unavailable: %s", e)
+    def _is_digit_char(self, word: str) -> bool:
+        """检测是否为单个数字字符"""
+        return word.strip() in '0123456789'
 
+    # =====================================================================
+    # Phone 清洗
+    # =====================================================================
+    def _clean_phone(self, phone: str) -> str:
+        """去掉 IPA 声调符号"""
+        if not phone:
+            return ""
+        phone = phone.strip()
+        tone_marks = ["˥", "˧", "˩", "˨", "˦", "˧˥", "˥˩", "˩˧", "˨˩", "˥˧", "˧˨", "˨˧"]
+        for mark in tone_marks:
+            phone = phone.replace(mark, "")
+        return phone.strip().lower()
+
+    def _is_silence_phone(self, phone: str) -> bool:
+        """判断是否为静音标记"""
+        return (phone or "").strip().lower() in self.SIL_PHONES
+
+    def _clean_phone_token(self, phone: str) -> str:
+        """宽松的 phone 归一化"""
+        phone = (phone or "").strip().lower().replace("ü", "v")
+        phone = re.sub(r"[^a-zA-Zv]+", "", phone)
+        return phone.strip()
+
+    def _extract_phone_items(self, tier) -> List[Tuple[int, int, str]]:
+        """从 TextGrid tier 中提取 phone items"""
+        items: List[Tuple[int, int, str]] = []
+        for interval in tier:
+            mark = self._clean_phone((interval.mark or "").strip())
+            if mark in self.IGNORE_PHONES:
+                continue
+            start = int(interval.minTime * 10000000)
+            end = int(interval.maxTime * 10000000)
+            items.append((start, end, mark))
+        items.sort(key=lambda x: (x[0], x[1]))
+        return items
+
+    def _get_phones_for_word(
+        self,
+        word_start: int,
+        word_end: int,
+        phone_items: List[Tuple[int, int, str]]
+    ) -> List[Tuple[int, int, str]]:
+        """提取属于某个 word 时间段内的 phone 条目"""
+        result = [
+            (s, e, p) for s, e, p in phone_items
+            if s >= word_start and s < word_end
+            and p not in self.SIL_PHONES
+            and p not in self.IGNORE_PHONES
+        ]
+        result.sort(key=lambda x: x[0])
         return result
 
-    def align(
+    def _get_arpabet_entries(
         self,
-        audio_path: str | Path,
+        word_start: int,
+        word_end: int,
+        phone_items: List[Tuple[int, int, str]]
+    ) -> List[Tuple[int, int, str]]:
+        """提取 ARPABET 音素条目"""
+        word_phones = self._get_phones_for_word(word_start, word_end, phone_items)
+        entries: List[Tuple[int, int, str]] = []
+        for s, e, p in word_phones:
+            arp = convert_phoneme(p, 'en')
+            if arp and arp not in self.SIL_PHONES:
+                entries.append((s, e, arp))
+        return entries
+
+    def _get_romaji_entries(
+        self,
+        word_start: int,
+        word_end: int,
+        phone_items: List[Tuple[int, int, str]]
+    ) -> List[Tuple[int, int, str]]:
+        """提取 ROMAJI 音素条目（IPA→Romaji 自动转换）"""
+        word_phones = self._get_phones_for_word(word_start, word_end, phone_items)
+        entries: List[Tuple[int, int, str]] = []
+        
+        for s, e, p in word_phones:
+            romaji = convert_phoneme(p, 'ja')
+            
+            if romaji is None:
+                logger.debug(f"  跳过静音: {p}")
+                continue
+            elif romaji == "":
+                logger.debug(f"  省略符号: {p}")
+                continue
+            elif romaji not in self.SIL_PHONES:
+                entries.append((s, e, romaji))
+                logger.debug(f"  转换: {p} → {romaji}")
+        
+        logger.debug(f"提取 Romaji 条目: {len(entries)} 个 from [{word_start}, {word_end}]")
+        return entries
+
+    def _get_jamo_entries(
+        self,
+        word_start: int,
+        word_end: int,
+        phone_items: List[Tuple[int, int, str]]
+    ) -> List[Tuple[int, int, str]]:
+        """提取 Hangul Jamo 音素条目（IPA→Jamo 自动转换）"""
+        word_phones = self._get_phones_for_word(word_start, word_end, phone_items)
+        entries: List[Tuple[int, int, str]] = []
+        
+        for s, e, p in word_phones:
+            jamo = convert_phoneme(p, 'ko')
+            
+            if jamo is None:
+                logger.debug(f"  跳过静音: {p}")
+                continue
+            elif jamo == "":
+                logger.debug(f"  省略符号: {p}")
+                continue
+            elif jamo not in self.SIL_PHONES:
+                entries.append((s, e, jamo))
+                logger.debug(f"  转换: {p} → {jamo}")
+        
+        logger.debug(f"提取 Jamo 条目: {len(entries)} 个 from [{word_start}, {word_end}]")
+        return entries
+
+    # =====================================================================
+    # 音节工具
+    # =====================================================================
+    def _syllable_weight(self, syl: str) -> float:
+        """计算音节权重"""
+        syl = (syl or "").strip().lower()
+        if not syl:
+            return 1.0
+        weight = 1.0 + min(len(syl), 8) * 0.10
+        if syl in self.SPECIAL_SYLLABLES:
+            weight += 0.10
+        if any(syl.endswith(hint) for hint in self.LONG_FINAL_HINTS):
+            weight += 0.20
+        elif any(syl.endswith(hint) for hint in self.SHORT_FINAL_HINTS):
+            weight += 0.08
+        if syl.startswith(("zh", "ch", "sh")):
+            weight += 0.12
+        else:
+            for ini in self.INITIALS_EXTENDED[:6]:
+                if syl.startswith(ini):
+                    weight += 0.08
+                    break
+        return max(weight, 0.75)
+
+    def _split_pinyin_syllable(self, syl: str) -> Tuple[str, str]:
+        """拆分拼音音节为声母和韵母"""
+        syl = (syl or "").strip().lower().replace("ü", "v")
+        if not syl:
+            return "", ""
+        for ini in self.INITIALS_EXTENDED:
+            if syl.startswith(ini):
+                final = syl[len(ini):]
+                return ini, final
+        return "", syl
+
+    def _get_syllable_nucleus(self, syl: str) -> str:
+        """提取拼音音节的主元音"""
+        syl = (syl or "").strip().lower().replace("ü", "v")
+        if not syl:
+            return ""
+        _, final = self._split_pinyin_syllable(syl)
+        if not final:
+            return ""
+        for ch in final:
+            if ch in "aeiouv":
+                return ch
+        return final[0] if final else ""
+
+    # =====================================================================
+    # con 标记逻辑
+    # =====================================================================
+    def _has_con_onset(self, syl: str, lang: str = 'zh') -> bool:
+        """判断音节是否有辅音声母"""
+        syl = (syl or "").strip().lower().replace("ü", "v")
+        if not syl:
+            return False
+
+        if lang in ('zh', 'cmn'):
+            for onset in sorted(self.CON_INITIALS, key=len, reverse=True):
+                if syl.startswith(onset):
+                    return True
+            return False
+
+        if lang == 'yue':
+            for onset in sorted(self.YUE_CON_INITIALS, key=len, reverse=True):
+                if syl.startswith(onset) and len(syl) > len(onset):
+                    return True
+            return False
+
+        return False
+
+    def _get_con_boundary(
+        self,
+        syl_start: int,
+        syl_end: int,
+        phone_items: List[Tuple[int, int, str]]
+    ) -> int:
+        """获取 con 标记的边界"""
+        if phone_items:
+            syl_phones = [
+                (s, e, p) for s, e, p in phone_items
+                if s >= syl_start and s < syl_end
+                and p not in self.SIL_PHONES
+                and p not in self.IGNORE_PHONES
+            ]
+            
+            if syl_phones:
+                syl_phones.sort(key=lambda x: x[0])
+                first_phone_end = syl_phones[0][1]
+                syl_duration = syl_end - syl_start
+                max_con_end = syl_start + syl_duration // 2
+                con_boundary = min(first_phone_end, max_con_end)
+                
+                if con_boundary - syl_start < 100000:
+                    con_boundary = syl_start + 100000
+                if con_boundary >= syl_end - 100000:
+                    con_boundary = syl_end - 100000
+                
+                return con_boundary
+        
+        syl_duration = syl_end - syl_start
+        con_duration = max(int(syl_duration * 0.15), 100000)
+        con_duration = min(con_duration, int(syl_duration * 0.40))
+        fallback = syl_start + con_duration
+        return fallback
+
+    def _make_con_entries(
+        self,
+        syl_start: int,
+        syl_end: int,
+        syl: str,
+        phone_items: List[Tuple[int, int, str]],
+        lang: str = 'zh'
+    ) -> List[Tuple[int, int, str]]:
+        """生成单个音节的 LAB 条目"""
+        if self._has_con_onset(syl, lang):
+            con_boundary = self._get_con_boundary(syl_start, syl_end, phone_items)
+            return [
+                (syl_start, con_boundary, "-"),
+                (con_boundary, syl_end, syl),
+            ]
+        else:
+            return [(syl_start, syl_end, syl)]
+
+    def _syllable_anchor_candidates(self, syl: str) -> List[str]:
+        """生成音节的可匹配候选"""
+        syl = (syl or "").strip().lower().replace("ü", "v")
+        if not syl:
+            return []
+        onset, rhyme = self._split_pinyin_syllable(syl)
+        nucleus = self._get_syllable_nucleus(syl)
+        
+        cands: List[str] = []
+        def push(token: str):
+            token = (token or "").strip().lower().replace("ü", "v")
+            if token and token not in cands:
+                cands.append(token)
+
+        push(syl)
+        push(rhyme)
+        push(nucleus)
+        if onset:
+            push(onset)
+        push(rhyme.replace("v", "u"))
+        push(rhyme.replace("v", "i"))
+        push(nucleus.replace("v", "u"))
+        push(nucleus.replace("v", "i"))
+        cleaned = re.sub(r"[^a-z]+", "", syl).lower()
+        push(cleaned)
+        
+        return [c for c in cands if c]
+
+    def _phone_matches_syllable(self, phone: str, syl: str) -> bool:
+        """判断 phone 是否匹配拼音音节"""
+        phone = self._clean_phone_token(phone)
+        if not phone:
+            return False
+        return phone in set(self._syllable_anchor_candidates(syl))
+
+    # =====================================================================
+    # 音节分配
+    # =====================================================================
+    def _distribute_syllables_in_word(
+        self,
+        word_start: int,
+        word_end: int,
+        syllables: List[str],
+        phone_tier=None,
+        lang: str = 'zh'
+    ) -> List[Tuple[int, int, str]]:
+        """在 Word 内分配音节"""
+        if not syllables:
+            return []
+        
+        if len(syllables) == 1:
+            return [(word_start, word_end, syllables[0])]
+
+        return self._distribute_syllables_by_weight(word_start, word_end, syllables)
+
+    def _distribute_syllables_by_weight(
+        self,
+        word_start: int,
+        word_end: int,
+        syllables: List[str]
+    ) -> List[Tuple[int, int, str]]:
+        """基于权重的比例分配"""
+        if not syllables:
+            return []
+        
+        weights = [self._syllable_weight(s) for s in syllables]
+        total_weight = sum(weights) or 1.0
+        
+        word_duration = word_end - word_start
+        result: List[Tuple[int, int, str]] = []
+        current_time = word_start
+        
+        for i, syl in enumerate(syllables):
+            if i == len(syllables) - 1:
+                syl_end = word_end
+            else:
+                syl_duration = int(round(word_duration * (weights[i] / total_weight)))
+                syl_end = current_time + syl_duration
+            
+            if syl_end - current_time < 60000:
+                syl_end = current_time + 60000
+            
+            if i < len(syllables) - 1 and syl_end > word_end:
+                syl_end = word_end
+            
+            result.append((current_time, syl_end, syl))
+            current_time = syl_end
+        
+        return result
+
+    # =====================================================================
+    # 各语言 Word Tier 处理
+    # =====================================================================
+    def _process_zh_words(
+        self,
+        word_tier,
+        phone_items: List[Tuple[int, int, str]],
+        text: str
+    ) -> List[str]:
+        """处理中文 Word Tier → 拼音 + con 标记"""
+        target_syls = self._normalize_no_tone_pinyin(self._text_to_pinyin_notone(text))
+        lines: List[str] = []
+        syl_index = 0
+
+        for interval in word_tier:
+            mark = getattr(interval, "mark", getattr(interval, "text", ""))
+            mark = (mark or "").strip()
+            start = int(interval.minTime * 10000000)
+            end = int(interval.maxTime * 10000000)
+
+            if not mark or mark in self.IGNORE_PHONES:
+                continue
+            if mark in self.SIL_PHONES or mark in ("sp", "spn"):
+                lines.append(f"{start} {end} sil")
+                continue
+
+            if self._is_english_word(mark):
+                entries = self._get_arpabet_entries(start, end, phone_items)
+                if entries:
+                    for s, e, p in entries:
+                        lines.append(f"{s} {e} {p}")
+                else:
+                    lines.append(f"{start} {end} {mark.lower()}")
+                continue
+
+            if self._is_digit_char(mark):
+                syl = self.DIGIT_PINYIN.get(mark.strip(), mark)
+                for es, ee, el in self._make_con_entries(start, end, syl, phone_items, 'zh'):
+                    lines.append(f"{es} {ee} {el}")
+                syl_index = min(syl_index + 1, len(target_syls))
+                continue
+
+            clean_mark = re.sub(r"[^\w\u4e00-\u9fa5]+", "", mark)
+            if not clean_mark:
+                continue
+            mark_syls = self._segment_to_syllables(clean_mark)
+            syl_count = len(mark_syls)
+            if syl_count == 0:
+                continue
+
+            current_syls = target_syls[syl_index: syl_index + syl_count]
+            syl_index += syl_count
+            if not current_syls:
+                current_syls = mark_syls
+
+            syl_lines = self._distribute_syllables_in_word(start, end, current_syls, None, 'zh')
+            for s, e, syl in syl_lines:
+                for es, ee, el in self._make_con_entries(s, e, syl, phone_items, 'zh'):
+                    lines.append(f"{es} {ee} {el}")
+
+        return lines
+
+    def _process_en_words(
+        self,
+        word_tier,
+        phone_items: List[Tuple[int, int, str]],
+        text: str
+    ) -> List[str]:
+        """处理英语 Word Tier → ARPABET"""
+        lines: List[str] = []
+
+        for interval in word_tier:
+            mark = getattr(interval, "mark", getattr(interval, "text", ""))
+            mark = (mark or "").strip()
+            start = int(interval.minTime * 10000000)
+            end = int(interval.maxTime * 10000000)
+
+            if not mark or mark in self.IGNORE_PHONES:
+                continue
+            if mark in self.SIL_PHONES or mark in ("sp", "spn"):
+                lines.append(f"{start} {end} sil")
+                continue
+
+            entries = self._get_arpabet_entries(start, end, phone_items)
+            if entries:
+                for s, e, p in entries:
+                    lines.append(f"{s} {e} {p}")
+            else:
+                lines.append(f"{start} {end} {mark.lower()}")
+
+        return lines
+
+    def _process_ja_words(
+        self,
+        word_tier,
+        phone_items: List[Tuple[int, int, str]],
+        text: str
+    ) -> List[str]:
+        """处理日语 Word Tier → ROMAJI（IPA→Romaji 自动转换）"""
+        lines: List[str] = []
+
+        for interval in word_tier:
+            mark = getattr(interval, "mark", getattr(interval, "text", ""))
+            mark = (mark or "").strip()
+            start = int(interval.minTime * 10000000)
+            end = int(interval.maxTime * 10000000)
+
+            if not mark or mark in self.IGNORE_PHONES:
+                continue
+            if mark in self.SIL_PHONES or mark in ("sp", "spn"):
+                lines.append(f"{start} {end} sil")
+                continue
+
+            if self._is_english_word(mark):
+                entries = self._get_arpabet_entries(start, end, phone_items)
+                if entries:
+                    for s, e, p in entries:
+                        lines.append(f"{s} {e} {p}")
+                else:
+                    lines.append(f"{start} {end} {mark.lower()}")
+                continue
+
+            entries = self._get_romaji_entries(start, end, phone_items)
+            if entries:
+                for s, e, p in entries:
+                    lines.append(f"{s} {e} {p}")
+            else:
+                logger.warning(f"日语 word '{mark}' 无法从 Phone Tier 获取音素，跳过")
+
+        return lines
+
+    def _process_ko_words(
+        self,
+        word_tier,
+        phone_items: List[Tuple[int, int, str]],
+        text: str
+    ) -> List[str]:
+        """处理韩语 Word Tier"""
+        lines: List[str] = []
+
+        for interval in word_tier:
+            mark = getattr(interval, "mark", getattr(interval, "text", ""))
+            mark = (mark or "").strip()
+            start = int(interval.minTime * 10000000)
+            end = int(interval.maxTime * 10000000)
+
+            if not mark or mark in self.IGNORE_PHONES:
+                continue
+            if mark in self.SIL_PHONES or mark in ("sp", "spn"):
+                lines.append(f"{start} {end} sil")
+                continue
+
+            if self._is_english_word(mark):
+                entries = self._get_arpabet_entries(start, end, phone_items)
+                if entries:
+                    for s, e, p in entries:
+                        lines.append(f"{s} {e} {p}")
+                else:
+                    lines.append(f"{start} {end} {mark.lower()}")
+                continue
+
+            if self._is_korean_text(mark):
+                syllable_entries = self._decompose_korean_syllable_with_onset(
+                    start, end, mark, phone_items=phone_items
+                )
+                if syllable_entries:
+                    for s, e, p in syllable_entries:
+                        lines.append(f"{s} {e} {p}")
+                else:
+                    logger.warning(f"无法处理韩语 word '{mark}'，跳过")
+            else:
+                logger.warning(f"非韩文 word '{mark}'，跳过")
+
+        return lines
+
+    def _is_korean_text(self, text: str) -> bool:
+        """检测文本是否为韩文"""
+        if not text:
+            return False
+        for char in text:
+            code = ord(char)
+            if (0xAC00 <= code <= 0xD7A3   
+                    or 0x3130 <= code <= 0x318F   
+                    or 0x1100 <= code <= 0x11FF):  
+                return True
+        return False
+
+    def _get_korean_initial_consonant(self, char: str) -> Optional[str]:
+        """从韩文字符提取初声"""
+        if not char:
+            return None
+        code = ord(char)
+        if 0xAC00 <= code <= 0xD7A3:
+            offset = code - 0xAC00
+            initial_idx = offset // 588
+            if initial_idx == 12:
+                return None
+            return "has_initial"  
+        if 0x3131 <= code <= 0x318E:
+            if 0x3131 <= code <= 0x3164:
+                return "has_initial"
+            else:
+                return None
+        if 0x1100 <= code <= 0x11FF:
+            if 0x1100 <= code <= 0x1114:
+                return "has_initial"
+            else:
+                return None
+        return None
+
+    def _decompose_korean_syllable_with_onset(
+        self,
+        word_start: int,
+        word_end: int,
+        korean_text: str,
+        phone_items: Optional[List[Tuple[int, int, str]]] = None,
+    ) -> List[Tuple[int, int, str]]:
+        """分解韩文字符"""
+        try:
+            import jamo
+            entries: List[Tuple[int, int, str]] = []
+            if not korean_text:
+                return entries
+
+            korean_chars: List[Tuple[str, bool]] = []  
+            for char in korean_text:
+                if not char or char == ' ':
+                    continue
+                has_initial = False
+                try:
+                    initial_marker = self._get_korean_initial_consonant(char)
+                    if initial_marker == "has_initial":
+                        has_initial = True
+                except Exception as jamo_err:
+                    logger.debug(f"Jamo 初声检测失败 {char}: {jamo_err}")
+                korean_chars.append((char, has_initial))
+
+            if not korean_chars:
+                return entries
+
+            n_chars = len(korean_chars)
+            syllable_time_ranges: List[Tuple[int, int]] = []
+            if phone_items:
+                word_phones = [
+                    (s, e, p) for s, e, p in phone_items
+                    if s >= word_start and s < word_end
+                    and p not in self.SIL_PHONES
+                    and p not in self.IGNORE_PHONES
+                ]
+                word_phones.sort(key=lambda x: x[0])
+
+                if len(word_phones) == n_chars:
+                    syllable_time_ranges = [(s, e) for s, e, _ in word_phones]
+                elif len(word_phones) > n_chars:
+                    jamo_counts = []
+                    for char, _ in korean_chars:
+                        try:
+                            dec = jamo.decompose(char)
+                            jamo_counts.append(max(len(dec), 1))
+                        except Exception:
+                            jamo_counts.append(2)
+
+                    idx = 0
+                    for i, (char, _) in enumerate(korean_chars):
+                        n = jamo_counts[i]
+                        chunk = word_phones[idx: idx + n]
+                        if chunk:
+                            syl_start = chunk[0][0]
+                            syl_end = (
+                                word_end if i == n_chars - 1
+                                else (chunk[-1][1] if len(chunk) == n 
+                                      else word_phones[min(idx + n, len(word_phones) - 1)][0])
+                            )
+                            syllable_time_ranges.append((syl_start, syl_end))
+                        idx += n
+
+            if len(syllable_time_ranges) != n_chars:
+                word_duration = word_end - word_start
+                total_units = sum(2 if hi else 1 for _, hi in korean_chars)
+                unit_dur = max(word_duration // max(total_units, 1), 100000)
+
+                cur = word_start
+                syllable_time_ranges = []
+                for i, (char, has_init) in enumerate(korean_chars):
+                    units = 2 if has_init else 1
+                    syl_end = (
+                        word_end if i == n_chars - 1
+                        else min(cur + units * unit_dur, word_end)
+                    )
+                    syllable_time_ranges.append((cur, syl_end))
+                    cur = syl_end
+
+            for i, ((char, has_initial), (syl_start, syl_end)) in enumerate(
+                zip(korean_chars, syllable_time_ranges)
+            ):
+                syl_dur = max(syl_end - syl_start, 200000)
+                if has_initial:
+                    dash_dur = max(syl_dur // 3, 60000)
+                    dash_end = min(syl_start + dash_dur, syl_end - 60000)
+                    entries.append((syl_start, dash_end, "-"))
+                    entries.append((dash_end, syl_end, char))
+                else:
+                    entries.append((syl_start, syl_end, char))
+
+            if entries and entries[-1][1] < word_end:
+                s, e, p = entries[-1]
+                entries[-1] = (s, word_end, p)
+
+            return entries
+        except ImportError:
+            logger.error("jamo 库未安装，无法分解韩文字符")
+            return []
+        except Exception as e:
+            logger.error(f"韩文分解失败: {e}", exc_info=True)
+            return []
+
+    def _process_yue_words(
+        self,
+        word_tier,
+        phone_items: List[Tuple[int, int, str]],
+        text: str
+    ) -> List[str]:
+        """处理粤语 Word Tier → 粤拼 + con 标记"""
+        target_syls = self._normalize_jyutping(self._text_to_jyutping(text))
+        lines: List[str] = []
+        syl_index = 0
+
+        for interval in word_tier:
+            mark = getattr(interval, "mark", getattr(interval, "text", ""))
+            mark = (mark or "").strip()
+            start = int(interval.minTime * 10000000)
+            end = int(interval.maxTime * 10000000)
+
+            if not mark or mark in self.IGNORE_PHONES:
+                continue
+            if mark in self.SIL_PHONES or mark in ("sp", "spn"):
+                lines.append(f"{start} {end} sil")
+                continue
+
+            if self._is_english_word(mark):
+                entries = self._get_arpabet_entries(start, end, phone_items)
+                if entries:
+                    for s, e, p in entries:
+                        lines.append(f"{s} {e} {p}")
+                else:
+                    lines.append(f"{start} {end} {mark.lower()}")
+                continue
+
+            if self._is_digit_char(mark):
+                syl = self.DIGIT_JYUTPING.get(mark.strip(), mark)
+                for es, ee, el in self._make_con_entries(start, end, syl, phone_items, 'yue'):
+                    lines.append(f"{es} {ee} {el}")
+                syl_index = min(syl_index + 1, len(target_syls))
+                continue
+
+            clean_mark = re.sub(r"[^\u4e00-\u9fa5\u3400-\u4dbf\uf900-\ufaff\u3000-\u303f]+", "", mark)
+            syl_count = len(clean_mark)
+
+            if syl_count == 0:
+                word_phones = self._get_phones_for_word(start, end, phone_items)
+                for s, e, p in word_phones:
+                    if p not in self.SIL_PHONES:
+                        lines.append(f"{s} {e} {p}")
+                continue
+
+            current_syls = target_syls[syl_index: syl_index + syl_count]
+            syl_index += syl_count
+
+            if not current_syls:
+                word_phones = self._get_phones_for_word(start, end, phone_items)
+                for s, e, p in word_phones:
+                    if p not in self.SIL_PHONES:
+                        lines.append(f"{s} {e} {p}")
+                continue
+
+            syl_lines = self._distribute_syllables_in_word(start, end, current_syls, None, 'yue')
+            for s, e, syl in syl_lines:
+                for es, ee, el in self._make_con_entries(s, e, syl, phone_items, 'yue'):
+                    lines.append(f"{es} {ee} {el}")
+
+        return lines
+
+    # =====================================================================
+    # TextGrid 处理
+    # =====================================================================
+    def _textgrid_to_lab_word_tier_primary(
+        self,
+        textgrid_path: str,
         text: str,
-        output_dir: str | Path,
-        language: str = "auto",
-        tmp_dir: str | Path | None = None,
-    ) -> Dict[str, object]:
+        lang: str = 'zh'
+    ) -> str:
+        """Word Tier 对齐主逻辑（含 LAB 后处理）"""
+        try:
+            from textgrid import TextGrid
+            tg = TextGrid.fromFile(textgrid_path)
+            
+            word_tier = None
+            phone_tier = None
+            
+            for candidate in tg:
+                tier_name = getattr(candidate, "name", "").lower()
+                if "word" in tier_name:
+                    word_tier = candidate
+                elif "phone" in tier_name or "phoneme" in tier_name:
+                    phone_tier = candidate
+            
+            if word_tier is None:
+                logger.error("未找到 Word Tier")
+                return ""
+            
+            phone_items: List[Tuple[int, int, str]] = []
+            if phone_tier is not None:
+                phone_items = self._extract_phone_items(phone_tier)
+            
+            if lang in ('zh', 'cmn'):
+                lines = self._process_zh_words(word_tier, phone_items, text)
+            elif lang == 'en':
+                lines = self._process_en_words(word_tier, phone_items, text)
+            elif lang == 'ja':
+                lines = self._process_ja_words(word_tier, phone_items, text)
+            elif lang == 'ko':
+                lines = self._process_ko_words(word_tier, phone_items, text)
+            elif lang == 'yue':
+                lines = self._process_yue_words(word_tier, phone_items, text)
+            else:
+                lines = self._process_en_words(word_tier, phone_items, text)
+            
+            # ★ 后处理：日语 romaji → hiragana；所有语言合并 '-' 标记
+            lines = self._apply_lab_postprocess(lines, lang)
+            return "\n".join(lines)
+            
+        except ImportError:
+            return self._parse_textgrid_manual(textgrid_path, text, lang)
+        except Exception as e:
+            logger.error(f"对齐失败: {e}", exc_info=True)
+            return ""
+
+    # =====================================================================
+    # LAB 后处理辅助方法
+    # =====================================================================
+    @staticmethod
+    def _parse_lab_lines(lines: List[str]) -> List[Tuple[int, int, str]]:
+        """将 LAB 行列表解析为 (start_100ns, end_100ns, label) 列表。"""
+        entries: List[Tuple[int, int, str]] = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            try:
+                entries.append((int(parts[0]), int(parts[1]), parts[2]))
+            except (ValueError, IndexError):
+                continue
+        return entries
+
+    def _apply_lab_postprocess(
+        self,
+        lines: List[str],
+        lang: str,
+    ) -> List[str]:
         """
-        一个保守版对齐入口：
-        - 先做文本清洗
-        - 再把文本送入 MFA
-        - 最后对 raw lab 做后处理
+        LAB 后处理流水线：
+          • 日语 (ja)  ： romaji 序列 → hiragana + '-' (build_ja_hiragana_lab)
+                           → 合并 '-' 标记 (merge_lab_silence)
+          • 中/英/韩/粤 ： 直接合并 '-' 标记 (merge_lab_silence)
+
+        规则说明
+        --------
+        '-' 在有声音节之后且紧邻（间距 ≤ 50 ms）→ 合并到左侧（延伸左侧结束时间）
+        '-' 在句首、静音后、或跨越句间停顿（间距 > 50 ms）→ 直接删除
         """
-        audio_path = Path(audio_path)
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        entries = self._parse_lab_lines(lines)
+        if lang in ('ja', 'jpn'):
+            entries = build_ja_hiragana_lab(entries)
+        merged = merge_lab_silence(entries)
+        return [f"{s} {e} {p}" for s, e, p in merged]
 
-        if tmp_dir is None:
-            tmp_dir = tempfile.mkdtemp(prefix="mfa_proc_")
-        else:
-            tmp_dir = str(tmp_dir)
 
-        temp_root = Path(tmp_dir)
-        temp_root.mkdir(parents=True, exist_ok=True)
+    def _parse_textgrid_manual(
+        self,
+        textgrid_path: str,
+        text: str,
+        lang: str = 'zh'
+    ) -> str:
+        """手工解析 TextGrid"""
+        try:
+            with open(textgrid_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            
+            tiers = content.split("item [")
+            word_tier_content = ""
+            phone_tier_content = ""
+            
+            for tier in tiers:
+                if 'name = "words"' in tier or 'name = "word"' in tier:
+                    word_tier_content = tier
+                elif 'name = "phones"' in tier or 'name = "phone"' in tier:
+                    phone_tier_content = tier
+            
+            if not word_tier_content:
+                logger.error("未找到 Word Tier")
+                return ""
+            
+            pattern = r"xmin = ([\d.]+)\s+xmax = ([\d.]+)\s+text = \"(.*?)\""
+            matches = re.findall(pattern, word_tier_content, re.DOTALL)
+            
+            class MockInterval:
+                def __init__(self, start, end, mark):
+                    self.minTime = float(start)
+                    self.maxTime = float(end)
+                    self.mark = mark
+            
+            word_tier = [MockInterval(m[0], m[1], m[2]) for m in matches]
+            
+            phone_items: List[Tuple[int, int, str]] = []
+            if phone_tier_content:
+                p_matches = re.findall(pattern, phone_tier_content, re.DOTALL)
+                phone_tier = [MockInterval(m[0], m[1], m[2]) for m in p_matches]
+                phone_items = self._extract_phone_items(phone_tier)
+            
+            if lang in ('zh', 'cmn'):
+                lines = self._process_zh_words(word_tier, phone_items, text)
+            elif lang == 'en':
+                lines = self._process_en_words(word_tier, phone_items, text)
+            elif lang == 'ja':
+                lines = self._process_ja_words(word_tier, phone_items, text)
+            elif lang == 'ko':
+                lines = self._process_ko_words(word_tier, phone_items, text)
+            elif lang == 'yue':
+                lines = self._process_yue_words(word_tier, phone_items, text)
+            else:
+                lines = self._process_en_words(word_tier, phone_items, text)
+            
+            # ★ 后处理：日语 romaji → hiragana；所有语言合并 '-' 标记
+            lines = self._apply_lab_postprocess(lines, lang)
+            return "\n".join(lines)
+            
+        except Exception as e:
+            logger.error(f"手工解析失败: {e}", exc_info=True)
+            return ""
 
-        cleaned_text = self._clean_input_text(text)
-        transcript_path = temp_root / "transcript.txt"
-        transcript_path.write_text(cleaned_text, encoding="utf-8")
+    def _textgrid_to_lab(self, textgrid_path: str, text: str, lang: str = 'zh') -> str:
+        return self._textgrid_to_lab_word_tier_primary(textgrid_path, text, lang)
 
-        raw_lab_path = temp_root / "raw.lab"
-        final_lab_path = output_dir / f"{audio_path.stem}.lab"
-        meta_path = final_lab_path.with_suffix(".meta.json")
+    def _get_audio_duration(self, audio_path: str) -> int:
+        try:
+            import soundfile as sf
+            data, sr = sf.read(audio_path)
+            duration_seconds = len(data) / sr
+            return int(duration_seconds * 10000000)
+        except (ImportError, Exception):
+            try:
+                import wave
+                with wave.open(audio_path, "rb") as wav_file:
+                    n_frames = wav_file.getnframes()
+                    framerate = wav_file.getframerate()
+                    duration_seconds = n_frames / framerate
+                    return int(duration_seconds * 10000000)
+            except Exception as e:
+                logger.error(f"获取音频时长失败: {e}")
+                return 0
 
-        # 这里给出一个最小可运行占位：
-        # 如果你的项目里已经有真正的 MFA shell 步骤，把它替换到这里即可。
-        # 下面逻辑的重点是：保证后处理链路可以工作。
-        if raw_lab_path.exists():
-            self.process_lab_file(raw_lab_path, final_lab_path, lang=language, meta_path=meta_path)
-        else:
-            # 没有 raw lab 时，生成一个“文本到简化 lab”的调试输出
-            simplified_lab = self.build_lab_from_text(cleaned_text, start=0, step=1000000, lang=language)
-            final_lab_path.write_text(simplified_lab, encoding="utf-8")
-            meta_path.write_text("[]", encoding="utf-8")
+    # =====================================================================
+    # 主流程（修改位置）
+    # =====================================================================
+    def process(self, audio_file, text: str, language: str = "cmn") -> Dict:
+        """处理单个音频文件"""
+        start_time = time.time()
+        try:
+            self.temp_dir = tempfile.mkdtemp(prefix="mfa_")
+            raw_lang = (language or "cmn").lower().strip()
 
-        return {
-            "success": True,
-            "audio_path": str(audio_path),
-            "text_path": str(transcript_path),
-            "lab_path": str(final_lab_path),
-            "meta_path": str(meta_path),
-            "temp_dir": str(temp_root),
-        }
+            # ★ 关键新增点：在任何语言分支提取前，优先使用新规则统一清洗输入的原始文本
+            text = self._clean_input_text(text)
 
-    def cleanup(self) -> None:
+            if raw_lang in ("cmn", "zh", "zh-cn", "mandarin"):
+                lang = "zh"
+                text_for_mfa = text.strip()
+                phoneme_text = self._text_to_pinyin_notone(text)
+            elif raw_lang in ("yue", "zh-yue", "cantonese"):
+                lang = "yue"
+                text_for_mfa = text.strip()
+                phoneme_text = self._text_to_jyutping(text) or text.strip()
+            elif raw_lang in ("en", "english", "eng"):
+                lang = "en"
+                text_for_mfa = text.strip()
+                phoneme_text = text.strip()
+            elif raw_lang in ("ja", "japanese", "jpn"):
+                lang = "ja"
+                text_for_mfa = text.strip()
+                phoneme_text = text.strip()
+            elif raw_lang in ("ko", "korean", "kor"):
+                lang = "ko"
+                text_for_mfa = text.strip()
+                phoneme_text = text.strip()
+            else:
+                lang = raw_lang
+                text_for_mfa = text.strip()
+                phoneme_text = text.strip()
+
+            env_ok, env_msg = self._check_language_environment(lang)
+            if not env_ok:
+                logger.error(env_msg)
+                return {
+                    "success": False, "error": env_msg,
+                    "processing_time": int((time.time() - start_time) * 1000)
+                }
+
+            audio_path = os.path.join(self.temp_dir, audio_file.filename)
+            audio_file.save(audio_path)
+            audio_duration = self._get_audio_duration(audio_path)
+
+            corpus_dir = os.path.join(self.temp_dir, "corpus")
+            os.makedirs(corpus_dir, exist_ok=True)
+            basename = Path(audio_path).stem
+            audio_dest = os.path.join(corpus_dir, f"{basename}.wav")
+            shutil.copy2(audio_path, audio_dest)
+            text_file = os.path.join(corpus_dir, f"{basename}.txt")
+            with open(text_file, "w", encoding="utf-8") as f:
+                f.write(text_for_mfa)
+
+            output_dir = os.path.join(self.temp_dir, "aligned")
+            os.makedirs(output_dir, exist_ok=True)
+            models = MFAChecker.LANGUAGE_MODELS.get(lang, {})
+            dict_model = models.get("dictionary", lang)
+            acoustic_model = models.get("acoustic", lang)
+            py = MFAChecker.env_python()
+            cmd = [
+                str(py), "-m", "montreal_forced_aligner.command_line.mfa",
+                "align", corpus_dir, dict_model, acoustic_model,
+                output_dir, "--clean", "--single_speaker"
+            ]
+            
+            timeout_seconds = 600 if lang in ('ja', 'ko') else 300
+            
+            env = os.environ.copy()
+            mfa_env_dir = MFAChecker.env_dir()
+            env["CONDA_PREFIX"] = str(mfa_env_dir)
+            lib_bin = mfa_env_dir / "Library" / "bin"
+            if lib_bin.exists():
+                env["PATH"] = str(lib_bin) + os.pathsep + env.get("PATH", "")
+            lib_dir = mfa_env_dir / "lib"
+            if lib_dir.exists():
+                env["LD_LIBRARY_PATH"] = str(lib_dir) + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+            
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout_seconds, env=env
+            )
+            
+            if result.returncode != 0:
+                error_msg = result.stderr if result.stderr else "MFA 失败"
+                logger.error(f"MFA: {error_msg}")
+                return {
+                    "success": False, "error": error_msg,
+                    "processing_time": int((time.time() - start_time) * 1000)
+                }
+
+            textgrid_files = list(Path(output_dir).glob("**/*.TextGrid"))
+            if not textgrid_files:
+                return {
+                    "success": False, "error": "MFA 未生成 TextGrid",
+                    "processing_time": int((time.time() - start_time) * 1000)
+                }
+            textgrid_path = str(textgrid_files[0])
+
+            lab_content = self._textgrid_to_lab(textgrid_path, text, lang=lang)
+
+            if not lab_content:
+                return {
+                    "success": False, "error": "LAB 内容为空",
+                    "processing_time": int((time.time() - start_time) * 1000)
+                }
+
+            processing_time = int((time.time() - start_time) * 1000)
+
+            return {
+                "success": True,
+                "raw_text": text,
+                "phoneme_text": phoneme_text,
+                "lab_content": lab_content,
+                "textgrid_path": textgrid_path,
+                "audio_duration": audio_duration,
+                "processing_time": processing_time
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                "success": False, "error": "MFA 超时",
+                "processing_time": int((time.time() - start_time) * 1000)
+            }
+        except FileNotFoundError as e:
+            return {
+                "success": False, "error": "MFA 命令不存在",
+                "processing_time": int((time.time() - start_time) * 1000)
+            }
+        except Exception as e:
+            logger.error(f"错误: {e}", exc_info=True)
+            return {
+                "success": False, "error": str(e),
+                "processing_time": int((time.time() - start_time) * 1000)
+            }
+        finally:
+            self._cleanup()
+
+    def _cleanup(self):
         if self.temp_dir and os.path.exists(self.temp_dir):
-            shutil.rmtree(self.temp_dir, ignore_errors=True)
-            self.temp_dir = None
-
-
-def process_lab_text(text: str, lang: str = "auto", write_meta: bool = False):
-    return MFAProcessor().process_lab_text(text, lang=lang, write_meta=write_meta)
-
-
-def process_lab_file(
-    input_path: str | Path,
-    output_path: str | Path,
-    lang: str = "auto",
-    meta_path: str | Path | None = None,
-) -> None:
-    MFAProcessor().process_lab_file(input_path, output_path, lang=lang, meta_path=meta_path)
+            try:
+                shutil.rmtree(self.temp_dir)
+            except Exception as e:
+                logger.warning(f"清理失败: {e}")

@@ -1,26 +1,32 @@
 # -*- coding: utf-8 -*-
 """
-phoneme_converter.py (Enhanced Korean IPA→Jamo support)
+phoneme_converter.py  v2.0
 Converts MFA output phonemes (IPA) to target phoneme sets for GPT-SoVITS.
 
 Supported conversions:
-  ja / jpn  →  Romaji      (MFA japanese_mfa IPA output)
-  en / eng  →  ARPAbet     (MFA english_us_mfa output)
-  zh / cmn  →  Pinyin      (MFA mandarin_china_mfa, pass-through)
-  ko / kor  →  Hangul Jamo (MFA korean_mfa, IPA→Jamo conversion) ★ NEW!
-  yue       →  Jyutping    (MFA mandarin_china_mfa, pass-through)
+  ja / jpn  →  Hiragana   (MFA japanese_mfa IPA → romaji → hiragana + merge)
+  en / eng  →  ARPAbet    (MFA english_us_mfa, with diacritic normalization)
+  zh / cmn  →  Pinyin     (MFA mandarin_china_mfa, pass-through)
+  ko / kor  →  Hangul Jamo(MFA korean_mfa, IPA → Jamo)
+  yue       →  Jyutping   (MFA mandarin_china_mfa, pass-through)
+
+New in v2.0:
+  - EN: diacritic-strip fallback (d̪→d, pʲ→p, tʰ→t, kʰ→k, ɝ→er, ʉː→uw …)
+  - JA: JA_CV_TO_HIRAGANA table + build_ja_hiragana_lab() converter
+  - ALL: merge_lab_silence() post-processor (absorb / delete '-' segments)
 """
 
 from __future__ import annotations
-from typing import Optional
+import unicodedata
 import logging
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════
 # Silence / boundary tokens (language-agnostic)
-# ══════════════════════════════════════════════════��═══════════
+# ══════════════════════════════════════════════════════════════
 
 SILENCE_TOKENS: set[str] = {
     "", "sp", "sil", "spn", "SIL", "SP", "SPN",
@@ -29,82 +35,142 @@ SILENCE_TOKENS: set[str] = {
 
 
 # ══════════════════════════════════════════════════════════════
-# Japanese  MFA IPA  →  Romaji (完整映射表)
+# Japanese  MFA IPA  →  Romaji  (individual phoneme mapping)
 # ══════════════════════════════════════════════════════════════
 
 JA_IPA_TO_ROMAJI: dict[str, str] = {
-
     # ── 元音 (Vowels) ────────────────────────────────────────
     "a":  "a",
     "e":  "e",
     "i":  "i",
     "o":  "o",
-    "ɯ":  "u",        # U+026F  闭后不圆元音 (日语 /u/)
-    "ɯ̥": "u",        # U+026F + U+0325  清后元音
-    "i̥":  "i",       # U+0069 + U+0325  清i
-    "ɨ̥":  "u",       # U+0268 + U+0325  清中央元音
+    "ɯ":  "u",   # U+026F  闭后不圆元音 (日语 /u/)
+    "ɯ̥":  "u",   # U+026F + U+0325  清后元音
+    "i̥":  "i",   # U+0069 + U+0325  清i
+    "ɨ̥":  "u",   # U+0268 + U+0325  清中央元音
 
     # ── 塞音 (Stops) ──────────────────────────────────────────
-    "p":  "p",
-    "b":  "b",
-    "t":  "t",
-    "d":  "d",
+    "p":  "p",   "b":  "b",
+    "t":  "t",   "d":  "d",
     "k":  "k",
-    "g":  "g",        # ASCII g
-    "ɡ":  "g",        # U+0261  IPA版g
-    "c":  "k",        # U+0063  清硬腭塞音
-    "ʔ":  "",         # U+0294  声门塞音 → 省略
+    "g":  "g",   "ɡ":  "g",  # ASCII g / IPA g
+    "c":  "k",               # 清硬腭塞音
+    "ʔ":  "",                # 声门塞音 → 省略
 
     # ── 摩擦音 (Fricatives) ───────────────────────────────────
-    "s":  "s",
-    "z":  "z",
-    "h":  "h",
-    "ɸ":  "f",        # U+0278  双唇摩擦音 (ふ)
-    "f":  "f",
-    "v":  "v",
-    "ɕ":  "sh",       # U+0255  清硬腭摩擦音 (し/しゃ/しゅ/しょ)
-    "ʑ":  "j",        # U+0291  浊硬腭摩擦音
+    "s":  "s",   "z":  "z",   "h":  "h",
+    "ɸ":  "f",   "f":  "f",   "v":  "v",
+    "ɕ":  "sh",              # U+0255  し行
+    "ʑ":  "j",               # U+0291  じ行
 
     # ── 塞擦音 (Affricates) ───────────────────────────────────
     "ts":  "ts",
-    "dz":  "z",
-    "tɕ":  "ch",      # 清硬腭塞擦音 (ち/ちゃ/etc.)
-    "dʑ":  "j",       # 浊硬腭塞擦音 (じ/じゃ/etc.)
-    "ch":  "ch",      # 已是Romaji形式
+    "dz":  "dz",
+    "tɕ":  "ch",             # ち行
+    "dʑ":  "j",              # じ行
+    "ch":  "ch",
+    "sh":  "sh",
 
     # ── 鼻音 (Nasals) ─────────────────────────────────────────
-    "n":   "n",
-    "m":   "m",
-    "ŋ":   "ng",      # U+014B  软腭鼻音
-    "ng":  "ng",      # 已是Romaji形式
-    "ɲ":   "ny",      # U+0272  硬腭鼻音
-    "ɴ":   "N",       # U+0274  鼻化鼻音/mora nasal
-    "N":   "N",       # 拨音 (ん)
+    "n":  "n",   "m":  "m",
+    "ŋ":  "ng",              # U+014B 軟口蓋鼻音
+    "ng": "ng",
+    "ɲ":  "ny",              # U+0272 硬口蓋鼻音
+    "ɴ":  "N",               # U+0274 拨音 mora nasal
+    "N":  "N",               # 拨音 (ん)
 
     # ── 液音 (Liquids) ────────────────────────────────────────
-    "r":   "r",
-    "ɾ":   "r",       # U+027E  齿龈轻拍音
+    "r":  "r",   "ɾ":  "r",  # U+027E 齿龈轻拍音
 
     # ── 半元音/滑音 (Semivowels) ──────────────────────────────
     "w":  "w",
-    "j":  "y",        # U+006A  硬腭近音
-    "y":  "y",        # 已是Romaji形式
+    "j":  "y",   "y":  "y",
 
     # ── 软腭化辅音 (Palatalized Consonants) ──────────────────
-    "ky": "ky",
-    "gy": "gy",
-    "ny": "ny",
-    "hy": "hy",
-    "my": "my",
-    "ry": "ry",
-    "py": "py",
-    "by": "by",
-    "ty": "ty",
-    "dy": "dy",
-
-    # ── 已是Romaji形式的二合字 (Digraphs) ──────────────────
-    "sh": "sh",
+    "ky": "ky", "gy": "gy", "ny": "ny", "hy": "hy",
+    "my": "my", "ry": "ry", "py": "py", "by": "by",
+    "ty": "ty", "dy": "dy",
 }
+
+
+# ══════════════════════════════════════════════════════════════
+# Japanese Romaji C+V  →  Hiragana  (look-up table)
+# ══════════════════════════════════════════════════════════════
+# Key = consonant-onset (romaji) + vowel (a/i/u/e/o)
+# Standalone vowels are also included (key = vowel only).
+
+JA_CV_TO_HIRAGANA: dict[str, str] = {
+    # ── 単独元音 (Standalone Vowels) ─────────────────────────
+    "a": "あ", "i": "い", "u": "う", "e": "え", "o": "お",
+
+    # ── か行 ─────────────────────────────────────────────────
+    "ka": "か", "ki": "き", "ku": "く", "ke": "け", "ko": "こ",
+    "ga": "が", "gi": "ぎ", "gu": "ぐ", "ge": "げ", "go": "ご",
+
+    # ── さ行 ─────────────────────────────────────────────────
+    "sa": "さ", "si": "し", "su": "す", "se": "せ", "so": "そ",
+    "sha": "しゃ", "shi": "し", "shu": "しゅ", "she": "しぇ", "sho": "しょ",
+    "sya": "しゃ", "syu": "しゅ", "syo": "しょ",
+
+    # ── ざ行 ─────────────────────────────────────────────────
+    "za": "ざ", "zi": "じ", "zu": "ず", "ze": "ぜ", "zo": "ぞ",
+    "ja": "じゃ", "ji": "じ", "ju": "じゅ", "je": "じぇ", "jo": "じょ",
+    "dza": "ざ", "dzi": "じ", "dzu": "づ", "dze": "ぜ", "dzo": "ぞ",
+
+    # ── た行 ─────────────────────────────────────────────────
+    "ta": "た", "ti": "ち", "tu": "つ", "te": "て", "to": "と",
+    "cha": "ちゃ", "chi": "ち", "chu": "ちゅ", "che": "ちぇ", "cho": "ちょ",
+    "tya": "ちゃ", "tyi": "ち", "tyu": "ちゅ", "tyo": "ちょ",
+    "tsa": "つぁ", "tsi": "つぃ", "tsu": "つ", "tse": "つぇ", "tso": "つぉ",
+
+    # ── だ行 ─────────────────────────────────────────────────
+    "da": "だ", "di": "ぢ", "du": "づ", "de": "で", "do": "ど",
+
+    # ── な行 ─────────────────────────────────────────────────
+    "na": "な", "ni": "に", "nu": "ぬ", "ne": "ね", "no": "の",
+    "nya": "にゃ", "nyi": "に",  "nyu": "にゅ", "nyo": "にょ",
+
+    # ── は行 ─────────────────────────────────────────────────
+    "ha": "は", "hi": "ひ", "hu": "ふ", "he": "へ", "ho": "ほ",
+    "hya": "ひゃ", "hyu": "ひゅ", "hyo": "ひょ",
+    "fa": "ふぁ", "fi": "ふぃ", "fu": "ふ", "fe": "ふぇ", "fo": "ふぉ",
+
+    # ── ば行 ─────────────────────────────────────────────────
+    "ba": "ば", "bi": "び", "bu": "ぶ", "be": "べ", "bo": "ぼ",
+    "bya": "びゃ", "byu": "びゅ", "byo": "びょ",
+
+    # ── ぱ行 ─────────────────────────────────────────────────
+    "pa": "ぱ", "pi": "ぴ", "pu": "ぷ", "pe": "ぺ", "po": "ぽ",
+    "pya": "ぴゃ", "pyu": "ぴゅ", "pyo": "ぴょ",
+
+    # ── ま行 ─────────────────────────────────────────────────
+    "ma": "ま", "mi": "み", "mu": "む", "me": "め", "mo": "も",
+    "mya": "みゃ", "myu": "みゅ", "myo": "みょ",
+
+    # ── や行 ─────────────────────────────────────────────────
+    "ya": "や", "yu": "ゆ", "yo": "よ",
+
+    # ── ら行 ─────────────────────────────────────────────────
+    "ra": "ら", "ri": "り", "ru": "る", "re": "れ", "ro": "ろ",
+    "rya": "りゃ", "ryu": "りゅ", "ryo": "りょ",
+
+    # ── わ行 ─────────────────────────────────────────────────
+    "wa": "わ", "wi": "ゐ", "we": "ゑ", "wo": "を",
+
+    # ── き行拗音 ─────────────────────────────────────────────
+    "kya": "きゃ", "kyu": "きゅ", "kyo": "きょ",
+    "gya": "ぎゃ", "gyu": "ぎゅ", "gyo": "ぎょ",
+}
+
+# Romaji vowels in Japanese phoneme context
+JA_VOWELS: frozenset[str] = frozenset({"a", "i", "u", "e", "o"})
+
+# Phonemes that act as mora nasals (ん) when before a consonant or at phrase end
+JA_MORA_NASAL_PHONEMES: frozenset[str] = frozenset({"N", "ɴ"})
+
+# Phonemes that are nasal consonants and need look-ahead to decide:
+# before vowel → onset; before consonant → ん
+JA_AMBIGUOUS_NASALS: frozenset[str] = frozenset({"n", "m", "ng", "ny"})
 
 
 # ══════════════════════════════════════════════════════════════
@@ -125,13 +191,17 @@ EN_IPA_TO_ARPABET: dict[str, str] = {
     "ʊ":  "uh",
     "uː": "uw",  "u":  "uw",
     "ʌ":  "ah",
-    "ɜː": "er",  "ɜ":  "er",  "ɚ": "er",
+    "ɜː": "er",  "ɜ":  "er",
+    "ɚ":  "er",               # r-colored schwa
+    "ɝ":  "er",               # ★ U+025D stressed rhotacized mid-central vowel
     "ə":  "ax",
-    "aɪ": "ay",
+    "aɪ": "ay",  "aj": "ay", # ★ aj = IPA notation for /aɪ/
     "aʊ": "aw",
     "ɔɪ": "oy",
+    "ʉ":  "uw",               # ★ U+0289 close central rounded
+    "ʉː": "uw",               # ★ long variant
 
-    # ── 元音 (ARPAbet pass-through) ────────────────────────────
+    # ── 元音 ARPAbet pass-through ────────────────────────────────
     "aa": "aa", "ae": "ae", "ah": "ah", "ao": "ao",
     "aw": "aw", "ax": "ax", "ay": "ay",
     "eh": "eh", "er": "er", "ey": "ey",
@@ -157,7 +227,7 @@ EN_IPA_TO_ARPABET: dict[str, str] = {
     "w":  "w",   "j":  "y",
     "ʔ":  "",
 
-    # ── 辅音 (ARPAbet pass-through) ────────────────────────────
+    # ── 辅音 ARPAbet pass-through ────────────────────────────────
     "ch": "ch", "dh": "dh", "dx": "dx",
     "dr": "dr", "tr": "tr",
     "hh": "hh", "jh": "jh",
@@ -165,134 +235,91 @@ EN_IPA_TO_ARPABET: dict[str, str] = {
 }
 
 
+def _strip_en_diacritics(ph: str) -> str:
+    """
+    Remove Unicode combining diacritics (category Mn/Mc) and modifier
+    letters (category Lm) for English phoneme fallback lookup.
+
+    Examples
+    --------
+    d̪  (d + U+032A COMBINING BRIDGE BELOW) → d
+    pʲ (p + U+02B2 MODIFIER LETTER SMALL J) → p
+    tʰ (t + U+02B0 MODIFIER LETTER SMALL H) → t
+    kʰ → k,  sʲ → s,  fʲ → f,  vʲ → v
+    ʉː (U+0289 + U+02D0 LENGTH MARK)        → ʉ  (still needs table entry)
+    """
+    nfd = unicodedata.normalize("NFD", ph)
+    return "".join(
+        c for c in nfd
+        if unicodedata.category(c) not in ("Mn", "Mc", "Lm")
+    )
+
+
 # ══════════════════════════════════════════════════════════════
-# Korean IPA → Hangul Jamo ★ NEW & ENHANCED!
+# Korean IPA → Hangul Jamo
 # ══════════════════════════════════════════════════════════════
-# 
-# 韩文字母 (Hangul Jamo) 映射表
-# 韩语 MFA 输出的 IPA 音标转换为韩文字母 (초성/중성/종성)
-#
-# 关键 IPA 符号：
-#   ɐ   (U+0250) 中央元音低 → ㅏ /a/
-#   ɛ   (U+025B) 开前元音 → ㅓ /eo/
-#   ɨ   (U+0268) 中央元音闭 → ㅡ /eu/
-#   ə   (U+0259) schwa → ㅗ /o/
-#   ɭ   (U+026D) 咽化卷舌音 → ㄹ /l/
-#   ɲ   (U+0272) 硬腭鼻音 → ㄴ /n/
-#   sʰ  (U+0073 + 02B7) aspirated /s/ → ㅆ /ss/
-#   t̚   (U+0074 + 031A) unreleased /t/ → ㄷ /t/
-#   ng  U+014B) 软腭鼻音 → ㅇ /ng/
-#
-# 转换逻辑：
-#   1. IPA → 韩文字母 (1-1映射)
-#   2. 多字符序列 → 拆分处理 (e.g., "tʰ" → "ㅌ")
-#   3. 未知音素 → 日志警告 + 直接通过
 
 KO_IPA_TO_JAMO: dict[str, str] = {
     # ── 元音 (Vowels / 모음) ──────────────────────────────────────
-    "a":    "ㅏ",      # IPA /a/ → Korean /a/
-    "ɐ":    "ㅏ",      # U+0250 중앙모음저 → /a/ ★ KEY!
-    "ɑ":    "ㅏ",      # IPA /ɑ/ → /a/
-    "ɑː":   "ㅏ",      # long /ɑ/ → /a/
-    "ə":    "ㅗ",      # schwa → /o/
-    "ɛ":    "ㅓ",      # IPA /ɛ/ → /eo/ ★ KEY!
-    "e":    "ㅔ",      # IPA /e/ → /e/
-    "i":    "ㅣ",      # IPA /i/
-    "ɪ":    "ㅣ",      # IPA /ɪ/ → /i/
-    "iː":   "ㅣ",      # long /i/
-    "o":    "ㅗ",      # IPA /o/
-    "ɔ":    "ㅗ",      # IPA /ɔ/ → /o/
-    "ɔː":   "ㅗ",      # long /ɔ/ → /o/
-    "u":    "ㅜ",      # IPA /u/
-    "ʊ":    "ㅜ",      # IPA /ʊ/ → /u/
-    "uː":   "ㅜ",      # long /u/
-    "ʌ":    "ㅏ",      # IPA /ʌ/ → /a/
-    "ɜ":    "ㅓ",      # IPA /ɜ/ → /eo/
-    "ɜː":   "ㅓ",      # long /ɜ/ → /eo/
-    "æ":    "ㅐ",      # IPA /æ/ → /ae/
-    "ɯ":    "ㅡ",      # IPA /ɯ/ → /eu/ (closed back unrounded)
-    "ɨ":    "ㅡ",      # U+0268 중앙모음고 → /eu/ ★ KEY!
+    "a": "ㅏ", "ɐ": "ㅏ", "ɑ": "ㅏ", "ɑː": "ㅏ",
+    "ə": "ㅗ", "ɛ": "ㅓ", "e": "ㅔ",
+    "i": "ㅣ", "ɪ": "ㅣ", "iː": "ㅣ",
+    "o": "ㅗ", "ɔ": "ㅗ", "ɔː": "ㅗ",
+    "u": "ㅜ", "ʊ": "ㅜ", "uː": "ㅜ",
+    "ʌ": "ㅏ",
+    "ɜ": "ㅓ", "ɜː": "ㅓ",
+    "æ": "ㅐ",
+    "ɯ": "ㅡ", "ɨ": "ㅡ",
 
-    # ── 辅音 (Consonants / 자음) ──────────────────────────────────
-    # 塞音 (Stops / 파열음)
-    "p":    "ㅂ",      # IPA /p/
-    "pʰ":   "ㅍ",      # aspirated /p'/
-    "b":    "ㅂ",      # IPA /b/ → /p/ (Korean no /b/)
-    "t":    "ㄷ",      # IPA /t/
-    "t̚":    "ㄷ",      # U+0074+031A unreleased /t/ → /t/ ★ KEY!
-    "tʰ":   "ㅌ",      # aspirated /t'/
-    "d":    "ㄷ",      # IPA /d/ → /t/
-    "k":    "ㄱ",      # IPA /k/
-    "kʰ":   "ㅋ",      # aspirated /k'/
-    "g":    "ㄱ",      # IPA /g/ → /k/
-    "ɡ":    "ㄱ",      # IPA /ɡ/ (Unicode g) → /k/
+    # ── 塞音 (Stops / 파열음) ────────────────────────────────────
+    "p": "ㅂ", "pʰ": "ㅍ", "b": "ㅂ",
+    "t": "ㄷ", "t̚": "ㄷ", "tʰ": "ㅌ", "d": "ㄷ",
+    "k": "ㄱ", "kʰ": "ㅋ", "g": "ㄱ", "ɡ": "ㄱ",
 
-    # 摩擦音 (Fricatives / 마찰음)
-    "f":    "ㅍ",      # IPA /f/ → /p'/
-    "v":    "ㅂ",      # IPA /v/ → /p/
-    "θ":    "ㄷ",      # IPA /θ/ → /t/
-    "ð":    "ㄷ",      # IPA /ð/ → /t/
-    "s":    "ㅅ",      # IPA /s/
-    "sʰ":   "ㅆ",      # U+0073+02B7 aspirated /s/ → /ss/ ★ KEY!
-    "ʃ":    "ㅅ",      # IPA /ʃ/ → /s/
-    "z":    "ㅊ",      # IPA /z/ → /s/ or /j/
-    "ʒ":    "ㅊ",      # IPA /ʒ/ → /s/ or /j/
-    "h":    "ㅎ",      # IPA /h/
+    # ── 摩擦音 (Fricatives / 마찰음) ────────────────────────────
+    "f": "ㅍ", "v": "ㅂ", "θ": "ㄷ", "ð": "ㄷ",
+    "s": "ㅅ", "sʰ": "ㅆ", "ʃ": "ㅅ",
+    "z": "ㅊ", "ʒ": "ㅊ", "h": "ㅎ",
 
-    # 塞擦音 (Affricates / 파찰음)
-    "tʃ":   "ㅊ",      # IPA /tʃ/ → /ch/
-    "dʒ":   "ㅈ",      # IPA /dʒ/ → /j/
-    "ts":   "ㄷ",      # IPA /ts/ → /t/ + /s/
-    "dz":   "ㅈ",      # IPA /dz/ → /j/
+    # ── 塞擦音 (Affricates / 파찰음) ────────────────────────────
+    "tʃ": "ㅊ", "dʒ": "ㅈ", "ts": "ㄷ", "dz": "ㅈ",
 
-    # 鼻音 (Nasals / 비음)
-    "m":    "ㅁ",      # IPA /m/
-    "n":    "ㄴ",      # IPA /n/
-    "ŋ":    "ㅇ",      # U+014B velar nasal → /ng/ ★ KEY!
-    "ɲ":    "ㄴ",      # U+0272 palatal nasal → /n/ ★ KEY!
-    "ɴ":    "ㅇ",      # U+0274 velarized nasal → /ng/
+    # ── 鼻音 (Nasals / 비음) ────────────────────────────────────
+    "m": "ㅁ", "n": "ㄴ", "ŋ": "ㅇ", "ɲ": "ㄴ", "ɴ": "ㅇ",
 
-    # 液音 (Liquids / 유음)
-    "l":    "ㄹ",      # IPA /l/
-    "r":    "ㄹ",      # IPA /r/ → /l/ (Korean /r/l/ are allophones)
-    "ɾ":    "ㄹ",      # U+027E flap → /l/ ★ KEY!
-    "ɭ":    "ㄹ",      # U+026D retroflex approximant → /l/ ★ KEY!
-    "ɹ":    "ㄹ",      # IPA /ɹ/ (approximant) → /l/
+    # ── 液音 / 半元音 (Liquids / Semivowels) ────────────────────
+    "l": "ㄹ", "r": "ㄹ", "ɾ": "ㄹ", "ɭ": "ㄹ", "ɹ": "ㄹ",
+    "w": "ㅇ", "j": "ㅇ", "y": "ㅇ",
 
-    # 半元音 (Semivowels / 반모음)
-    "w":    "ㅇ",      # IPA /w/ → initial /zero/ + /o/
-    "j":    "ㅇ",      # IPA /j/ → initial /zero/ + /i/
-    "y":    "ㅇ",      # IPA /y/ → /j/
+    # ── 特殊 ─────────────────────────────────────────────────────
+    "ʔ": "",
 
-    # 特殊 (Special)
-    "ʔ":    "",        # glottal stop → omit
-    
-    # ── 已是韩文字母的直通 (Pass-through) ─────────────────────
-    "ㄱ": "ㄱ",  "ㄴ": "ㄴ",  "ㄷ": "ㄷ",  "ㄹ": "ㄹ",
-    "ㅁ": "ㅁ",  "ㅂ": "ㅂ",  "ㅅ": "ㅅ",  "ㅇ": "ㅇ",
-    "ㅈ": "ㅈ",  "ㅉ": "ㅉ",  "ㅊ": "ㅊ",  "ㅋ": "ㅋ",
-    "ㅌ": "ㅌ",  "ㅍ": "ㅍ",  "ㅎ": "ㅎ",
-    "ㅏ": "ㅏ",  "ㅑ": "ㅑ",  "ㅓ": "ㅓ",  "ㅕ": "ㅕ",
-    "ㅗ": "ㅗ",  "ㅜ": "ㅜ",  "ㅠ": "ㅠ",  "ㅡ": "ㅡ",
-    "ㅢ": "ㅢ",  "ㅝ": "ㅝ",  "ㅞ": "ㅞ",  "ㅙ": "ㅙ",
-    "ㅚ": "ㅚ",  "ㅘ": "ㅘ",
+    # ── 韩文字母直通 (Pass-through) ──────────────────────────────
+    "ㄱ": "ㄱ", "ㄴ": "ㄴ", "ㄷ": "ㄷ", "ㄹ": "ㄹ",
+    "ㅁ": "ㅁ", "ㅂ": "ㅂ", "ㅅ": "ㅅ", "ㅇ": "ㅇ",
+    "ㅈ": "ㅈ", "ㅉ": "ㅉ", "ㅊ": "ㅊ", "ㅋ": "ㅋ",
+    "ㅌ": "ㅌ", "ㅍ": "ㅍ", "ㅎ": "ㅎ",
+    "ㅏ": "ㅏ", "ㅑ": "ㅑ", "ㅓ": "ㅓ", "ㅕ": "ㅕ",
+    "ㅗ": "ㅗ", "ㅜ": "ㅜ", "ㅠ": "ㅠ", "ㅡ": "ㅡ",
+    "ㅢ": "ㅢ", "ㅝ": "ㅝ", "ㅞ": "ㅞ", "ㅙ": "ㅙ",
+    "ㅚ": "ㅚ", "ㅘ": "ㅘ",
 }
 
 
 # ══════════════════════════════════════════════════════════════
-# Public API
+# Public API — single-phoneme conversion
 # ══════════════════════════════════════════════════════════════
 
 def convert_phoneme(phoneme: str, language: str) -> Optional[str]:
     """
     Convert a single MFA phoneme string to the target format.
 
-    Returns:
-      str   – converted phoneme (may equal the input for pass-through languages)
-      ""    – phoneme that should be omitted (e.g. glottal stop ʔ)
-      None  – silence / boundary token; caller should skip this interval
+    Returns
+    -------
+    str   converted phoneme (may equal input for pass-through languages)
+    ""    phoneme should be omitted (e.g. glottal stop ʔ)
+    None  silence / boundary token; caller should skip this interval
     """
-    # Silence / boundary → skip
     if phoneme in SILENCE_TOKENS:
         return None
 
@@ -310,32 +337,39 @@ def convert_phoneme(phoneme: str, language: str) -> Optional[str]:
             return phoneme
         return result if result != "" else None
 
-    # ── English → ARPAbet ────────────────────────────────────
+    # ── English → ARPAbet (with diacritic-strip fallback) ────
     if lang in ("en", "eng"):
         result = EN_IPA_TO_ARPABET.get(phoneme)
-        if result is None:
-            logger.warning(
-                "English phoneme not in mapping: %r – using lowercase passthrough",
-                phoneme,
-            )
-            return phoneme.lower()
-        return result if result != "" else None
+        if result is not None:
+            return result if result != "" else None
 
-    # ── Korean (IPA) → Hangul Jamo ★ NEW! ────────────────────
+        # Fallback: strip combining diacritics / modifier letters
+        stripped = _strip_en_diacritics(phoneme)
+        if stripped != phoneme:
+            result = EN_IPA_TO_ARPABET.get(stripped)
+            if result is not None:
+                logger.debug(
+                    "EN diacritic-strip: %r → %r → %r", phoneme, stripped, result
+                )
+                return result if result != "" else None
+
+        # Still unknown → lowercase passthrough
+        logger.warning("English phoneme not in mapping: %r – lowercase passthrough", phoneme)
+        return phoneme.lower()
+
+    # ── Korean (IPA) → Hangul Jamo ────────────────────────────
     if lang in ("ko", "kor"):
         result = KO_IPA_TO_JAMO.get(phoneme)
         if result is None:
             logger.warning(
-                "Korean phoneme not in mapping: %r (U+%s) – passing through as-is",
+                "Korean phoneme not in mapping: %r (U+%s) – passing through",
                 phoneme,
                 " U+".join(f"{ord(c):04X}" for c in phoneme),
             )
-            return phoneme  # Pass through unknown phonemes
+            return phoneme
         return result if result != "" else None
 
-    # ── Chinese (Pinyin), Cantonese (Jyutping) ──
-    # MFA dictionaries for these languages already emit the target
-    # phoneme symbols; no conversion needed.
+    # ── Chinese (Pinyin), Cantonese (Jyutping) – pass-through ─
     return phoneme
 
 
@@ -344,36 +378,20 @@ def convert_phoneme_list(
     language: str,
     drop_silence: bool = True,
 ) -> list[str]:
-    """
-    Convert a list of MFA phonemes to the target format.
-
-    Args:
-      phonemes:      Raw phoneme tokens from MFA output.
-      language:      ISO 639-1/3 language code (ja, jpn, en, eng, zh, cmn, ko, kor, …).
-      drop_silence:  If True, silence/boundary/omitted tokens are excluded.
-
-    Returns:
-      List of converted phoneme strings.
-    """
+    """Convert a list of MFA phonemes to the target format."""
     out: list[str] = []
     for ph in phonemes:
         converted = convert_phoneme(ph, language)
-        if converted is None:          # silence or omit
+        if converted is None:
             if not drop_silence:
-                out.append("sp")       # replace silence with explicit token
+                out.append("sp")
             continue
         out.append(converted)
     return out
 
 
-def debug_unknown_phonemes(
-    phonemes: list[str],
-    language: str,
-) -> list[str]:
-    """
-    Return a list of phonemes that have no explicit mapping.
-    Useful for auditing MFA output from a new model/language.
-    """
+def debug_unknown_phonemes(phonemes: list[str], language: str) -> list[str]:
+    """Return phonemes with no explicit mapping (useful for auditing new models)."""
     lang = language.lower()
     if lang in ("ja", "jpn"):
         table = JA_IPA_TO_ROMAJI
@@ -383,59 +401,203 @@ def debug_unknown_phonemes(
         table = KO_IPA_TO_JAMO
     else:
         return []
-    
-    return [
-        ph for ph in phonemes
-        if ph not in SILENCE_TOKENS and ph not in table
-    ]
+    return [ph for ph in phonemes if ph not in SILENCE_TOKENS and ph not in table]
 
 
 # ══════════════════════════════════════════════════════════════
-# LAB 文件转换函数
+# Japanese Hiragana LAB builder
 # ══════════════════════════════════════════════════════════════
 
-def convert_lab_file(
-    lab_content: str,
-    language: str = "ja",
-) -> str:
+def build_ja_hiragana_lab(
+    entries: list[tuple[int, int, str]],
+) -> list[tuple[int, int, str]]:
     """
-    Convert entire LAB file from IPA to target phoneme format.
-    
-    LAB format: start_time end_time phoneme
-    (times in 100-nanosecond units, as per MFA TextGrid)
-    
-    Args:
-      lab_content:  Raw LAB file content (multiline, space-separated)
-      language:     Target language ('ja', 'en', 'zh', 'ko', etc.)
-    
-    Returns:
-      Converted LAB content
+    Convert a sequence of individual romaji phoneme segments into hiragana
+    LAB segments, inserting '-' markers for consonant onsets.
+
+    Algorithm
+    ---------
+    • Vowel                       → hiragana character (or C+V if preceded by
+                                     a pending consonant onset)
+    • Hard mora nasal (N / ɴ)    → ん  (always)
+    • Ambiguous nasal (n / m / ng) before consonant or at end → ん
+    • Ambiguous nasal before vowel → treated as consonant onset (pending)
+    • Other consonant             → '-'  (pending; combines with next vowel)
+
+    Parameters
+    ----------
+    entries : list of (start_100ns, end_100ns, romaji_phoneme)
+
+    Returns
+    -------
+    list of (start_100ns, end_100ns, hiragana_or_dash)
     """
-    lines = lab_content.strip().split('\n')
-    result_lines = []
-    
+    result: list[tuple[int, int, str]] = []
+    n = len(entries)
+    pending: tuple[int, int, str] | None = None  # (start, end, romaji_consonant)
+
+    def flush_pending_as_dash() -> None:
+        nonlocal pending
+        if pending is not None:
+            result.append((pending[0], pending[1], "-"))
+            pending = None
+
+    i = 0
+    while i < n:
+        start, end, ph = entries[i]
+
+        # ── Vowel ────────────────────────────────────────────
+        if ph in JA_VOWELS:
+            if pending is not None:
+                cv = pending[2] + ph
+                hiragana = JA_CV_TO_HIRAGANA.get(cv) or JA_CV_TO_HIRAGANA.get(ph, ph)
+                # consonant segment → '-'
+                result.append((pending[0], pending[1], "-"))
+                pending = None
+            else:
+                hiragana = JA_CV_TO_HIRAGANA.get(ph, ph)
+            result.append((start, end, hiragana))
+            i += 1
+            continue
+
+        # ── Hard mora nasal (N / ɴ) ───────────────────────────
+        if ph in JA_MORA_NASAL_PHONEMES:
+            flush_pending_as_dash()
+            result.append((start, end, "ん"))
+            i += 1
+            continue
+
+        # ── Ambiguous nasal (n / m / ng / ny) ────────────────
+        if ph in JA_AMBIGUOUS_NASALS:
+            # Look ahead: if followed by a vowel, treat as consonant onset
+            next_ph = entries[i + 1][2] if i + 1 < n else None
+            is_mora = (next_ph is None) or (next_ph not in JA_VOWELS)
+            if is_mora:
+                flush_pending_as_dash()
+                result.append((start, end, "ん"))
+            else:
+                # Onset: may combine with next vowel (e.g. n+a = な)
+                flush_pending_as_dash()
+                pending = (start, end, ph)
+            i += 1
+            continue
+
+        # ── Other consonant ────────────────────────────────────
+        flush_pending_as_dash()
+        pending = (start, end, ph)
+        i += 1
+
+    # Trailing consonant with no following vowel
+    flush_pending_as_dash()
+    return result
+
+
+# ══════════════════════════════════════════════════════════════
+# Universal LAB silence merger
+# ══════════════════════════════════════════════════════════════
+
+def merge_lab_silence(
+    entries: list[tuple[int, int, str]],
+    max_gap_100ns: int = 500_000,   # 50 ms — gap larger than this = phrase boundary
+) -> list[tuple[int, int, str]]:
+    """
+    Post-process a LAB segment list to handle '-' (consonant onset) markers.
+
+    Rules
+    -----
+    1. '-' that starts ≤ max_gap_100ns after a voiced (non-sil, non-'-') segment
+       → absorbed into that segment (extend its end time).
+    2. '-' at the start, following 'sil' / another '-', OR across a phrase gap
+       (gap > max_gap_100ns) → deleted entirely.
+
+    'sil' segments are never modified or deleted.
+
+    Cross-phrase gap fix
+    --------------------
+    Without the gap check, a '-' that begins a new phrase (e.g. Korean 요····[-]무)
+    would incorrectly extend the previous phrase's last syllable across the silence.
+    The gap threshold (default 50 ms) prevents this: within a syllable the '-' is
+    always adjacent (gap ≈ 0), while inter-phrase silences are typically ≥ 200 ms.
+
+    Examples (Chinese)
+    ------------------
+    [sil, -, hai, -, da, -, jia]
+        sil → kept
+        - after sil → deleted
+        hai → kept
+        - after hai → absorbed (hai extends)
+        da → kept
+        - after da → absorbed (da extends)
+        jia → kept
+    Result: [sil, hai(extended), da(extended), jia]
+
+    Examples (Korean, two phrases with 200 ms gap)
+    ------------------------------------------------
+    [-, 안, -, 녕, …, 요, GAP 200ms, -, 무, …]
+        leading '-'      → deleted (result empty)
+        - after 안       → absorbed (안 extends)
+        - after 녕       → absorbed (녕 extends)
+        …
+        - after GAP 200ms → gap > 50 ms → deleted (not merged into 요)
+        무               → kept
+    """
+    result: list[tuple[int, int, str]] = []
+    for seg_start, seg_end, label in entries:
+        if label == "-":
+            if (result
+                    and result[-1][2] not in ("-", "sil")
+                    and seg_start - result[-1][1] <= max_gap_100ns):
+                # Adjacent enough to previous voiced segment → absorb
+                ps, _, pl = result[-1]
+                result[-1] = (ps, seg_end, pl)
+            # else: delete (no nearby voiced predecessor, or phrase gap)
+        else:
+            result.append((seg_start, seg_end, label))
+    return result
+
+
+# ══════════════════════════════════════════════════════════════
+# LAB file-level conversion (utility, called from tests / CLI)
+# ══════════════════════════════════════════════════════════════
+
+def convert_lab_file(lab_content: str, language: str = "ja") -> str:
+    """
+    Convert an entire LAB file's phoneme column to the target format.
+    Applies hiragana grouping for Japanese and silence merging for all languages.
+
+    LAB format: start_time end_time phoneme  (one entry per line)
+    Times are in 100-nanosecond units.
+    """
+    lines = lab_content.strip().split("\n")
+    raw: list[tuple[int, int, str]] = []
     for line in lines:
         line = line.strip()
         if not line:
             continue
-            
         parts = line.split()
         if len(parts) < 3:
-            result_lines.append(line)
             continue
-        
-        start_time = parts[0]
-        end_time = parts[1]
-        phoneme = parts[2]
-        
-        # Convert phoneme
-        converted = convert_phoneme(phoneme, language)
-        
-        if converted is None:
-            continue
-        elif converted == "":
-            continue
-        else:
-            result_lines.append(f"{start_time} {end_time} {converted}")
-    
-    return "\n".join(result_lines)
+        raw.append((int(parts[0]), int(parts[1]), parts[2]))
+
+    lang = language.lower()
+    converted: list[tuple[int, int, str]] = []
+
+    if lang in ("ja", "jpn"):
+        # Phase 1: IPA → romaji per phoneme
+        romaji_entries: list[tuple[int, int, str]] = []
+        for start, end, ph in raw:
+            r = convert_phoneme(ph, "ja")
+            if r is not None and r != "":
+                romaji_entries.append((start, end, r))
+        # Phase 2: romaji → hiragana + '-' for consonant onsets
+        converted = build_ja_hiragana_lab(romaji_entries)
+    else:
+        for start, end, ph in raw:
+            c = convert_phoneme(ph, language)
+            if c is None or c == "":
+                continue
+            converted.append((start, end, c))
+
+    # Phase 3: merge '-' segments for all languages
+    merged = merge_lab_silence(converted)
+    return "\n".join(f"{s} {e} {p}" for s, e, p in merged)

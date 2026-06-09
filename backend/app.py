@@ -464,9 +464,66 @@ def pipeline_full_process():
         return jsonify({"error": str(e)}), 500
     
 
+# =====================================================================
+# 替换原有的 pipeline_mfa_only 函数，新增 run_mfa_only_job 异步任务
+# =====================================================================
+
+def run_mfa_only_job(job_id: str, wav_path: str, text: str, language: str):
+    try:
+        set_job(
+            job_id,
+            status="running",
+            started_at=datetime.now().isoformat(),
+        )
+
+        # 伪造 FileStorage 包装器，兼容 pipeline 的写入逻辑
+        class FileStorageWrapper:
+            def __init__(self, local_path):
+                self.path = os.path.abspath(local_path)
+                self.filename = os.path.basename(local_path)
+
+            def save(self, dst):
+                import shutil
+                if os.path.abspath(dst) != self.path:
+                    shutil.copy(self.path, dst)
+
+            def seek(self, *args, **kwargs):
+                pass
+
+        compat_audio_file = FileStorageWrapper(wav_path)
+
+        # 执行耗时的 MFA 标注
+        result = pipeline.process_mfa_only(compat_audio_file, text, language)
+
+        if result.get("success"):
+            set_job(
+                job_id,
+                status="done",
+                finished_at=datetime.now().isoformat(),
+                result=result,
+            )
+        else:
+            set_job(
+                job_id,
+                status="failed",
+                finished_at=datetime.now().isoformat(),
+                error=result.get("error"),
+                result=result,
+            )
+
+    except Exception as e:
+        logger.exception("后台MFA任务异常")
+        set_job(
+            job_id,
+            status="failed",
+            finished_at=datetime.now().isoformat(),
+            error=str(e),
+        )
+
+
 @app.route("/api/pipeline/mfa-only", methods=["POST"])
 def pipeline_mfa_only():
-    """仅执行 MFA 标注"""
+    """仅执行 MFA 标注 (异步后台任务轮询版)"""
     try:
         if "audio_file" not in request.files:
             return jsonify({"error": "缺少 audio_file"}), 400
@@ -480,17 +537,33 @@ def pipeline_mfa_only():
         if not audio_file or not text:
             return jsonify({"error": "输入无效"}), 400
 
-        logger.info("MFA 标注模式启动")
-        result = pipeline.process_mfa_only(audio_file, text, language)
+        # 1. 马上保存文件，生成路径
+        stem, wav_path, lab_path = build_job_paths(audio_file.filename or "audio.wav")
+        audio_file.save(str(wav_path))
 
-        if result.get("success"):
-            return jsonify(result), 200
+        # 2. 创建任务 ID
+        job_id = uuid.uuid4().hex
+        set_job(
+            job_id,
+            status="queued",
+            created_at=datetime.now().isoformat(),
+        )
 
+        logger.info(f"MFA 标注模式启动，投递后台任务: {job_id}")
+
+        # 3. 启动后台线程执行耗时任务
+        Thread(
+            target=run_mfa_only_job,
+            daemon=True,
+            args=(job_id, str(wav_path), text, language),
+        ).start()
+
+        # 4. 立即返回 job_id 供前端轮询
         return jsonify({
-            "success": False,
-            "error": result.get("error", "MFA 处理失败"),
-            "processing_time": result.get("processing_time", 0)
-        }), 500
+            "success": True,
+            "job_id": job_id,
+            "status": "queued",
+        }), 202
 
     except Exception as e:
         logger.error("MFA 模式异常: %s", e, exc_info=True)
