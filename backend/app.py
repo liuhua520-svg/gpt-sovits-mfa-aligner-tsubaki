@@ -572,47 +572,96 @@ def pipeline_mfa_only():
 
 @app.route("/api/pipeline/project-only", methods=["POST"])
 def pipeline_project_only():
-    """仅执行工程文件生成"""
+    """
+    仅执行工程文件生成：
+    - 只需要 WAV + LAB
+    - 不需要 text
+    - 继续复用 pipeline.process_project_only(...)
+    """
     try:
-        wav_path = request.form.get("wav_path")
-        lab_path = request.form.get("lab_path")
+        # 读取工程参数
         output_format = request.form.get("format", "sv")
         project_title = request.form.get("title", "Project")
+        bpm = float(request.form.get("bpm", 120))
+        base_pitch = int(request.form.get("base_pitch", 60))
+        f0_method = request.form.get("f0_method", "dio")
+        f0_smooth = request.form.get("f0_smooth", "true").lower() == "true"
+        f0_smooth_window = int(request.form.get("f0_smooth_window", 5))
+        use_double_precision = request.form.get("precision", "single").lower() == "double"
+        f0_floor = float(request.form.get("f0_floor", 71.0))
+        f0_ceil = float(request.form.get("f0_ceil", 800.0))
+        refine_pitch = request.form.get("auto_note_pitch", "false").lower() == "true"
+
+        # 兼容两种输入：
+        # 1) 前端上传文件：wav_file + lab_file
+        # 2) 已有路径：wav_path + lab_path
+        wav_path = request.form.get("wav_path")
+        lab_path = request.form.get("lab_path")
+
+        wav_file = request.files.get("wav_file")
+        lab_file = request.files.get("lab_file")
+
+        if wav_file is not None and lab_file is not None:
+            # 用 WAV 文件名作为同名基底，确保 wav/lab 成对保存
+            stem, wav_path_obj, lab_path_obj = build_job_paths(wav_file.filename or "audio.wav")
+            wav_file.save(str(wav_path_obj))
+            lab_file.save(str(lab_path_obj))
+            wav_path = str(wav_path_obj)
+            lab_path = str(lab_path_obj)
 
         if not wav_path or not lab_path:
-            return jsonify({"error": "缺少 wav_path 或 lab_path"}), 400
+            return jsonify({"error": "请提供 wav_path/lab_path 或 wav_file/lab_file"}), 400
 
-        if output_format not in pipeline.get_supported_formats()['formats']:
+        supported_formats = pipeline.get_supported_formats().get("formats", [])
+        if output_format not in supported_formats:
             return jsonify({
                 "error": f"不支持的格式: {output_format}",
-                "supported": pipeline.get_supported_formats()['formats']
+                "supported": supported_formats
             }), 400
 
-        # 验证文件存在
         if not os.path.exists(wav_path):
             return jsonify({"error": f"WAV 文件不存在: {wav_path}"}), 400
+
         if not os.path.exists(lab_path):
             return jsonify({"error": f"LAB 文件不存在: {lab_path}"}), 400
 
-        logger.info(f"工程文件生成模式启动: {output_format} 格式")
+        logger.info(
+            "工程文件模式启动: format=%s wav=%s lab=%s",
+            output_format, wav_path, lab_path
+        )
+
         result = pipeline.process_project_only(
             wav_path=wav_path,
             lab_path=lab_path,
             output_format=output_format,
-            project_title=project_title
+            project_title=project_title,
+            bpm=bpm,
+            base_pitch=base_pitch,
+            f0_method=f0_method,
+            f0_smooth=f0_smooth,
+            f0_smooth_window=f0_smooth_window,
+            use_double_precision=use_double_precision,
+            f0_floor=f0_floor,
+            f0_ceil=f0_ceil,
+            refine_pitch=refine_pitch,
         )
 
         if result.get("success"):
+            # 统一补齐前端常见字段，方便直接显示
+            result.setdefault("project_path", result.get("project_path") or result.get("output_path"))
+            result.setdefault("project_format", result.get("project_format", output_format))
+            result.setdefault("requested_format", output_format)
+            result.setdefault("project_title", project_title)
             return jsonify(result), 200
 
         return jsonify({
             "success": False,
-            "error": "工程生成失败",
-            "processing_time": result.get("processing_time", 0)
+            "error": result.get("error", "工程生成失败"),
+            "processing_time": result.get("processing_time", 0),
         }), 500
 
     except Exception as e:
-        logger.error("工程生成模式异常: %s", e, exc_info=True)
+        logger.error("工程文件生成异常: %s", e, exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
@@ -803,7 +852,7 @@ def open_browser(host: str, port: int):
 
 def main(host: str = "127.0.0.1", port: int = 5000):
     print(f"\n{'=' * 60}")
-    print("🚀 启动 Audio Processing Aligner with MFA + PyWORLD")
+    print("🚀 启动 SVS Lab Aligner with MFA + PyWORLD")
     print(f"📍 访问地址: http://{host}:{port}")
     print(f"📂 工作目录: {WORK_DIR}")
     print(f"📂 前端目录: {FRONTEND_DIST}")
