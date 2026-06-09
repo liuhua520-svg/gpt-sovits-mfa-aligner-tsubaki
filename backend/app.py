@@ -5,8 +5,6 @@ import sys
 import uuid
 import logging
 import webbrowser
-import threading
-threading.stack_size(32 * 1024 * 1024)  # <-- 就是加在这里！
 from threading import Thread
 from time import sleep
 from pathlib import Path
@@ -84,6 +82,11 @@ def fit_stem_to_limit(base_dir: str, stem: str, limit: int = WINDOWS_SAFE_PATH_L
 
 def build_job_paths(original_filename: str):
     stem = sanitize_stem(original_filename)
+    
+    # 【优化】为文件名注入 6 位随机标识符，彻底避免连续点击时发生文件覆盖/锁死冲突
+    unique_suffix = uuid.uuid4().hex[:6]
+    stem = f"{stem}_{unique_suffix}"
+    
     stem = fit_stem_to_limit(str(WORK_DIR), stem)
 
     wav_path = WORK_DIR / f"{stem}.wav"
@@ -94,6 +97,14 @@ def build_job_paths(original_filename: str):
 
     return stem, wav_path, lab_path
 
+@app.after_request
+def disable_keepalive(response):
+    """
+    强制告诉浏览器关闭当前连接，不复用 TCP Socket。
+    彻底解决 Werkzeug 开发服务器在连续上传大文件时，因 Keep-Alive 复用导致的 Connection Reset (Failed to fetch) 问题。
+    """
+    response.headers["Connection"] = "close"
+    return response
 
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
