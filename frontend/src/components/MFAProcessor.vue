@@ -947,6 +947,21 @@ const processAudio = async () => {
     }
 
     // 仅标注模式
+    if (data.job_id) {
+      progressPercent.value = 92
+      updateProcessingStep(0, '进行中', 'MFA 后台标注中...')
+      const finalPayload = await waitForJobFinished(data.job_id)
+      const normalized = normalizeResult(finalPayload)
+      result.value = normalized
+      progressPercent.value = 100
+      updateProcessingStep(0, '完成', `${normalized.segments || '?'} 个标注段`)
+      updateProcessingStep(1, '跳过', '仅标注模式未执行 F0 提取')
+      updateProcessingStep(2, '跳过', '仅标注模式未生成工程文件')
+      ElMessage.success('✅ 处理成功！')
+      return
+    }
+
+    // 备用方案：如果直接返回结果（不需轮询的快速路径）
     if (!data.success) throw new Error(data.error || 'MFA 处理失败')
     const normalized = normalizeResult(data)
     result.value = normalized
