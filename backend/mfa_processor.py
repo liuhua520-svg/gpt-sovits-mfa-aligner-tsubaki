@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-MFA 处理核心模块 - 多语言增强版 v9.5
-修复：按句子边界分段（替代 RMS 静音分割），解决时间戳错位问题
+MFA 处理核心模块 - 多语言增强版 v9.3 (已包含特定标点符号清洗规则)
 """
 from __future__ import annotations
 
@@ -13,7 +12,7 @@ import shutil
 import logging
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 
 from pypinyin import lazy_pinyin, Style
 from mfa_utils import MFAChecker
@@ -27,7 +26,7 @@ _ja_tokenizer: Optional[object] = None
 
 
 class MFAProcessor:
-    """Montreal Forced Aligner 处理器 - 多语言增强版 v9.5"""
+    """Montreal Forced Aligner 处理器 - 多语言增强版 v9.3"""
 
     INITIALS_EXTENDED = [
         "zh", "ch", "sh",
@@ -100,7 +99,7 @@ class MFAProcessor:
         },
         'en': {
             'vowels': {
-                'aa', 'ae', 'ah', 'ao', 'aw', 'ay', 'eh', 'er', 'ey', 'ih', 'iy',
+                'aa', 'ae', 'ah', 'ao', 'aw', 'ay', 'eh', 'er', 'ey', 'ih', 'iy', 
                 'ow', 'oy', 'uh', 'uw'
             },
             'stops': {'b', 'd', 'g', 'k', 'p', 't'},
@@ -126,7 +125,7 @@ class MFAProcessor:
         '0': 'ling', '1': 'yi',  '2': 'er',  '3': 'san', '4': 'si',
         '5': 'wu',   '6': 'liu', '7': 'qi',  '8': 'ba',  '9': 'jiu',
     }
-
+    
     DIGIT_JYUTPING = {
         '0': 'ling', '1': 'jat', '2': 'ji',   '3': 'saam', '4': 'sei',
         '5': 'ng',   '6': 'luk', '7': 'cat',  '8': 'baat', '9': 'gau',
@@ -139,26 +138,38 @@ class MFAProcessor:
         'sp':  'sil',
     }
 
-    # ── 长音频处理改为按句子分割 ────────────────────────────────────────
-    LONG_AUDIO_THRESHOLD_SEC: float = 25.0
-    MAX_SEGMENT_SEC: float = 27.0
-
     def __init__(self):
         self.temp_dir: Optional[str] = None
 
-    # ... [保留所有原有的工具方法，不重复列出] ...
-
+    # =====================================================================
+    # 新增：文本标点符号规范化清洗
+    # =====================================================================
     def _clean_input_text(self, text: str) -> str:
-        """清洗文本标点符号"""
+        """
+        根据用户要求清洗文本标点符号：
+        1. 「」、""、“” 转换为忽略（替换为空字符串）
+        2. （）、《》、()、＜＞、<>、【】 视为逗号（替换为 ","）
+        """
         if not text:
             return ""
-        ignore_pattern = r'[「」"""]'
+        
+        # 步骤 1：忽略指定的引号和书名号
+        # 匹配 「 」 " “ ” 并删掉
+        ignore_pattern = r'[「」"“”]'
         text = re.sub(ignore_pattern, "", text)
+        
+        # 步骤 2：把指定的括号、书名号、句号、尖括号视为逗号
+        # 匹配 （ ） 《 》  ( ) ＜ ＞ < > 【 】 并替换为逗号
         comma_pattern = r'[（）《》()＜＞<>【】]'
         text = re.sub(comma_pattern, ",", text)
+        
         return text
 
+    # =====================================================================
+    # 多语言环境检查
+    # =====================================================================
     def _check_zh_environment(self) -> Tuple[bool, str]:
+        """检查中文（普通话）环境"""
         try:
             from pypinyin import lazy_pinyin, Style
             lazy_pinyin("测试", style=Style.NORMAL)
@@ -169,6 +180,7 @@ class MFAProcessor:
             return False, f"❌ 中文环境错误：{str(e)}"
 
     def _check_en_environment(self) -> Tuple[bool, str]:
+        """检查英语环境"""
         try:
             mfa_ok, mfa_msg = MFAChecker.check_mfa_installed()
             if mfa_ok:
@@ -179,12 +191,13 @@ class MFAProcessor:
             return False, f"❌ 英语环境错误：{str(e)}"
 
     def _check_ja_environment(self) -> Tuple[bool, str]:
-        """检查日语环境"""
+        """检查日语环境（首次调用时加载字典，后续直接复用缓存，避免每次重复 ~4 min 加载）"""
         global _ja_tokenizer
         try:
             from sudachipy import Dictionary
             if _ja_tokenizer is None:
                 _ja_tokenizer = Dictionary().create()
+            # 轻量冒烟测试，复用已缓存的 tokenizer
             test_result = _ja_tokenizer.tokenize("テスト")
             if test_result and len(test_result) > 0:
                 return True, "✓ 日语环境就绪（sudachipy + 字典已就绪）"
@@ -200,6 +213,7 @@ class MFAProcessor:
                 return False, f"❌ 日语环境错误：{error_msg}"
 
     def _check_ko_environment(self) -> Tuple[bool, str]:
+        """检查韩语环境"""
         try:
             mfa_ok, mfa_msg = MFAChecker.check_mfa_installed()
             if not mfa_ok:
@@ -213,6 +227,7 @@ class MFAProcessor:
             return False, f"❌ 韩语环境错误：{str(e)}"
 
     def _check_yue_environment(self) -> Tuple[bool, str]:
+        """检查粤语环境"""
         try:
             import pycantonese
             return True, "✓ 粤语环境就绪（pycantonese已安装）"
@@ -222,7 +237,9 @@ class MFAProcessor:
             return False, f"❌ 粤语环境错误：{str(e)}"
 
     def _check_language_environment(self, lang: str) -> Tuple[bool, str]:
+        """统一的语言环境检查"""
         logger.info(f"\n{'='*60}\n检查语言环境：{lang.upper()}\n{'='*60}")
+        
         if lang in ('zh', 'cmn'):
             ok, msg = self._check_zh_environment()
         elif lang == 'en':
@@ -236,15 +253,21 @@ class MFAProcessor:
         else:
             logger.warning(f"未知语言代码：{lang}")
             return True, f"未知语言：{lang}（跳过环境检查）"
+        
         logger.info(msg)
         return ok, msg
 
+    # =====================================================================
+    # 文本处理
+    # =====================================================================
     def _text_to_pinyin_notone(self, text: str) -> str:
+        """中文文本转无声调拼音"""
         phones = lazy_pinyin(text, style=Style.NORMAL, errors="ignore")
         phones = [p.strip().lower() for p in phones if p and p.strip()]
         return " ".join(phones)
 
     def _text_to_jyutping(self, text: str) -> str:
+        """粤语文本转粤拼（无声调）"""
         try:
             import pycantonese
             result = pycantonese.characters_to_jyutping(text)
@@ -260,6 +283,7 @@ class MFAProcessor:
             return ""
 
     def _normalize_no_tone_pinyin(self, text: str) -> List[str]:
+        """无声调拼音文本转音节列表"""
         if not text:
             return []
         tokens: List[str] = []
@@ -272,6 +296,7 @@ class MFAProcessor:
         return tokens
 
     def _normalize_jyutping(self, text: str) -> List[str]:
+        """粤拼文本转音节列表"""
         if not text:
             return []
         tokens: List[str] = []
@@ -284,18 +309,29 @@ class MFAProcessor:
         return tokens
 
     def _segment_to_syllables(self, segment: str) -> List[str]:
+        """文本片段 -> 拼音音节列表"""
         return self._normalize_no_tone_pinyin(self._text_to_pinyin_notone(segment))
 
     def _segment_to_jyutping(self, segment: str) -> List[str]:
+        """文本片段 -> 粤拼音节列表"""
         return self._normalize_jyutping(self._text_to_jyutping(segment))
 
+    # =====================================================================
+    # 语言/词语类型检测
+    # =====================================================================
     def _is_english_word(self, word: str) -> bool:
+        """检测是否为英语单词"""
         return bool(re.match(r"^[a-zA-Z''\-]+$", word.strip()))
 
     def _is_digit_char(self, word: str) -> bool:
+        """检测是否为单个数字字符"""
         return word.strip() in '0123456789'
 
+    # =====================================================================
+    # Phone 清洗
+    # =====================================================================
     def _clean_phone(self, phone: str) -> str:
+        """去掉 IPA 声调符号"""
         if not phone:
             return ""
         phone = phone.strip()
@@ -305,456 +341,17 @@ class MFAProcessor:
         return phone.strip().lower()
 
     def _is_silence_phone(self, phone: str) -> bool:
+        """判断是否为静音标记"""
         return (phone or "").strip().lower() in self.SIL_PHONES
 
     def _clean_phone_token(self, phone: str) -> str:
+        """宽松的 phone 归一化"""
         phone = (phone or "").strip().lower().replace("ü", "v")
         phone = re.sub(r"[^a-zA-Zv]+", "", phone)
         return phone.strip()
 
-    # ... [省略中间大量重复的工具方法，保持原样] ...
-
-    def _split_text_at_sentence_boundaries(self, text: str, lang: str) -> List[str]:
-        """
-        按句子边界分割文本。
-        
-        CJK 语言：在 。！？；\n 处分割（完整句子）
-        英语：在 . ! ? 后接空格处分割
-        """
-        text = text.strip()
-        if not text:
-            return []
-
-        if lang in ('zh', 'cmn', 'yue', 'ja', 'jpn', 'ko', 'kor'):
-            # 在句末标点处分割，保留标点
-            sentences = re.split(r'(?<=[。！？；\n])', text)
-            return [s.strip() for s in sentences if s.strip()]
-        else:
-            # 英语：在句末标点后接空格处分割
-            parts = re.split(r'(?<=[.!?])\s+', text)
-            return [p.strip() for p in parts if p.strip()]
-
-    def _split_audio_by_sentences(
-        self,
-        audio_path: str,
-        text: str,
-        lang: str,
-    ) -> List[Tuple[str, float, float]]:
-        """
-        按句子边界分割音频。
-        
-        返回 [(segment_wav_path, start_sec, end_sec), ...]
-        """
-        try:
-            import numpy as np
-            import soundfile as sf
-        except ImportError:
-            logger.warning("soundfile/numpy 不可用，跳过分割")
-            return [(audio_path, 0.0, self._get_audio_duration(audio_path) / 10_000_000)]
-
-        # 读取音频
-        try:
-            data, sr = sf.read(audio_path, dtype="float32")
-        except Exception as e:
-            logger.error(f"读取音频失败: {e}")
-            return [(audio_path, 0.0, self._get_audio_duration(audio_path) / 10_000_000)]
-
-        if data.ndim > 1:
-            data = data.mean(axis=1)
-
-        total_sec = len(data) / sr
-        
-        # 获取句子列表
-        sentences = self._split_text_at_sentence_boundaries(text, lang)
-        if len(sentences) <= 1:
-            logger.info("文本无法按句子分割，保持单一片段")
-            return [(audio_path, 0.0, total_sec)]
-
-        # 按句子数量均匀分割音频时间
-        n_sentences = len(sentences)
-        segment_duration = total_sec / n_sentences
-        
-        segments: List[Tuple[str, float, float]] = []
-        base = Path(audio_path).stem
-        seg_dir = self.temp_dir or os.path.dirname(audio_path)
-
-        for i in range(n_sentences):
-            seg_start = i * segment_duration
-            seg_end = (i + 1) * segment_duration if i < n_sentences - 1 else total_sec
-            
-            start_sample = int(seg_start * sr)
-            end_sample = int(seg_end * sr)
-            seg_data = data[start_sample:end_sample]
-            
-            seg_path = os.path.join(seg_dir, f"{base}_sent{i:03d}.wav")
-            try:
-                sf.write(seg_path, seg_data, sr)
-            except Exception as e:
-                logger.error(f"写分段 WAV 失败: {e}")
-                continue
-            
-            segments.append((seg_path, seg_start, seg_end))
-            logger.info(f"  句子{i+1}/{n_sentences}: [{seg_start:.2f}s, {seg_end:.2f}s] → {seg_path}")
-
-        return segments if segments else [(audio_path, 0.0, total_sec)]
-
-    @staticmethod
-    def _merge_segment_lab_entries(
-        all_entries: List[Tuple[int, int, str]],
-    ) -> List[Tuple[int, int, str]]:
-        """
-        合并各分段 LAB 条目：按时间排序并填补空隙。
-        """
-        if not all_entries:
-            return []
-
-        all_entries.sort(key=lambda x: x[0])
-        result: List[Tuple[int, int, str]] = []
-
-        for s, e, p in all_entries:
-            if not result:
-                result.append((s, e, p))
-                continue
-
-            prev_s, prev_e, prev_p = result[-1]
-            gap = s - prev_e
-            
-            if 0 < gap < 500_000:  # 填补 <50ms 的空隙
-                result[-1] = (prev_s, s, prev_p)
-
-            if p == 'sil' and prev_p == 'sil':
-                result[-1] = (prev_s, max(prev_e, e), 'sil')
-            else:
-                result.append((s, e, p))
-
-        return result
-
-    def _process_with_sentence_segmentation(
-        self,
-        audio_path: str,
-        text: str,
-        lang: str,
-        text_for_mfa: str,
-        phoneme_text: str,
-        start_time: float,
-    ) -> Dict:
-        """
-        按句子分段处理长音频。
-        
-        ① 按句子边界切分音频
-        ② 对每个分段独立运行 MFA
-        ③ 合并 LAB 结果
-        """
-        logger.info(f"[句子分段模式] 启动句子边界分段对齐")
-
-        # ① 按句子分割
-        sentences = self._split_text_at_sentence_boundaries(text, lang)
-        logger.info(f"文本分割为 {len(sentences)} 个句子")
-        
-        segments = self._split_audio_by_sentences(audio_path, text, lang)
-        
-        if len(segments) <= 1:
-            logger.info("分割结果为单一片段，回退到直接处理模式")
-            return self._process_direct(
-                audio_path, text, lang, text_for_mfa, phoneme_text, start_time
-            )
-
-        logger.info(f"共 {len(segments)} 个分段")
-
-        # ② 逐分段 MFA 对齐
-        all_entries: List[Tuple[int, int, str]] = []
-        success_count = 0
-
-        for i, ((seg_path, seg_start_sec, seg_end_sec), seg_text) in enumerate(
-            zip(segments, sentences)
-        ):
-            seg_text = seg_text.strip()
-            if not seg_text:
-                logger.warning(f"  句子{i+1} 文本为空，跳过")
-                continue
-
-            logger.info(f"  ▶ 句子{i+1}/{len(segments)} [{seg_start_sec:.2f}s-{seg_end_sec:.2f}s]")
-
-            seg_corpus = os.path.join(self.temp_dir, f"corpus_sent{i:03d}")
-            seg_output = os.path.join(self.temp_dir, f"aligned_sent{i:03d}")
-            os.makedirs(seg_corpus, exist_ok=True)
-            os.makedirs(seg_output, exist_ok=True)
-
-            seg_basename = f"sent{i:03d}"
-            seg_wav_dest = os.path.join(seg_corpus, f"{seg_basename}.wav")
-            try:
-                shutil.copy2(seg_path, seg_wav_dest)
-            except Exception as e:
-                logger.error(f"  复制分段 WAV 失败: {e}")
-                continue
-
-            seg_txt_path = os.path.join(seg_corpus, f"{seg_basename}.txt")
-            cleaned_seg_text = self._prepare_text_for_mfa(seg_text, lang)
-            if not cleaned_seg_text:
-                logger.warning(f"  句子{i+1} 清洗后文本为空，跳过")
-                continue
-            with open(seg_txt_path, "w", encoding="utf-8") as f:
-                f.write(cleaned_seg_text)
-
-            seg_timeout = max(90, int((seg_end_sec - seg_start_sec) * 25))
-            if lang in ('ja', 'ko'):
-                seg_timeout = max(120, int((seg_end_sec - seg_start_sec) * 40))
-
-            seg_mfa_temp = os.path.join(self.temp_dir, f"mfa_work_sent_{i:03d}")
-            tg_path = self._run_mfa_align(
-                seg_corpus, seg_output, lang, seg_timeout, seg_mfa_temp,
-                beam=100, retry_beam=400,
-            )
-
-            if tg_path is None:
-                logger.warning(f"  句子{i+1} 首次对齐失败，使用超大束重试...")
-                seg_output_retry = os.path.join(self.temp_dir, f"aligned_sent{i:03d}_retry")
-                seg_mfa_temp_retry = os.path.join(self.temp_dir, f"mfa_work_sent_{i:03d}_retry")
-                os.makedirs(seg_output_retry, exist_ok=True)
-                tg_path = self._run_mfa_align(
-                    seg_corpus, seg_output_retry, lang,
-                    seg_timeout + 60, seg_mfa_temp_retry,
-                    beam=200, retry_beam=800,
-                )
-
-            if tg_path is None:
-                logger.warning(f"  句子{i+1} 对齐失败（两次尝试均失败），跳过")
-                continue
-
-            # 解析 TextGrid → LAB
-            seg_lab = self._textgrid_to_lab(tg_path, seg_text, lang=lang)
-            if not seg_lab:
-                logger.warning(f"  句子{i+1} LAB 为空，跳过")
-                continue
-
-            # ★ 关键修复：时间戳已经是相对于该分段的绝对值，直接加上分段起始偏移
-            offset_100ns = int(seg_start_sec * 10_000_000)
-            for line in seg_lab.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split()
-                if len(parts) >= 3:
-                    try:
-                        entry_start = int(parts[0]) + offset_100ns
-                        entry_end = int(parts[1]) + offset_100ns
-                        label = parts[2]
-                        all_entries.append((entry_start, entry_end, label))
-                    except ValueError:
-                        continue
-
-            success_count += 1
-
-        if not all_entries:
-            logger.error("所有句子对齐均失败，回退到直接处理模式")
-            return self._process_direct(
-                audio_path, text, lang, text_for_mfa, phoneme_text, start_time
-            )
-
-        merged_entries = self._merge_segment_lab_entries(all_entries)
-        lab_content = "\n".join(f"{s} {e} {p}" for s, e, p in merged_entries)
-
-        processing_time = int((time.time() - start_time) * 1000)
-        logger.info(
-            f"[句子分段模式] 完成：{success_count}/{len(segments)} 个句子成功，"
-            f"共 {len(merged_entries)} 条 LAB 条目，耗时 {processing_time}ms"
-        )
-
-        return {
-            "success": True,
-            "raw_text": text,
-            "phoneme_text": phoneme_text,
-            "lab_content": lab_content,
-            "audio_duration": self._get_audio_duration(audio_path),
-            "processing_time": processing_time,
-            "segments_count": len(segments),
-            "segments_success": success_count,
-        }
-
-    def _prepare_text_for_mfa(self, text: str, lang: str) -> str:
-        """送入 MFA 前的文本清洗"""
-        if not text:
-            return ""
-
-        if lang in ('zh', 'cmn'):
-            clean = re.sub(
-                r'[^\u4e00-\u9fa5\u3400-\u4dbf\uf900-\ufaff a-zA-Z0-9]', ' ', text
-            )
-        elif lang == 'yue':
-            clean = re.sub(
-                r'[^\u4e00-\u9fa5\u3400-\u4dbf\uf900-\ufaff a-zA-Z0-9]', ' ', text
-            )
-        elif lang in ('ja', 'jpn'):
-            clean = re.sub(
-                r'[^\u3040-\u30ff\u4e00-\u9fa5\uff66-\uff9f a-zA-Z0-9]', ' ', text
-            )
-        elif lang in ('ko', 'kor'):
-            clean = re.sub(
-                r'[^\uac00-\ud7a3\u3130-\u318f\u1100-\u11ff a-zA-Z0-9]', ' ', text
-            )
-        else:
-            clean = re.sub(r"[^a-zA-Z0-9'\- ]", ' ', text)
-
-        clean = re.sub(r'\s+', ' ', clean).strip()
-        return clean
-
-    def _run_mfa_align(
-        self,
-        corpus_dir: str,
-        output_dir: str,
-        lang: str,
-        timeout_seconds: int = 300,
-        mfa_temp_dir: Optional[str] = None,
-        beam: int = 100,
-        retry_beam: int = 400,
-    ) -> Optional[str]:
-        """运行 MFA align"""
-        models = MFAChecker.LANGUAGE_MODELS.get(lang, {})
-        dict_model = models.get("dictionary", lang)
-        acoustic_model = models.get("acoustic", lang)
-        py = MFAChecker.env_python()
-
-        cmd = [
-            str(py), "-m", "montreal_forced_aligner.command_line.mfa",
-            "align", corpus_dir, dict_model, acoustic_model,
-            output_dir, "--clean", "--single_speaker",
-            "--beam", str(beam), "--retry_beam", str(retry_beam),
-        ]
-
-        if mfa_temp_dir is not None:
-            os.makedirs(mfa_temp_dir, exist_ok=True)
-            cmd += ["--temp_directory", mfa_temp_dir]
-
-        env = os.environ.copy()
-        mfa_env_dir = MFAChecker.env_dir()
-        env["CONDA_PREFIX"] = str(mfa_env_dir)
-        lib_bin = mfa_env_dir / "Library" / "bin"
-        if lib_bin.exists():
-            env["PATH"] = str(lib_bin) + os.pathsep + env.get("PATH", "")
-
-        try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True,
-                timeout=timeout_seconds, env=env
-            )
-        except subprocess.TimeoutExpired:
-            logger.error(f"MFA align 超时 ({timeout_seconds}s)")
-            return None
-        except Exception as e:
-            logger.error(f"MFA align 异常: {e}")
-            return None
-
-        if result.returncode != 0:
-            full_diag = ((result.stderr or "") + (result.stdout or "")).strip()
-            logger.error(
-                f"MFA align 失败 (code={result.returncode}):\n"
-                f"{'=' * 60}\n{full_diag}\n{'=' * 60}"
-            )
-            return None
-
-        textgrid_files = list(Path(output_dir).glob("**/*.TextGrid"))
-        if not textgrid_files:
-            logger.error("MFA 未生成 TextGrid")
-            return None
-
-        return str(textgrid_files[0])
-
-    def _process_direct(
-        self,
-        audio_path: str,
-        text: str,
-        lang: str,
-        text_for_mfa: str,
-        phoneme_text: str,
-        start_time: float,
-    ) -> Dict:
-        """直接（不分段）处理"""
-        corpus_dir = os.path.join(self.temp_dir, "corpus")
-        os.makedirs(corpus_dir, exist_ok=True)
-        basename = Path(audio_path).stem
-        audio_dest = os.path.join(corpus_dir, f"{basename}.wav")
-        shutil.copy2(audio_path, audio_dest)
-        text_file = os.path.join(corpus_dir, f"{basename}.txt")
-        cleaned_text_for_mfa = self._prepare_text_for_mfa(text_for_mfa, lang)
-        with open(text_file, "w", encoding="utf-8") as f:
-            f.write(cleaned_text_for_mfa or text_for_mfa)
-
-        output_dir = os.path.join(self.temp_dir, "aligned")
-        os.makedirs(output_dir, exist_ok=True)
-
-        audio_duration_sec = self._get_audio_duration(audio_path) / 10_000_000
-        timeout_seconds = max(300, int(audio_duration_sec * 15))
-        if lang in ('ja', 'ko'):
-            timeout_seconds = max(600, int(audio_duration_sec * 25))
-
-        direct_mfa_temp = os.path.join(self.temp_dir, "mfa_work_direct")
-        tg_path = self._run_mfa_align(
-            corpus_dir, output_dir, lang, timeout_seconds, direct_mfa_temp,
-            beam=100, retry_beam=400,
-        )
-
-        if tg_path is None:
-            return {
-                "success": False, "error": "MFA align 失败或未生成 TextGrid",
-                "processing_time": int((time.time() - start_time) * 1000)
-            }
-
-        lab_content = self._textgrid_to_lab(tg_path, text, lang=lang)
-        if not lab_content:
-            return {
-                "success": False, "error": "LAB 内容为空",
-                "processing_time": int((time.time() - start_time) * 1000)
-            }
-
-        return {
-            "success": True,
-            "raw_text": text,
-            "phoneme_text": phoneme_text,
-            "lab_content": lab_content,
-            "textgrid_path": tg_path,
-            "audio_duration": self._get_audio_duration(audio_path),
-            "processing_time": int((time.time() - start_time) * 1000),
-        }
-
-    def _textgrid_to_lab(self, textgrid_path: str, text: str, lang: str = 'zh') -> str:
-        """TextGrid → LAB"""
-        return self._textgrid_to_lab_word_tier_primary(textgrid_path, text, lang)
-
-    def _textgrid_to_lab_word_tier_primary(
-        self,
-        textgrid_path: str,
-        text: str,
-        lang: str = 'zh'
-    ) -> str:
-        """Word Tier 对齐主逻辑"""
-        try:
-            from textgrid import TextGrid
-            tg = TextGrid.fromFile(textgrid_path)
-            word_tier = None
-            phone_tier = None
-            for candidate in tg:
-                tier_name = getattr(candidate, "name", "").lower()
-                if "word" in tier_name:
-                    word_tier = candidate
-                elif "phone" in tier_name or "phoneme" in tier_name:
-                    phone_tier = candidate
-            if word_tier is None:
-                logger.error("未找到 Word Tier")
-                return ""
-            phone_items: List[Tuple[int, int, str]] = []
-            if phone_tier is not None:
-                phone_items = self._extract_phone_items(phone_tier)
-            if lang in ('zh', 'cmn'):
-                lines = self._process_zh_words(word_tier, phone_items, text)
-            else:
-                lines = self._process_en_words(word_tier, phone_items, text)
-            lines = self._apply_lab_postprocess(lines, lang)
-            return "\n".join(lines)
-        except Exception as e:
-            logger.error(f"对齐失败: {e}", exc_info=True)
-            return ""
-
     def _extract_phone_items(self, tier) -> List[Tuple[int, int, str]]:
+        """从 TextGrid tier 中提取 phone items"""
         items: List[Tuple[int, int, str]] = []
         for interval in tier:
             mark = self._clean_phone((interval.mark or "").strip())
@@ -766,13 +363,313 @@ class MFAProcessor:
         items.sort(key=lambda x: (x[0], x[1]))
         return items
 
+    def _get_phones_for_word(
+        self,
+        word_start: int,
+        word_end: int,
+        phone_items: List[Tuple[int, int, str]]
+    ) -> List[Tuple[int, int, str]]:
+        """提取属于某个 word 时间段内的 phone 条目"""
+        result = [
+            (s, e, p) for s, e, p in phone_items
+            if s >= word_start and s < word_end
+            and p not in self.SIL_PHONES
+            and p not in self.IGNORE_PHONES
+        ]
+        result.sort(key=lambda x: x[0])
+        return result
+
+    def _get_arpabet_entries(
+        self,
+        word_start: int,
+        word_end: int,
+        phone_items: List[Tuple[int, int, str]]
+    ) -> List[Tuple[int, int, str]]:
+        """提取 ARPABET 音素条目"""
+        word_phones = self._get_phones_for_word(word_start, word_end, phone_items)
+        entries: List[Tuple[int, int, str]] = []
+        for s, e, p in word_phones:
+            arp = convert_phoneme(p, 'en')
+            if arp and arp not in self.SIL_PHONES:
+                entries.append((s, e, arp))
+        return entries
+
+    def _get_romaji_entries(
+        self,
+        word_start: int,
+        word_end: int,
+        phone_items: List[Tuple[int, int, str]]
+    ) -> List[Tuple[int, int, str]]:
+        """提取 ROMAJI 音素条目（IPA→Romaji 自动转换）"""
+        word_phones = self._get_phones_for_word(word_start, word_end, phone_items)
+        entries: List[Tuple[int, int, str]] = []
+        
+        for s, e, p in word_phones:
+            romaji = convert_phoneme(p, 'ja')
+            
+            if romaji is None:
+                logger.debug(f"  跳过静音: {p}")
+                continue
+            elif romaji == "":
+                logger.debug(f"  省略符号: {p}")
+                continue
+            elif romaji not in self.SIL_PHONES:
+                entries.append((s, e, romaji))
+                logger.debug(f"  转换: {p} → {romaji}")
+        
+        logger.debug(f"提取 Romaji 条目: {len(entries)} 个 from [{word_start}, {word_end}]")
+        return entries
+
+    def _get_jamo_entries(
+        self,
+        word_start: int,
+        word_end: int,
+        phone_items: List[Tuple[int, int, str]]
+    ) -> List[Tuple[int, int, str]]:
+        """提取 Hangul Jamo 音素条目（IPA→Jamo 自动转换）"""
+        word_phones = self._get_phones_for_word(word_start, word_end, phone_items)
+        entries: List[Tuple[int, int, str]] = []
+        
+        for s, e, p in word_phones:
+            jamo = convert_phoneme(p, 'ko')
+            
+            if jamo is None:
+                logger.debug(f"  跳过静音: {p}")
+                continue
+            elif jamo == "":
+                logger.debug(f"  省略符号: {p}")
+                continue
+            elif jamo not in self.SIL_PHONES:
+                entries.append((s, e, jamo))
+                logger.debug(f"  转换: {p} → {jamo}")
+        
+        logger.debug(f"提取 Jamo 条目: {len(entries)} 个 from [{word_start}, {word_end}]")
+        return entries
+
+    # =====================================================================
+    # 音节工具
+    # =====================================================================
+    def _syllable_weight(self, syl: str) -> float:
+        """计算音节权重"""
+        syl = (syl or "").strip().lower()
+        if not syl:
+            return 1.0
+        weight = 1.0 + min(len(syl), 8) * 0.10
+        if syl in self.SPECIAL_SYLLABLES:
+            weight += 0.10
+        if any(syl.endswith(hint) for hint in self.LONG_FINAL_HINTS):
+            weight += 0.20
+        elif any(syl.endswith(hint) for hint in self.SHORT_FINAL_HINTS):
+            weight += 0.08
+        if syl.startswith(("zh", "ch", "sh")):
+            weight += 0.12
+        else:
+            for ini in self.INITIALS_EXTENDED[:6]:
+                if syl.startswith(ini):
+                    weight += 0.08
+                    break
+        return max(weight, 0.75)
+
+    def _split_pinyin_syllable(self, syl: str) -> Tuple[str, str]:
+        """拆分拼音音节为声母和韵母"""
+        syl = (syl or "").strip().lower().replace("ü", "v")
+        if not syl:
+            return "", ""
+        for ini in self.INITIALS_EXTENDED:
+            if syl.startswith(ini):
+                final = syl[len(ini):]
+                return ini, final
+        return "", syl
+
+    def _get_syllable_nucleus(self, syl: str) -> str:
+        """提取拼音音节的主元音"""
+        syl = (syl or "").strip().lower().replace("ü", "v")
+        if not syl:
+            return ""
+        _, final = self._split_pinyin_syllable(syl)
+        if not final:
+            return ""
+        for ch in final:
+            if ch in "aeiouv":
+                return ch
+        return final[0] if final else ""
+
+    # =====================================================================
+    # con 标记逻辑
+    # =====================================================================
+    def _has_con_onset(self, syl: str, lang: str = 'zh') -> bool:
+        """判断音节是否有辅音声母"""
+        syl = (syl or "").strip().lower().replace("ü", "v")
+        if not syl:
+            return False
+
+        if lang in ('zh', 'cmn'):
+            for onset in sorted(self.CON_INITIALS, key=len, reverse=True):
+                if syl.startswith(onset):
+                    return True
+            return False
+
+        if lang == 'yue':
+            for onset in sorted(self.YUE_CON_INITIALS, key=len, reverse=True):
+                if syl.startswith(onset) and len(syl) > len(onset):
+                    return True
+            return False
+
+        return False
+
+    def _get_con_boundary(
+        self,
+        syl_start: int,
+        syl_end: int,
+        phone_items: List[Tuple[int, int, str]]
+    ) -> int:
+        """获取 con 标记的边界"""
+        if phone_items:
+            syl_phones = [
+                (s, e, p) for s, e, p in phone_items
+                if s >= syl_start and s < syl_end
+                and p not in self.SIL_PHONES
+                and p not in self.IGNORE_PHONES
+            ]
+            
+            if syl_phones:
+                syl_phones.sort(key=lambda x: x[0])
+                first_phone_end = syl_phones[0][1]
+                syl_duration = syl_end - syl_start
+                max_con_end = syl_start + syl_duration // 2
+                con_boundary = min(first_phone_end, max_con_end)
+                
+                if con_boundary - syl_start < 100000:
+                    con_boundary = syl_start + 100000
+                if con_boundary >= syl_end - 100000:
+                    con_boundary = syl_end - 100000
+                
+                return con_boundary
+        
+        syl_duration = syl_end - syl_start
+        con_duration = max(int(syl_duration * 0.15), 100000)
+        con_duration = min(con_duration, int(syl_duration * 0.40))
+        fallback = syl_start + con_duration
+        return fallback
+
+    def _make_con_entries(
+        self,
+        syl_start: int,
+        syl_end: int,
+        syl: str,
+        phone_items: List[Tuple[int, int, str]],
+        lang: str = 'zh'
+    ) -> List[Tuple[int, int, str]]:
+        """生成单个音节的 LAB 条目"""
+        if self._has_con_onset(syl, lang):
+            con_boundary = self._get_con_boundary(syl_start, syl_end, phone_items)
+            return [
+                (syl_start, con_boundary, "-"),
+                (con_boundary, syl_end, syl),
+            ]
+        else:
+            return [(syl_start, syl_end, syl)]
+
+    def _syllable_anchor_candidates(self, syl: str) -> List[str]:
+        """生成音节的可匹配候选"""
+        syl = (syl or "").strip().lower().replace("ü", "v")
+        if not syl:
+            return []
+        onset, rhyme = self._split_pinyin_syllable(syl)
+        nucleus = self._get_syllable_nucleus(syl)
+        
+        cands: List[str] = []
+        def push(token: str):
+            token = (token or "").strip().lower().replace("ü", "v")
+            if token and token not in cands:
+                cands.append(token)
+
+        push(syl)
+        push(rhyme)
+        push(nucleus)
+        if onset:
+            push(onset)
+        push(rhyme.replace("v", "u"))
+        push(rhyme.replace("v", "i"))
+        push(nucleus.replace("v", "u"))
+        push(nucleus.replace("v", "i"))
+        cleaned = re.sub(r"[^a-z]+", "", syl).lower()
+        push(cleaned)
+        
+        return [c for c in cands if c]
+
+    def _phone_matches_syllable(self, phone: str, syl: str) -> bool:
+        """判断 phone 是否匹配拼音音节"""
+        phone = self._clean_phone_token(phone)
+        if not phone:
+            return False
+        return phone in set(self._syllable_anchor_candidates(syl))
+
+    # =====================================================================
+    # 音节分配
+    # =====================================================================
+    def _distribute_syllables_in_word(
+        self,
+        word_start: int,
+        word_end: int,
+        syllables: List[str],
+        phone_tier=None,
+        lang: str = 'zh'
+    ) -> List[Tuple[int, int, str]]:
+        """在 Word 内分配音节"""
+        if not syllables:
+            return []
+        
+        if len(syllables) == 1:
+            return [(word_start, word_end, syllables[0])]
+
+        return self._distribute_syllables_by_weight(word_start, word_end, syllables)
+
+    def _distribute_syllables_by_weight(
+        self,
+        word_start: int,
+        word_end: int,
+        syllables: List[str]
+    ) -> List[Tuple[int, int, str]]:
+        """基于权重的比例分配"""
+        if not syllables:
+            return []
+        
+        weights = [self._syllable_weight(s) for s in syllables]
+        total_weight = sum(weights) or 1.0
+        
+        word_duration = word_end - word_start
+        result: List[Tuple[int, int, str]] = []
+        current_time = word_start
+        
+        for i, syl in enumerate(syllables):
+            if i == len(syllables) - 1:
+                syl_end = word_end
+            else:
+                syl_duration = int(round(word_duration * (weights[i] / total_weight)))
+                syl_end = current_time + syl_duration
+            
+            if syl_end - current_time < 60000:
+                syl_end = current_time + 60000
+            
+            if i < len(syllables) - 1 and syl_end > word_end:
+                syl_end = word_end
+            
+            result.append((current_time, syl_end, syl))
+            current_time = syl_end
+        
+        return result
+
+    # =====================================================================
+    # 各语言 Word Tier 处理
+    # =====================================================================
     def _process_zh_words(
         self,
         word_tier,
         phone_items: List[Tuple[int, int, str]],
         text: str
     ) -> List[str]:
-        """处理中文 word tier"""
+        """处理中文 Word Tier → 拼音 + con 标记"""
         target_syls = self._normalize_no_tone_pinyin(self._text_to_pinyin_notone(text))
         lines: List[str] = []
         syl_index = 0
@@ -788,39 +685,40 @@ class MFAProcessor:
             if mark in self.SIL_PHONES or mark in ("sp", "spn"):
                 lines.append(f"{start} {end} sil")
                 continue
+
             if self._is_english_word(mark):
-                lines.append(f"{start} {end} {mark.lower()}")
+                entries = self._get_arpabet_entries(start, end, phone_items)
+                if entries:
+                    for s, e, p in entries:
+                        lines.append(f"{s} {e} {p}")
+                else:
+                    lines.append(f"{start} {end} {mark.lower()}")
                 continue
+
             if self._is_digit_char(mark):
                 syl = self.DIGIT_PINYIN.get(mark.strip(), mark)
-                lines.append(f"{start} {end} {syl}")
+                for es, ee, el in self._make_con_entries(start, end, syl, phone_items, 'zh'):
+                    lines.append(f"{es} {ee} {el}")
                 syl_index = min(syl_index + 1, len(target_syls))
                 continue
 
             clean_mark = re.sub(r"[^\w\u4e00-\u9fa5]+", "", mark)
             if not clean_mark:
                 continue
-            
             mark_syls = self._segment_to_syllables(clean_mark)
             syl_count = len(mark_syls)
             if syl_count == 0:
                 continue
-            
+
             current_syls = target_syls[syl_index: syl_index + syl_count]
             syl_index += syl_count
-            
             if not current_syls:
                 current_syls = mark_syls
 
-            # 简化：直接按时间比例分配
-            if syl_count == 1:
-                lines.append(f"{start} {end} {current_syls[0]}")
-            else:
-                syl_dur = (end - start) // syl_count
-                for j, syl in enumerate(current_syls):
-                    s = start + j * syl_dur
-                    e = start + (j + 1) * syl_dur if j < syl_count - 1 else end
-                    lines.append(f"{s} {e} {syl}")
+            syl_lines = self._distribute_syllables_in_word(start, end, current_syls, None, 'zh')
+            for s, e, syl in syl_lines:
+                for es, ee, el in self._make_con_entries(s, e, syl, phone_items, 'zh'):
+                    lines.append(f"{es} {ee} {el}")
 
         return lines
 
@@ -830,33 +728,381 @@ class MFAProcessor:
         phone_items: List[Tuple[int, int, str]],
         text: str
     ) -> List[str]:
-        """处理英文 word tier"""
+        """处理英语 Word Tier → ARPABET"""
         lines: List[str] = []
+
         for interval in word_tier:
             mark = getattr(interval, "mark", getattr(interval, "text", ""))
             mark = (mark or "").strip()
             start = int(interval.minTime * 10000000)
             end = int(interval.maxTime * 10000000)
+
             if not mark or mark in self.IGNORE_PHONES:
                 continue
             if mark in self.SIL_PHONES or mark in ("sp", "spn"):
                 lines.append(f"{start} {end} sil")
                 continue
-            lines.append(f"{start} {end} {mark.lower()}")
+
+            entries = self._get_arpabet_entries(start, end, phone_items)
+            if entries:
+                for s, e, p in entries:
+                    lines.append(f"{s} {e} {p}")
+            else:
+                lines.append(f"{start} {end} {mark.lower()}")
+
         return lines
 
-    def _apply_lab_postprocess(
+    def _process_ja_words(
         self,
-        lines: List[str],
-        lang: str,
+        word_tier,
+        phone_items: List[Tuple[int, int, str]],
+        text: str
     ) -> List[str]:
-        """LAB 后处理"""
-        entries = self._parse_lab_lines(lines)
-        merged = merge_lab_silence(entries)
-        return [f"{s} {e} {p}" for s, e, p in merged]
+        """处理日语 Word Tier → ROMAJI（IPA→Romaji 自动转换）"""
+        lines: List[str] = []
 
+        for interval in word_tier:
+            mark = getattr(interval, "mark", getattr(interval, "text", ""))
+            mark = (mark or "").strip()
+            start = int(interval.minTime * 10000000)
+            end = int(interval.maxTime * 10000000)
+
+            if not mark or mark in self.IGNORE_PHONES:
+                continue
+            if mark in self.SIL_PHONES or mark in ("sp", "spn"):
+                lines.append(f"{start} {end} sil")
+                continue
+
+            if self._is_english_word(mark):
+                entries = self._get_arpabet_entries(start, end, phone_items)
+                if entries:
+                    for s, e, p in entries:
+                        lines.append(f"{s} {e} {p}")
+                else:
+                    lines.append(f"{start} {end} {mark.lower()}")
+                continue
+
+            entries = self._get_romaji_entries(start, end, phone_items)
+            if entries:
+                for s, e, p in entries:
+                    lines.append(f"{s} {e} {p}")
+            else:
+                logger.warning(f"日语 word '{mark}' 无法从 Phone Tier 获取音素，跳过")
+
+        return lines
+
+    def _process_ko_words(
+        self,
+        word_tier,
+        phone_items: List[Tuple[int, int, str]],
+        text: str
+    ) -> List[str]:
+        """处理韩语 Word Tier"""
+        lines: List[str] = []
+
+        for interval in word_tier:
+            mark = getattr(interval, "mark", getattr(interval, "text", ""))
+            mark = (mark or "").strip()
+            start = int(interval.minTime * 10000000)
+            end = int(interval.maxTime * 10000000)
+
+            if not mark or mark in self.IGNORE_PHONES:
+                continue
+            if mark in self.SIL_PHONES or mark in ("sp", "spn"):
+                lines.append(f"{start} {end} sil")
+                continue
+
+            if self._is_english_word(mark):
+                entries = self._get_arpabet_entries(start, end, phone_items)
+                if entries:
+                    for s, e, p in entries:
+                        lines.append(f"{s} {e} {p}")
+                else:
+                    lines.append(f"{start} {end} {mark.lower()}")
+                continue
+
+            if self._is_korean_text(mark):
+                syllable_entries = self._decompose_korean_syllable_with_onset(
+                    start, end, mark, phone_items=phone_items
+                )
+                if syllable_entries:
+                    for s, e, p in syllable_entries:
+                        lines.append(f"{s} {e} {p}")
+                else:
+                    logger.warning(f"无法处理韩语 word '{mark}'，跳过")
+            else:
+                logger.warning(f"非韩文 word '{mark}'，跳过")
+
+        return lines
+
+    def _is_korean_text(self, text: str) -> bool:
+        """检测文本是否为韩文"""
+        if not text:
+            return False
+        for char in text:
+            code = ord(char)
+            if (0xAC00 <= code <= 0xD7A3   
+                    or 0x3130 <= code <= 0x318F   
+                    or 0x1100 <= code <= 0x11FF):  
+                return True
+        return False
+
+    def _get_korean_initial_consonant(self, char: str) -> Optional[str]:
+        """从韩文字符提取初声"""
+        if not char:
+            return None
+        code = ord(char)
+        if 0xAC00 <= code <= 0xD7A3:
+            offset = code - 0xAC00
+            initial_idx = offset // 588
+            if initial_idx == 12:
+                return None
+            return "has_initial"  
+        if 0x3131 <= code <= 0x318E:
+            if 0x3131 <= code <= 0x3164:
+                return "has_initial"
+            else:
+                return None
+        if 0x1100 <= code <= 0x11FF:
+            if 0x1100 <= code <= 0x1114:
+                return "has_initial"
+            else:
+                return None
+        return None
+
+    def _decompose_korean_syllable_with_onset(
+        self,
+        word_start: int,
+        word_end: int,
+        korean_text: str,
+        phone_items: Optional[List[Tuple[int, int, str]]] = None,
+    ) -> List[Tuple[int, int, str]]:
+        """分解韩文字符"""
+        try:
+            import jamo
+            entries: List[Tuple[int, int, str]] = []
+            if not korean_text:
+                return entries
+
+            korean_chars: List[Tuple[str, bool]] = []  
+            for char in korean_text:
+                if not char or char == ' ':
+                    continue
+                has_initial = False
+                try:
+                    initial_marker = self._get_korean_initial_consonant(char)
+                    if initial_marker == "has_initial":
+                        has_initial = True
+                except Exception as jamo_err:
+                    logger.debug(f"Jamo 初声检测失败 {char}: {jamo_err}")
+                korean_chars.append((char, has_initial))
+
+            if not korean_chars:
+                return entries
+
+            n_chars = len(korean_chars)
+            syllable_time_ranges: List[Tuple[int, int]] = []
+            if phone_items:
+                word_phones = [
+                    (s, e, p) for s, e, p in phone_items
+                    if s >= word_start and s < word_end
+                    and p not in self.SIL_PHONES
+                    and p not in self.IGNORE_PHONES
+                ]
+                word_phones.sort(key=lambda x: x[0])
+
+                if len(word_phones) == n_chars:
+                    syllable_time_ranges = [(s, e) for s, e, _ in word_phones]
+                elif len(word_phones) > n_chars:
+                    jamo_counts = []
+                    for char, _ in korean_chars:
+                        try:
+                            dec = jamo.decompose(char)
+                            jamo_counts.append(max(len(dec), 1))
+                        except Exception:
+                            jamo_counts.append(2)
+
+                    idx = 0
+                    for i, (char, _) in enumerate(korean_chars):
+                        n = jamo_counts[i]
+                        chunk = word_phones[idx: idx + n]
+                        if chunk:
+                            syl_start = chunk[0][0]
+                            syl_end = (
+                                word_end if i == n_chars - 1
+                                else (chunk[-1][1] if len(chunk) == n 
+                                      else word_phones[min(idx + n, len(word_phones) - 1)][0])
+                            )
+                            syllable_time_ranges.append((syl_start, syl_end))
+                        idx += n
+
+            if len(syllable_time_ranges) != n_chars:
+                word_duration = word_end - word_start
+                total_units = sum(2 if hi else 1 for _, hi in korean_chars)
+                unit_dur = max(word_duration // max(total_units, 1), 100000)
+
+                cur = word_start
+                syllable_time_ranges = []
+                for i, (char, has_init) in enumerate(korean_chars):
+                    units = 2 if has_init else 1
+                    syl_end = (
+                        word_end if i == n_chars - 1
+                        else min(cur + units * unit_dur, word_end)
+                    )
+                    syllable_time_ranges.append((cur, syl_end))
+                    cur = syl_end
+
+            for i, ((char, has_initial), (syl_start, syl_end)) in enumerate(
+                zip(korean_chars, syllable_time_ranges)
+            ):
+                syl_dur = max(syl_end - syl_start, 200000)
+                if has_initial:
+                    dash_dur = max(syl_dur // 3, 60000)
+                    dash_end = min(syl_start + dash_dur, syl_end - 60000)
+                    entries.append((syl_start, dash_end, "-"))
+                    entries.append((dash_end, syl_end, char))
+                else:
+                    entries.append((syl_start, syl_end, char))
+
+            if entries and entries[-1][1] < word_end:
+                s, e, p = entries[-1]
+                entries[-1] = (s, word_end, p)
+
+            return entries
+        except ImportError:
+            logger.error("jamo 库未安装，无法分解韩文字符")
+            return []
+        except Exception as e:
+            logger.error(f"韩文分解失败: {e}", exc_info=True)
+            return []
+
+    def _process_yue_words(
+        self,
+        word_tier,
+        phone_items: List[Tuple[int, int, str]],
+        text: str
+    ) -> List[str]:
+        """处理粤语 Word Tier → 粤拼 + con 标记"""
+        target_syls = self._normalize_jyutping(self._text_to_jyutping(text))
+        lines: List[str] = []
+        syl_index = 0
+
+        for interval in word_tier:
+            mark = getattr(interval, "mark", getattr(interval, "text", ""))
+            mark = (mark or "").strip()
+            start = int(interval.minTime * 10000000)
+            end = int(interval.maxTime * 10000000)
+
+            if not mark or mark in self.IGNORE_PHONES:
+                continue
+            if mark in self.SIL_PHONES or mark in ("sp", "spn"):
+                lines.append(f"{start} {end} sil")
+                continue
+
+            if self._is_english_word(mark):
+                entries = self._get_arpabet_entries(start, end, phone_items)
+                if entries:
+                    for s, e, p in entries:
+                        lines.append(f"{s} {e} {p}")
+                else:
+                    lines.append(f"{start} {end} {mark.lower()}")
+                continue
+
+            if self._is_digit_char(mark):
+                syl = self.DIGIT_JYUTPING.get(mark.strip(), mark)
+                for es, ee, el in self._make_con_entries(start, end, syl, phone_items, 'yue'):
+                    lines.append(f"{es} {ee} {el}")
+                syl_index = min(syl_index + 1, len(target_syls))
+                continue
+
+            clean_mark = re.sub(r"[^\u4e00-\u9fa5\u3400-\u4dbf\uf900-\ufaff\u3000-\u303f]+", "", mark)
+            syl_count = len(clean_mark)
+
+            if syl_count == 0:
+                word_phones = self._get_phones_for_word(start, end, phone_items)
+                for s, e, p in word_phones:
+                    if p not in self.SIL_PHONES:
+                        lines.append(f"{s} {e} {p}")
+                continue
+
+            current_syls = target_syls[syl_index: syl_index + syl_count]
+            syl_index += syl_count
+
+            if not current_syls:
+                word_phones = self._get_phones_for_word(start, end, phone_items)
+                for s, e, p in word_phones:
+                    if p not in self.SIL_PHONES:
+                        lines.append(f"{s} {e} {p}")
+                continue
+
+            syl_lines = self._distribute_syllables_in_word(start, end, current_syls, None, 'yue')
+            for s, e, syl in syl_lines:
+                for es, ee, el in self._make_con_entries(s, e, syl, phone_items, 'yue'):
+                    lines.append(f"{es} {ee} {el}")
+
+        return lines
+
+    # =====================================================================
+    # TextGrid 处理
+    # =====================================================================
+    def _textgrid_to_lab_word_tier_primary(
+        self,
+        textgrid_path: str,
+        text: str,
+        lang: str = 'zh'
+    ) -> str:
+        """Word Tier 对齐主逻辑（含 LAB 后处理）"""
+        try:
+            from textgrid import TextGrid
+            tg = TextGrid.fromFile(textgrid_path)
+            
+            word_tier = None
+            phone_tier = None
+            
+            for candidate in tg:
+                tier_name = getattr(candidate, "name", "").lower()
+                if "word" in tier_name:
+                    word_tier = candidate
+                elif "phone" in tier_name or "phoneme" in tier_name:
+                    phone_tier = candidate
+            
+            if word_tier is None:
+                logger.error("未找到 Word Tier")
+                return ""
+            
+            phone_items: List[Tuple[int, int, str]] = []
+            if phone_tier is not None:
+                phone_items = self._extract_phone_items(phone_tier)
+            
+            if lang in ('zh', 'cmn'):
+                lines = self._process_zh_words(word_tier, phone_items, text)
+            elif lang == 'en':
+                lines = self._process_en_words(word_tier, phone_items, text)
+            elif lang == 'ja':
+                lines = self._process_ja_words(word_tier, phone_items, text)
+            elif lang == 'ko':
+                lines = self._process_ko_words(word_tier, phone_items, text)
+            elif lang == 'yue':
+                lines = self._process_yue_words(word_tier, phone_items, text)
+            else:
+                lines = self._process_en_words(word_tier, phone_items, text)
+            
+            # ★ 后处理：日语 romaji → hiragana；所有语言合并 '-' 标记
+            lines = self._apply_lab_postprocess(lines, lang)
+            return "\n".join(lines)
+            
+        except ImportError:
+            return self._parse_textgrid_manual(textgrid_path, text, lang)
+        except Exception as e:
+            logger.error(f"对齐失败: {e}", exc_info=True)
+            return ""
+
+    # =====================================================================
+    # LAB 后处理辅助方法
+    # =====================================================================
     @staticmethod
     def _parse_lab_lines(lines: List[str]) -> List[Tuple[int, int, str]]:
+        """将 LAB 行列表解析为 (start_100ns, end_100ns, label) 列表。"""
         entries: List[Tuple[int, int, str]] = []
         for line in lines:
             line = line.strip()
@@ -871,14 +1117,102 @@ class MFAProcessor:
                 continue
         return entries
 
+    def _apply_lab_postprocess(
+        self,
+        lines: List[str],
+        lang: str,
+    ) -> List[str]:
+        """
+        LAB 后处理流水线：
+          • 日语 (ja)  ： romaji 序列 → hiragana + '-' (build_ja_hiragana_lab)
+                           → 合并 '-' 标记 (merge_lab_silence)
+          • 中/英/韩/粤 ： 直接合并 '-' 标记 (merge_lab_silence)
+
+        规则说明
+        --------
+        '-' 在有声音节之后且紧邻（间距 ≤ 50 ms）→ 合并到左侧（延伸左侧结束时间）
+        '-' 在句首、静音后、或跨越句间停顿（间距 > 50 ms）→ 直接删除
+        """
+        entries = self._parse_lab_lines(lines)
+        if lang in ('ja', 'jpn'):
+            entries = build_ja_hiragana_lab(entries)
+        merged = merge_lab_silence(entries)
+        return [f"{s} {e} {p}" for s, e, p in merged]
+
+
+    def _parse_textgrid_manual(
+        self,
+        textgrid_path: str,
+        text: str,
+        lang: str = 'zh'
+    ) -> str:
+        """手工解析 TextGrid"""
+        try:
+            with open(textgrid_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            
+            tiers = content.split("item [")
+            word_tier_content = ""
+            phone_tier_content = ""
+            
+            for tier in tiers:
+                if 'name = "words"' in tier or 'name = "word"' in tier:
+                    word_tier_content = tier
+                elif 'name = "phones"' in tier or 'name = "phone"' in tier:
+                    phone_tier_content = tier
+            
+            if not word_tier_content:
+                logger.error("未找到 Word Tier")
+                return ""
+            
+            pattern = r"xmin = ([\d.]+)\s+xmax = ([\d.]+)\s+text = \"(.*?)\""
+            matches = re.findall(pattern, word_tier_content, re.DOTALL)
+            
+            class MockInterval:
+                def __init__(self, start, end, mark):
+                    self.minTime = float(start)
+                    self.maxTime = float(end)
+                    self.mark = mark
+            
+            word_tier = [MockInterval(m[0], m[1], m[2]) for m in matches]
+            
+            phone_items: List[Tuple[int, int, str]] = []
+            if phone_tier_content:
+                p_matches = re.findall(pattern, phone_tier_content, re.DOTALL)
+                phone_tier = [MockInterval(m[0], m[1], m[2]) for m in p_matches]
+                phone_items = self._extract_phone_items(phone_tier)
+            
+            if lang in ('zh', 'cmn'):
+                lines = self._process_zh_words(word_tier, phone_items, text)
+            elif lang == 'en':
+                lines = self._process_en_words(word_tier, phone_items, text)
+            elif lang == 'ja':
+                lines = self._process_ja_words(word_tier, phone_items, text)
+            elif lang == 'ko':
+                lines = self._process_ko_words(word_tier, phone_items, text)
+            elif lang == 'yue':
+                lines = self._process_yue_words(word_tier, phone_items, text)
+            else:
+                lines = self._process_en_words(word_tier, phone_items, text)
+            
+            # ★ 后处理：日语 romaji → hiragana；所有语言合并 '-' 标记
+            lines = self._apply_lab_postprocess(lines, lang)
+            return "\n".join(lines)
+            
+        except Exception as e:
+            logger.error(f"手工解析失败: {e}", exc_info=True)
+            return ""
+
+    def _textgrid_to_lab(self, textgrid_path: str, text: str, lang: str = 'zh') -> str:
+        return self._textgrid_to_lab_word_tier_primary(textgrid_path, text, lang)
+
     def _get_audio_duration(self, audio_path: str) -> int:
-        """获取音频时长（100ns 单位）"""
         try:
             import soundfile as sf
             data, sr = sf.read(audio_path)
             duration_seconds = len(data) / sr
             return int(duration_seconds * 10000000)
-        except Exception:
+        except (ImportError, Exception):
             try:
                 import wave
                 with wave.open(audio_path, "rb") as wav_file:
@@ -890,13 +1224,17 @@ class MFAProcessor:
                 logger.error(f"获取音频时长失败: {e}")
                 return 0
 
+    # =====================================================================
+    # 主流程（修改位置）
+    # =====================================================================
     def process(self, audio_file, text: str, language: str = "cmn") -> Dict:
-        """主流程"""
+        """处理单个音频文件"""
         start_time = time.time()
         try:
             self.temp_dir = tempfile.mkdtemp(prefix="mfa_")
             raw_lang = (language or "cmn").lower().strip()
 
+            # ★ 关键新增点：在任何语言分支提取前，优先使用新规则统一清洗输入的原始文本
             text = self._clean_input_text(text)
 
             if raw_lang in ("cmn", "zh", "zh-cn", "mandarin"):
@@ -909,6 +1247,14 @@ class MFAProcessor:
                 phoneme_text = self._text_to_jyutping(text) or text.strip()
             elif raw_lang in ("en", "english", "eng"):
                 lang = "en"
+                text_for_mfa = text.strip()
+                phoneme_text = text.strip()
+            elif raw_lang in ("ja", "japanese", "jpn"):
+                lang = "ja"
+                text_for_mfa = text.strip()
+                phoneme_text = text.strip()
+            elif raw_lang in ("ko", "korean", "kor"):
+                lang = "ko"
                 text_for_mfa = text.strip()
                 phoneme_text = text.strip()
             else:
@@ -926,37 +1272,92 @@ class MFAProcessor:
 
             audio_path = os.path.join(self.temp_dir, audio_file.filename)
             audio_file.save(audio_path)
+            audio_duration = self._get_audio_duration(audio_path)
 
-            audio_duration_100ns = self._get_audio_duration(audio_path)
-            audio_duration_sec = audio_duration_100ns / 10_000_000
+            corpus_dir = os.path.join(self.temp_dir, "corpus")
+            os.makedirs(corpus_dir, exist_ok=True)
+            basename = Path(audio_path).stem
+            audio_dest = os.path.join(corpus_dir, f"{basename}.wav")
+            shutil.copy2(audio_path, audio_dest)
+            text_file = os.path.join(corpus_dir, f"{basename}.txt")
+            with open(text_file, "w", encoding="utf-8") as f:
+                f.write(text_for_mfa)
 
-            logger.info(
-                f"音频时长: {audio_duration_sec:.1f}s | 语言: {lang} | "
-                f"长音频阈值: {self.LONG_AUDIO_THRESHOLD_SEC}s"
+            output_dir = os.path.join(self.temp_dir, "aligned")
+            os.makedirs(output_dir, exist_ok=True)
+            models = MFAChecker.LANGUAGE_MODELS.get(lang, {})
+            dict_model = models.get("dictionary", lang)
+            acoustic_model = models.get("acoustic", lang)
+            py = MFAChecker.env_python()
+            cmd = [
+                str(py), "-m", "montreal_forced_aligner.command_line.mfa",
+                "align", corpus_dir, dict_model, acoustic_model,
+                output_dir, "--clean", "--single_speaker"
+            ]
+            
+            timeout_seconds = 600 if lang in ('ja', 'ko') else 300
+            
+            env = os.environ.copy()
+            mfa_env_dir = MFAChecker.env_dir()
+            env["CONDA_PREFIX"] = str(mfa_env_dir)
+            lib_bin = mfa_env_dir / "Library" / "bin"
+            if lib_bin.exists():
+                env["PATH"] = str(lib_bin) + os.pathsep + env.get("PATH", "")
+            lib_dir = mfa_env_dir / "lib"
+            if lib_dir.exists():
+                env["LD_LIBRARY_PATH"] = str(lib_dir) + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+            
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout_seconds, env=env
             )
+            
+            if result.returncode != 0:
+                error_msg = result.stderr if result.stderr else "MFA 失败"
+                logger.error(f"MFA: {error_msg}")
+                return {
+                    "success": False, "error": error_msg,
+                    "processing_time": int((time.time() - start_time) * 1000)
+                }
 
-            # ★ 改为句子分段处理
-            if audio_duration_sec > self.LONG_AUDIO_THRESHOLD_SEC:
-                return self._process_with_sentence_segmentation(
-                    audio_path, text, lang, text_for_mfa, phoneme_text, start_time
-                )
-            else:
-                return self._process_direct(
-                    audio_path, text, lang, text_for_mfa, phoneme_text, start_time
-                )
+            textgrid_files = list(Path(output_dir).glob("**/*.TextGrid"))
+            if not textgrid_files:
+                return {
+                    "success": False, "error": "MFA 未生成 TextGrid",
+                    "processing_time": int((time.time() - start_time) * 1000)
+                }
+            textgrid_path = str(textgrid_files[0])
 
+            lab_content = self._textgrid_to_lab(textgrid_path, text, lang=lang)
+
+            if not lab_content:
+                return {
+                    "success": False, "error": "LAB 内容为空",
+                    "processing_time": int((time.time() - start_time) * 1000)
+                }
+
+            processing_time = int((time.time() - start_time) * 1000)
+
+            return {
+                "success": True,
+                "raw_text": text,
+                "phoneme_text": phoneme_text,
+                "lab_content": lab_content,
+                "textgrid_path": textgrid_path,
+                "audio_duration": audio_duration,
+                "processing_time": processing_time
+            }
         except subprocess.TimeoutExpired:
             return {
                 "success": False, "error": "MFA 超时",
                 "processing_time": int((time.time() - start_time) * 1000)
             }
-        except FileNotFoundError:
+        except FileNotFoundError as e:
             return {
                 "success": False, "error": "MFA 命令不存在",
                 "processing_time": int((time.time() - start_time) * 1000)
             }
         except Exception as e:
-            logger.error(f"处理错误: {e}", exc_info=True)
+            logger.error(f"错误: {e}", exc_info=True)
             return {
                 "success": False, "error": str(e),
                 "processing_time": int((time.time() - start_time) * 1000)
