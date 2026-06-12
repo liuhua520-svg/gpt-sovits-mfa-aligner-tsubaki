@@ -570,6 +570,115 @@ def pipeline_mfa_only():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/pipeline/textgrid-to-lab", methods=["POST"])
+def pipeline_textgrid_to_lab():
+    """将 TextGrid 文件转换为 LAB 格式（可直接上传 .TextGrid 文件）。"""
+    try:
+        text = request.form.get("text", "").strip()
+        language = request.form.get("language", "cmn")
+
+        tg_file = request.files.get("textgrid_file")
+        tg_path = request.form.get("textgrid_path")
+
+        if tg_file is not None:
+            basename = Path(tg_file.filename or "alignment.TextGrid").stem
+            dest_path = WORK_DIR / f"{basename}_{uuid.uuid4().hex[:6]}.TextGrid"
+            tg_file.save(str(dest_path))
+            tg_path = str(dest_path)
+
+        if not tg_path:
+            return jsonify({"error": "请提供 textgrid_file 或 textgrid_path"}), 400
+        if not os.path.exists(tg_path):
+            return jsonify({"error": f"TextGrid 文件不存在: {tg_path}"}), 400
+        if not text:
+            return jsonify({"error": "请提供文本（text）以完成 TextGrid → LAB 转换"}), 400
+
+        result = pipeline.textgrid_to_lab(tg_path, text, language)
+        if result.get("success"):
+            return jsonify(result), 200
+        return jsonify(result), 500
+    except Exception as e:
+        logger.error("TextGrid→LAB 失败: %s", e, exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/pipeline/from-textgrid", methods=["POST"])
+def pipeline_from_textgrid():
+    """
+    TextGrid → LAB → 工程文件（一步完成）。
+    需要上传 TextGrid 文件 + WAV 文件（或提供 wav_path）。
+    """
+    try:
+        text = request.form.get("text", "").strip()
+        language = request.form.get("language", "cmn")
+        output_format = request.form.get("format", "sv")
+        project_title = request.form.get("title", "Project")
+        bpm = float(request.form.get("bpm", 120))
+        base_pitch = int(request.form.get("base_pitch", 60))
+        f0_method = request.form.get("f0_method", "dio")
+        f0_smooth = request.form.get("f0_smooth", "true").lower() == "true"
+        f0_smooth_window = int(request.form.get("f0_smooth_window", 5))
+        use_double_precision = request.form.get("precision", "single").lower() == "double"
+        f0_floor = float(request.form.get("f0_floor", 71.0))
+        f0_ceil = float(request.form.get("f0_ceil", 800.0))
+        refine_pitch = request.form.get("auto_note_pitch", "false").lower() == "true"
+        export_pitch_line = request.form.get("export_pitch_line", "true").lower() == "true"
+
+        if not text:
+            return jsonify({"error": "请提供文本（text）以完成 TextGrid → LAB 转换"}), 400
+
+        # TextGrid 文件
+        tg_file = request.files.get("textgrid_file")
+        tg_path = request.form.get("textgrid_path")
+        if tg_file is not None:
+            basename = Path(tg_file.filename or "alignment.TextGrid").stem
+            dest_path = WORK_DIR / f"{basename}_{uuid.uuid4().hex[:6]}.TextGrid"
+            tg_file.save(str(dest_path))
+            tg_path = str(dest_path)
+        if not tg_path or not os.path.exists(tg_path):
+            return jsonify({"error": "请提供 textgrid_file 或有效的 textgrid_path"}), 400
+
+        # WAV 文件
+        wav_file = request.files.get("wav_file")
+        wav_path = request.form.get("wav_path")
+        if wav_file is not None:
+            stem, wav_path_obj, _ = build_job_paths(wav_file.filename or "audio.wav")
+            wav_file.save(str(wav_path_obj))
+            wav_path = str(wav_path_obj)
+        if not wav_path or not os.path.exists(wav_path):
+            return jsonify({"error": "请提供 wav_file 或有效的 wav_path"}), 400
+
+        result = pipeline.process_from_textgrid(
+            textgrid_path=tg_path,
+            wav_path=wav_path,
+            text=text,
+            language=language,
+            output_format=output_format,
+            project_title=project_title,
+            bpm=bpm,
+            base_pitch=base_pitch,
+            f0_method=f0_method,
+            f0_smooth=f0_smooth,
+            f0_smooth_window=f0_smooth_window,
+            use_double_precision=use_double_precision,
+            f0_floor=f0_floor,
+            f0_ceil=f0_ceil,
+            refine_pitch=refine_pitch,
+            export_pitch_line=export_pitch_line,
+        )
+
+        if result.get("success"):
+            result.setdefault("project_path", result.get("output_path"))
+            result.setdefault("project_format", output_format)
+            result.setdefault("requested_format", output_format)
+            return jsonify(result), 200
+        return jsonify(result), 500
+    except Exception as e:
+        logger.error("TextGrid 工程生成失败: %s", e, exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+
 @app.route("/api/pipeline/project-only", methods=["POST"])
 def pipeline_project_only():
     """
@@ -753,6 +862,16 @@ def list_work_dir_files():
                 "modified": lab_file.stat().st_mtime
             })
         
+        # 列出 TextGrid 文件
+        for tg_file in WORK_DIR.glob("*.TextGrid"):
+            files.append({
+                "name": tg_file.name,
+                "path": str(tg_file),
+                "type": "textgrid",
+                "size": tg_file.stat().st_size,
+                "modified": tg_file.stat().st_mtime
+            })
+
         # 列出工程文件
         for project_file in WORK_DIR.glob("**/*.ustx"):
             files.append({
@@ -830,7 +949,7 @@ def clear_work_dir():
         import shutil
         
         # 只删除特定类型的文件
-        patterns = ["*.wav", "*.lab", "**/*.ustx", "*.txt", "*.TextGrid"]
+        patterns = ["*.wav", "*.lab", "**/*.ustx", "*.txt", "*.TextGrid", "**/*.svp"]
         
         deleted_count = 0
         for pattern in patterns:

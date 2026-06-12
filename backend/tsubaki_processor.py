@@ -135,6 +135,8 @@ class TsubakiProcessor:
 
     # 真正的静音标签：跳过（不生成音符），但用 '-' 填充其占用的时间段
     _TRUE_SILENCE = {"pau", "sil", "sp", "spn", "br", "silence", "noise", "ap", "blank"}
+    # ★ 声母标记：'-'（旧格式）或 'con'（新 VvTalk 兼容格式）
+    _CON_LABELS   = {"-", "con"}
 
     def __init__(self, work_dir: str):
         self.work_dir = Path(work_dir)
@@ -194,6 +196,55 @@ class TsubakiProcessor:
                     continue
                 label = " ".join(parts[2:]).strip()
                 segments.append(LabelSegment(start_time=start_time, end_time=end_time, label=label))
+        return segments
+
+    def _load_textgrid_segments(self, textgrid_path: str) -> List[LabelSegment]:
+        """
+        ★ 直接读取 VvTalk / MFA 输出的 TextGrid，无需中间 LAB 转换。
+        支持两种格式：
+          • VvTalk 短格式（每组三行: 时间/时间/"标签"），tier 名 "grid"
+          • MFA 长格式（xmin/xmax/text），优先选 "grid" tier，否则取第一个 IntervalTier
+        输出 LabelSegment 列表，时间单位为 100ns（与 LAB 一致）。
+        """
+        import re as _re
+
+        with open(textgrid_path, encoding="utf-8", errors="replace") as f:
+            raw = f.read()
+
+        segments: List[LabelSegment] = []
+
+        # ── 长格式（MFA 标准输出）：xmin = x  xmax = y  text/mark = "label" ──
+        long_blocks = _re.findall(
+            r'name\s*=\s*"([^"]+)"(.*?)(?=\n\s*item\s*\[|\Z)',
+            raw, flags=_re.DOTALL
+        )
+        if long_blocks:
+            chosen_body = None
+            for tier_name, body in long_blocks:
+                if tier_name.strip().lower() == "grid":
+                    chosen_body = body; break
+            if chosen_body is None:
+                chosen_body = long_blocks[0][1]
+            ivs = _re.findall(
+                r'xmin\s*=\s*([\d.]+)\s+xmax\s*=\s*([\d.]+)\s+(?:text|mark)\s*=\s*"([^"]*)"',
+                chosen_body
+            )
+            for s, e, lbl in ivs:
+                s100 = int(float(s) * 10_000_000)
+                e100 = int(float(e) * 10_000_000)
+                if e100 > s100:
+                    segments.append(LabelSegment(start_time=s100, end_time=e100, label=lbl.strip()))
+            if segments:
+                return segments
+
+        # ── 短格式（VvTalk ooTextFile short）：三行一组 ──────────────────────
+        short_ivs = _re.findall(r'([\d.]+)\r?\n([\d.]+)\r?\n"([^"]*)"', raw)
+        for s, e, lbl in short_ivs:
+            s100 = int(float(s) * 10_000_000)
+            e100 = int(float(e) * 10_000_000)
+            if e100 > s100:
+                segments.append(LabelSegment(start_time=s100, end_time=e100, label=lbl.strip()))
+
         return segments
 
     def _default_svp_note(self, lyric: str, tone: int, onset: int = 0, duration: int = 0) -> Dict:
@@ -677,10 +728,11 @@ class TsubakiProcessor:
                     tone      = int(round(float(np.median(midi_vals))))
                     tone      = max(12, min(127, tone))
 
-            # 原本就有的 "-" 标签由于不属于 _is_true_silence，会顺利走到这里，被正确保留为 "-" 音符
-            note = self._default_svp_note(seg.label, tone, onset, dur)
+            # ★ 'con' 标记（或旧版 '-'）在 SVP 中统一写成 '-' 音符（声母过渡音符）
+            svp_lyric = "-" if seg.label in self._CON_LABELS else seg.label
+            note = self._default_svp_note(svp_lyric, tone, onset, dur)
             all_notes.append(note)
-            if seg.label != "-":
+            if seg.label not in self._CON_LABELS:
                 voiced_refs.append(note)
 
         # ── 步骤 2：检查并填补音符之间的空隙 ────────────────────────────────
@@ -887,7 +939,7 @@ class TsubakiProcessor:
                 "position": pos,
                 "duration": dur_tick,
                 "tone":     tone,
-                "lyric":    label,
+                "lyric":    "-" if label in self._CON_LABELS else label,  # ★ con→-
                 # pitch.data = 默认两端锚点，不存 F0（F0 走 voice_part curves）
                 "pitch":    make_default_pitch(),
                 "vibrato":  make_default_vibrato(),
@@ -1016,24 +1068,37 @@ class TsubakiProcessor:
     def process_full_pipeline(
         self,
         wav_path: str,
-        lab_path: str,
+        lab_path: Optional[str] = None,
+        textgrid_path: Optional[str] = None,
         output_format: str = "sv",
         project_title: str = "Project",
         config: Optional[AudioProcessingConfig] = None,
         audio_f0_data: Optional[Dict] = None,
     ) -> Dict:
-        """完整工程文件生成入口：读取 WAV + LAB，生成 SVP / USTX 文件。"""
+        """
+        完整工程文件生成入口：读取 WAV + LAB/TextGrid，生成 SVP / USTX 文件。
+        ★ 优先使用 textgrid_path（直接读 TextGrid，绕过 LAB 转换误差）。
+          若 textgrid_path 不存在则回退到 lab_path。
+        """
         try:
             config   = config or AudioProcessingConfig()
             wav_path = str(wav_path)
-            lab_path = str(lab_path)
 
             if not Path(wav_path).exists():
                 return {"success": False, "error": f"WAV 文件不存在: {wav_path}"}
-            if not Path(lab_path).exists():
-                return {"success": False, "error": f"LAB 文件不存在: {lab_path}"}
 
-            segments          = self._load_lab_segments(lab_path)
+            # ★ 优先 TextGrid，回退 LAB
+            tg_path = str(textgrid_path) if textgrid_path else None
+            lb_path = str(lab_path) if lab_path else None
+            if tg_path and Path(tg_path).exists():
+                segments = self._load_textgrid_segments(tg_path)
+                logger.info(f"✓ TextGrid 驱动音符边界: {tg_path} ({len(segments)} 段)")
+            elif lb_path and Path(lb_path).exists():
+                segments = self._load_lab_segments(lb_path)
+                logger.info(f"✓ LAB 驱动音符边界: {lb_path} ({len(segments)} 段)")
+            else:
+                return {"success": False, "error": "需要提供 lab_path 或有效的 textgrid_path"}
+
             audio_duration_sec = self._read_audio_duration_sec(wav_path)
 
             f0, t, sr = None, None, None
