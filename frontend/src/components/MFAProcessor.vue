@@ -49,24 +49,60 @@
           </div>
         </el-form-item>
 
-        <el-form-item v-if="processingMode === 'project-only'" label="LAB 文件">
-          <el-upload
-            drag
-            action="#"
-            :auto-upload="false"
-            :limit="1"
-            :on-exceed="handleExceed"
-            @change="handleLabSelect"
-            accept=".lab"
-          >
-            <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
-            <div class="el-upload__text">
-              拖拽或<em>点击选择</em> LAB 标注文件
+        <el-form-item v-if="processingMode === 'project-only'" label="标注文件">
+          <!-- 切换：LAB 还是 TextGrid -->
+          <el-radio-group v-model="useTextGridInsteadOfLab" style="margin-bottom:10px">
+            <el-radio :value="false">上传 LAB 文件</el-radio>
+            <el-radio :value="true">上传 TextGrid 文件（自动转 LAB）</el-radio>
+          </el-radio-group>
+
+          <!-- LAB 上传 -->
+          <template v-if="!useTextGridInsteadOfLab">
+            <el-upload
+              drag action="#" :auto-upload="false" :limit="1"
+              :on-exceed="handleExceed" @change="handleLabSelect" accept=".lab"
+            >
+              <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
+              <div class="el-upload__text">拖拽或<em>点击选择</em> LAB 标注文件</div>
+            </el-upload>
+            <div v-if="formData.labFile" class="file-info">
+              ✓ {{ formData.labFile.name }} ({{ formatFileSize(formData.labFile.size) }})
             </div>
-          </el-upload>
-          <div v-if="formData.labFile" class="file-info">
-            ✓ {{ formData.labFile.name }} ({{ formatFileSize(formData.labFile.size) }})
-          </div>
+          </template>
+
+          <!-- TextGrid 上传 -->
+          <template v-else>
+            <el-upload
+              drag action="#" :auto-upload="false" :limit="1"
+              :on-exceed="handleExceed" @change="handleTextGridSelect" accept=".TextGrid,.textgrid"
+            >
+              <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
+              <div class="el-upload__text">拖拽或<em>点击选择</em> TextGrid 文件</div>
+            </el-upload>
+            <div v-if="formData.textgridFile" class="file-info">
+              ✓ {{ formData.textgridFile.name }} ({{ formatFileSize(formData.textgridFile.size) }})
+            </div>
+            <div class="help-text" style="color:#e6a23c">
+              ⚠️ 使用 TextGrid 模式需要填写对应文本和语言
+            </div>
+          </template>
+        </el-form-item>
+
+        <!-- TextGrid 模式下需要额外显示文本和语言字段 -->
+        <el-form-item v-if="processingMode === 'project-only' && useTextGridInsteadOfLab" label="对应文本">
+          <el-input
+            v-model="formData.text" type="textarea" :rows="3"
+            placeholder="粘贴与 TextGrid 对应的原文文本" show-word-limit
+          />
+        </el-form-item>
+        <el-form-item v-if="processingMode === 'project-only' && useTextGridInsteadOfLab" label="语言">
+          <el-select v-model="formData.language" placeholder="选择语言">
+            <el-option label="普通话 🇨🇳" value="cmn" />
+            <el-option label="英语 🇬🇧" value="eng" />
+            <el-option label="日语 🇯🇵" value="jpn" />
+            <el-option label="韩语 🇰🇷" value="kor" />
+            <el-option label="粤语 🇭🇰" value="yue" />
+          </el-select>
         </el-form-item>
 
         <el-form-item v-if="processingMode !== 'project-only'" label="输入文本">
@@ -380,6 +416,15 @@
           <el-button v-if="result.labContent" type="success" @click="downloadLab" size="large">
             📥 下载 LAB 文件
           </el-button>
+          <el-button
+            v-if="result.textgridPath"
+            type="warning"
+            @click="downloadTextgrid"
+            size="large"
+            :loading="downloadingTextgrid"
+          >
+            📥 下载 TextGrid
+          </el-button>
           <el-button 
             v-if="result.projectPath" 
             type="success" 
@@ -496,6 +541,7 @@ type ProcessingMode = 'mfa-only' | 'full' | 'project-only'
 interface FormData {
   audioFile: File | null
   labFile: File | null
+  textgridFile: File | null
   text: string
   language: string
   outputFormat: string
@@ -533,6 +579,7 @@ const processingMode = ref<ProcessingMode>('mfa-only')
 const formData = ref<FormData>({
   audioFile: null,
   labFile: null,
+  textgridFile: null,
   text: '',
   language: 'cmn',
   outputFormat: 'sv',
@@ -559,6 +606,8 @@ const error = ref('')
 const checkingStatus = ref(false)
 const downloadingLangs = ref<string[]>([])
 const downloadingProject = ref(false)
+const downloadingTextgrid = ref(false)
+const useTextGridInsteadOfLab = ref(false)
 
 const systemStatus = ref<SystemStatus>({
   mfa: {
@@ -597,7 +646,11 @@ const isReady = computed(() => {
 // 根据不同模式控制提交按钮的禁用状态
 const isSubmitDisabled = computed(() => {
   if (processingMode.value === 'project-only') {
-    return !formData.value.audioFile || !formData.value.labFile
+    if (!formData.value.audioFile) return true
+    if (useTextGridInsteadOfLab.value) {
+      return !formData.value.textgridFile || !formData.value.text.trim()
+    }
+    return !formData.value.labFile
   }
   return !formData.value.audioFile || !formData.value.text.trim() || !isReady.value
 })
@@ -664,6 +717,7 @@ const normalizeResult = (payload: any) => {
     labContent: payload?.lab_content || payload?.labContent || '',
     processingTime: payload?.processing_time || payload?.processingTime || 0,
     labPath: payload?.lab_path || payload?.labPath || '',
+    textgridPath: payload?.textgrid_path || payload?.textgridPath || '',
     projectPath,
     projectFormat: payload?.project_format || payload?.projectFormat || formData.value.outputFormat,
     segments: payload?.segments || 0,
@@ -767,6 +821,10 @@ const handleLabSelect = (file: any) => {
   formData.value.labFile = file.raw || null
 }
 
+const handleTextGridSelect = (file: any) => {
+  formData.value.textgridFile = file.raw || null
+}
+
 const downloadModel = async (lang: string) => {
   downloadingLangs.value.push(lang)
   try {
@@ -788,16 +846,18 @@ const downloadModel = async (lang: string) => {
 // 核心核心控制逻辑：开始处理
 const processAudio = async () => {
   // ============================================================
-  // 分支 1) 仅工程文件模式：WAV + LAB -> 直接转工程文件
+  // 分支 1) 仅工程文件模式：WAV + LAB/TextGrid -> 直接转工程文件
   // ============================================================
   if (processingMode.value === 'project-only') {
     if (!formData.value.audioFile) {
       ElMessage.warning('请选择 WAV 文件')
       return
     }
-    if (!formData.value.labFile) {
-      ElMessage.warning('请选择 LAB 文件')
-      return
+    if (useTextGridInsteadOfLab.value) {
+      if (!formData.value.textgridFile) { ElMessage.warning('请选择 TextGrid 文件'); return }
+      if (!formData.value.text.trim()) { ElMessage.warning('请输入对应文本以转换 TextGrid'); return }
+    } else {
+      if (!formData.value.labFile) { ElMessage.warning('请选择 LAB 文件'); return }
     }
 
     clearJobPolling()
@@ -816,7 +876,6 @@ const processAudio = async () => {
     try {
       const formDataObj = new FormData()
       formDataObj.append('wav_file', formData.value.audioFile)
-      formDataObj.append('lab_file', formData.value.labFile)
       formDataObj.append('format', formData.value.outputFormat)
       formDataObj.append('title', formData.value.projectTitle)
       formDataObj.append('bpm', advancedConfig.value.bpm.toString())
@@ -830,22 +889,31 @@ const processAudio = async () => {
       formDataObj.append('auto_note_pitch', advancedConfig.value.auto_note_pitch.toString())
       formDataObj.append('export_pitch_line', advancedConfig.value.export_pitch_line.toString())
 
+      let endpoint = '/api/pipeline/project-only'
+      if (useTextGridInsteadOfLab.value) {
+        formDataObj.append('textgrid_file', formData.value.textgridFile!)
+        formDataObj.append('text', formData.value.text)
+        formDataObj.append('language', formData.value.language)
+        endpoint = '/api/pipeline/from-textgrid'
+      } else {
+        formDataObj.append('lab_file', formData.value.labFile!)
+      }
+
       progressTimer = window.setInterval(() => {
         if (progressPercent.value < 90) progressPercent.value += 3
       }, 400)
 
-      const res = await fetch('/api/pipeline/project-only', {
-        method: 'POST',
-        body: formDataObj,
-      })
+      const res = await fetch(endpoint, { method: 'POST', body: formDataObj })
       const data = await res.json()
 
       if (!res.ok) throw new Error(data.error || '提交失败')
-
-      const normalized = normalizeResult(data)
       if (!data.success) throw new Error(data.error || '工程文件生成失败')
 
-      result.value = normalized
+      const normalized = normalizeResult(data)
+      result.value = {
+        ...normalized,
+        textgridPath: data.textgrid_path || ''
+      }
       progressPercent.value = 100
       updateProcessingStep(0, '跳过', '工程文件模式不需要 MFA 标注')
       updateProcessingStep(1, '完成', 'F0 提取已完成')
@@ -854,11 +922,11 @@ const processAudio = async () => {
     } catch (e: any) {
       error.value = e?.message || String(e)
       ElMessage.error(`❌ ${error.value}`)
-    } {{
+    } finally {
       if (progressTimer !== null) window.clearInterval(progressTimer)
       clearJobPolling()
       processing.value = false
-    }}
+    }
     return
   }
 
@@ -991,6 +1059,30 @@ const downloadLab = () => {
   ElMessage.success('LAB 文件已下载')
 }
 
+const downloadTextgrid = async () => {
+  if (!result.value?.textgridPath) return
+  downloadingTextgrid.value = true
+  try {
+    const filename = result.value.textgridPath.split(/[\\/]/).pop()
+    const response = await fetch(`/api/work-dir/download/${encodeURIComponent(filename)}`)
+    if (!response.ok) { ElMessage.error('TextGrid 下载失败'); return }
+    const blob = await response.blob()
+    const url = window.URL.createObjectURL(blob)
+    const element = document.createElement('a')
+    element.href = url
+    element.download = filename
+    document.body.appendChild(element)
+    element.click()
+    document.body.removeChild(element)
+    window.URL.revokeObjectURL(url)
+    ElMessage.success('TextGrid 文件已下载')
+  } catch (e) {
+    ElMessage.error(`下载失败: ${e}`)
+  } finally {
+    downloadingTextgrid.value = false
+  }
+}
+
 const downloadProject = async () => {
   if (!result.value?.projectPath) return
   downloadingProject.value = true
@@ -1032,11 +1124,13 @@ const reset = () => {
   formData.value = {
     audioFile: null,
     labFile: null,
+    textgridFile: null,
     text: '',
     language: 'cmn',
     outputFormat: 'sv',
     projectTitle: 'Project'
   }
+  useTextGridInsteadOfLab.value = false
   result.value = null
   error.value = ''
   progressPercent.value = 0
