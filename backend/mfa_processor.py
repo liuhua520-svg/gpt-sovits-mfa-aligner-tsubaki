@@ -160,7 +160,7 @@ class MFAProcessor:
         
         # 步骤 2：把指定的括号、书名号、句号、尖括号视为逗号
         # 匹配 （ ） 《 》  ( ) ＜ ＞ < > 【 】 并替换为逗号
-        comma_pattern = r'[（）《》()＜＞<>【】]'
+        comma_pattern = r'[（）《》()＜＞<>【】、：；:;]'
         text = re.sub(comma_pattern, ",", text)
         
         return text
@@ -265,38 +265,6 @@ class MFAProcessor:
         phones = lazy_pinyin(text, style=Style.NORMAL, errors="ignore")
         phones = [p.strip().lower() for p in phones if p and p.strip()]
         return " ".join(phones)
-
-    def _text_to_pinyin_tone3(self, text: str) -> str:
-        """
-        中文文本转带数字声调拼音 (zai4 / gu3 / dai4)。
-        轻声统一输出为 0（VvTalk 惯例），其余声调 1-4 照数字原样保留。
-        """
-        from pypinyin import lazy_pinyin, Style as PyStyle
-        phones = lazy_pinyin(
-            text,
-            style=PyStyle.TONE3,
-            errors="ignore",
-            neutral_tone_with_five=True,   # 轻声 → 5，再统一改成 0
-        )
-        phones = [p.strip().lower() for p in phones if p and p.strip()]
-        phones = [re.sub(r"5$", "0", p) for p in phones]   # 5 → 0
-        return " ".join(phones)
-
-    def _normalize_tone3_pinyin(self, text: str) -> List[str]:
-        """
-        将 tone3 拼音字符串（空格分隔）解析为列表，保留尾部数字。
-        例: "zai4 gu3 dai4" → ["zai4", "gu3", "dai4"]
-        """
-        if not text:
-            return []
-        tokens: List[str] = []
-        for part in text.split():
-            p = part.strip().lower()
-            if p:
-                p = re.sub(r"[^a-züv0-9]+", "", p)   # 保留字母 + 数字
-                if p:
-                    tokens.append(p)
-        return tokens
 
     def _text_to_jyutping(self, text: str) -> str:
         """粤语文本转粤拼（无声调）"""
@@ -596,7 +564,7 @@ class MFAProcessor:
         if self._has_con_onset(syl, lang):
             con_boundary = self._get_con_boundary(syl_start, syl_end, phone_items)
             return [
-                (syl_start, con_boundary, "con"),   # ★ 与 VvTalk 保持一致：用 "con" 而非 "-"
+                (syl_start, con_boundary, "-"),
                 (con_boundary, syl_end, syl),
             ]
         else:
@@ -648,124 +616,14 @@ class MFAProcessor:
         phone_tier=None,
         lang: str = 'zh'
     ) -> List[Tuple[int, int, str]]:
-        """在 Word 内分配音节（已弃用，请改用 _distribute_syllables_with_phones）"""
+        """在 Word 内分配音节"""
         if not syllables:
             return []
+        
         if len(syllables) == 1:
             return [(word_start, word_end, syllables[0])]
+
         return self._distribute_syllables_by_weight(word_start, word_end, syllables)
-
-    def _distribute_syllables_with_phones(
-        self,
-        word_start: int,
-        word_end: int,
-        syllables: List[str],
-        phone_items: List[Tuple[int, int, str]],
-        lang: str = 'zh'
-    ) -> List[Tuple[int, int, str]]:
-        """
-        ★ 核心修复：使用 Phone Tier 实际边界确定音节时间范围。
-        替代原来"按权重比例分配"方案，从而消除多字词的音标错位。
-
-        算法：
-        1. 提取 word 时间窗内的所有非静音 phone 条目（来自 TextGrid phone tier）
-        2. 计算每个音节期望的 phone 数量（声母+韵母=2，零声母=1）
-        3. 按期望数量将 phone 条目分组到各音节
-        4. 用每组第一个 phone 的开始时间作为该音节的开始时间
-        如果 phone 条目不足，回退到权重比例分配。
-        """
-        if not syllables:
-            return []
-        n = len(syllables)
-        if n == 1:
-            return [(word_start, word_end, syllables[0])]
-
-        # 提取词语时间窗内的非静音 phone（按时间排序）
-        word_phones = sorted(
-            [
-                (s, e, p) for s, e, p in phone_items
-                if s >= word_start and s < word_end
-                and p not in self.SIL_PHONES
-                and p not in self.IGNORE_PHONES
-            ],
-            key=lambda x: x[0],
-        )
-        m = len(word_phones)
-
-        if m < n:
-            # phone 数量少于音节数 → 降级为权重分配
-            logger.debug(f"  phone 数({m}) < 音节数({n})，降级为权重分配")
-            return self._distribute_syllables_by_weight(word_start, word_end, syllables)
-
-        # 计算每个音节期望的 phone 数
-        if lang in ('zh', 'cmn'):
-            expected_counts = []
-            for syl in syllables:
-                onset, _ = self._split_pinyin_syllable(syl)
-                expected_counts.append(2 if onset else 1)
-        elif lang == 'yue':
-            expected_counts = []
-            for syl in syllables:
-                has_onset = any(
-                    syl.lower().startswith(onset)
-                    for onset in sorted(self.YUE_CON_INITIALS, key=len, reverse=True)
-                    if len(syl) > len(onset)
-                )
-                expected_counts.append(2 if has_onset else 1)
-        else:
-            expected_counts = [1] * n
-
-        total_expected = sum(expected_counts)
-
-        result: List[Tuple[int, int, str]] = []
-        phone_idx = 0
-
-        if m == total_expected:
-            # phone 总数与期望完全匹配：精确分组
-            for i, (syl, count) in enumerate(zip(syllables, expected_counts)):
-                if phone_idx >= m:
-                    break
-                chunk = word_phones[phone_idx: phone_idx + count]
-                phone_idx += count
-                syl_start = chunk[0][0]
-                syl_end = word_phones[phone_idx][0] if phone_idx < m else word_end
-                if i == n - 1:
-                    syl_end = word_end
-                result.append((syl_start, syl_end, syl))
-        else:
-            # 数量不完全匹配：按比例缩放期望数量后分组
-            scale = m / max(total_expected, 1)
-            for i, (syl, exp_count) in enumerate(zip(syllables, expected_counts)):
-                scaled = max(1, round(exp_count * scale))
-                if i == n - 1:
-                    chunk = word_phones[phone_idx:]
-                else:
-                    chunk = word_phones[phone_idx: phone_idx + scaled]
-                    phone_idx += scaled
-
-                if not chunk:
-                    # 无 phone 可分配：将上一音节末尾平分
-                    if result:
-                        ps, pe, pl = result[-1]
-                        mid = (ps + pe) // 2
-                        result[-1] = (ps, mid, pl)
-                        result.append((mid, word_end if i == n - 1 else mid + 500_000, syl))
-                    else:
-                        result.append((word_start, word_end, syl))
-                    continue
-
-                syl_start = chunk[0][0]
-                syl_end = word_phones[phone_idx][0] if (i < n - 1 and phone_idx < m) else word_end
-                if i == n - 1:
-                    syl_end = word_end
-                result.append((syl_start, syl_end, syl))
-
-        if result:
-            # 确保最后一个音节延伸到词语结束时间
-            s, _, p = result[-1]
-            result[-1] = (s, word_end, p)
-
-        return result if result else self._distribute_syllables_by_weight(word_start, word_end, syllables)
 
     def _distribute_syllables_by_weight(
         self,
@@ -811,9 +669,8 @@ class MFAProcessor:
         phone_items: List[Tuple[int, int, str]],
         text: str
     ) -> List[str]:
-        """处理中文 Word Tier → 带声调拼音 + con 标记（VvTalk 兼容格式）"""
-        # ★ 使用带声调拼音 (zai4/gu3/dai4)，与 VvTalk 输出对齐
-        target_syls = self._normalize_tone3_pinyin(self._text_to_pinyin_tone3(text))
+        """处理中文 Word Tier → 拼音 + con 标记"""
+        target_syls = self._normalize_no_tone_pinyin(self._text_to_pinyin_notone(text))
         lines: List[str] = []
         syl_index = 0
 
@@ -823,9 +680,7 @@ class MFAProcessor:
             start = int(interval.minTime * 10000000)
             end = int(interval.maxTime * 10000000)
 
-            # ★ 空白 word 条目：输出 sil（原来是 continue，导致静音消失）
             if not mark or mark in self.IGNORE_PHONES:
-                lines.append(f"{start} {end} sil")
                 continue
             if mark in self.SIL_PHONES or mark in ("sp", "spn"):
                 lines.append(f"{start} {end} sil")
@@ -850,8 +705,7 @@ class MFAProcessor:
             clean_mark = re.sub(r"[^\w\u4e00-\u9fa5]+", "", mark)
             if not clean_mark:
                 continue
-            # ★ 用 tone3 计数（字符数即音节数）
-            mark_syls = self._normalize_tone3_pinyin(self._text_to_pinyin_tone3(clean_mark))
+            mark_syls = self._segment_to_syllables(clean_mark)
             syl_count = len(mark_syls)
             if syl_count == 0:
                 continue
@@ -861,8 +715,7 @@ class MFAProcessor:
             if not current_syls:
                 current_syls = mark_syls
 
-            # ★ 用 phone tier 实际边界分配音节（_distribute_syllables_with_phones）
-            syl_lines = self._distribute_syllables_with_phones(start, end, current_syls, phone_items, 'zh')
+            syl_lines = self._distribute_syllables_in_word(start, end, current_syls, None, 'zh')
             for s, e, syl in syl_lines:
                 for es, ee, el in self._make_con_entries(s, e, syl, phone_items, 'zh'):
                     lines.append(f"{es} {ee} {el}")
@@ -1182,7 +1035,7 @@ class MFAProcessor:
                         lines.append(f"{s} {e} {p}")
                 continue
 
-            syl_lines = self._distribute_syllables_with_phones(start, end, current_syls, phone_items, 'yue')
+            syl_lines = self._distribute_syllables_in_word(start, end, current_syls, None, 'yue')
             for s, e, syl in syl_lines:
                 for es, ee, el in self._make_con_entries(s, e, syl, phone_items, 'yue'):
                     lines.append(f"{es} {ee} {el}")
@@ -1271,19 +1124,20 @@ class MFAProcessor:
     ) -> List[str]:
         """
         LAB 后处理流水线：
-          • 日语 (ja/jpn)：romaji → hiragana + '-'，再合并 '-' 标记
-          • 中/粤       ：'con' 标记来自 phone tier，不合并，直接保留
-          • 英/韩       ：无 '-'/'con'，原样输出
+          • 日语 (ja)  ： romaji 序列 → hiragana + '-' (build_ja_hiragana_lab)
+                           → 合并 '-' 标记 (merge_lab_silence)
+          • 中/英/韩/粤 ： 直接合并 '-' 标记 (merge_lab_silence)
 
-        ★ 关键修复：中文不再调用 merge_lab_silence，
-          避免 con 标记（原来是 '-'）被吸收进前一个音节，导致时间错位。
+        规则说明
+        --------
+        '-' 在有声音节之后且紧邻（间距 ≤ 50 ms）→ 合并到左侧（延伸左侧结束时间）
+        '-' 在句首、静音后、或跨越句间停顿（间距 > 50 ms）→ 直接删除
         """
         entries = self._parse_lab_lines(lines)
         if lang in ('ja', 'jpn'):
             entries = build_ja_hiragana_lab(entries)
-            entries = merge_lab_silence(entries)   # 只有日语需要合并 '-'
-        # 其他语言（zh/yue/en/ko）：直接使用，不合并
-        return [f"{s} {e} {p}" for s, e, p in entries]
+        merged = merge_lab_silence(entries)
+        return [f"{s} {e} {p}" for s, e, p in merged]
 
 
     def _parse_textgrid_manual(
@@ -1373,8 +1227,7 @@ class MFAProcessor:
     # =====================================================================
     # 主流程（修改位置）
     # =====================================================================
-    def process(self, audio_file, text: str, language: str = "cmn",
-                save_dir: Optional[str] = None) -> Dict:
+    def process(self, audio_file, text: str, language: str = "cmn") -> Dict:
         """处理单个音频文件"""
         start_time = time.time()
         try:
@@ -1482,18 +1335,6 @@ class MFAProcessor:
                     "processing_time": int((time.time() - start_time) * 1000)
                 }
 
-            # ★ 保存 TextGrid 到持久目录（temp 目录即将被删除）
-            saved_textgrid_path = textgrid_path
-            if save_dir:
-                try:
-                    import shutil as _shutil
-                    tg_dest = Path(save_dir) / Path(textgrid_path).name
-                    _shutil.copy2(textgrid_path, tg_dest)
-                    saved_textgrid_path = str(tg_dest)
-                    logger.info(f"✓ TextGrid 已保存到: {saved_textgrid_path}")
-                except Exception as _e:
-                    logger.warning(f"⚠ TextGrid 持久化失败: {_e}")
-
             processing_time = int((time.time() - start_time) * 1000)
 
             return {
@@ -1501,7 +1342,7 @@ class MFAProcessor:
                 "raw_text": text,
                 "phoneme_text": phoneme_text,
                 "lab_content": lab_content,
-                "textgrid_path": saved_textgrid_path,
+                "textgrid_path": textgrid_path,
                 "audio_duration": audio_duration,
                 "processing_time": processing_time
             }
