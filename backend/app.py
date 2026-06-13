@@ -286,6 +286,8 @@ def run_pipeline_job(
     f0_ceil: float,
     refine_pitch: bool,
     export_pitch_line: bool,
+    f0_device: str = "auto",
+    crepe_model: str = "full",
 ):
     try:
         set_job(
@@ -330,6 +332,8 @@ def run_pipeline_job(
             f0_ceil=f0_ceil,
             refine_pitch=refine_pitch,
             export_pitch_line=export_pitch_line,
+            f0_device=f0_device,
+            crepe_model=crepe_model,
         )
 
         if result.get("success"):
@@ -384,6 +388,9 @@ def pipeline_full_process():
 
         f0_method = request.form.get("f0_method", "dio")
         f0_smooth = request.form.get("f0_smooth", "true").lower() == "true"
+
+        f0_device = request.form.get("f0_device", "auto")
+        crepe_model = request.form.get("crepe_model", "full")
 
         f0_smooth_window = int(
             request.form.get("f0_smooth_window", 5)
@@ -448,6 +455,8 @@ def pipeline_full_process():
                 f0_ceil,
                 refine_pitch,
                 export_pitch_line,
+                f0_device,
+                crepe_model,
             ),
         ).start()
 
@@ -590,6 +599,8 @@ def pipeline_project_only():
         use_double_precision = request.form.get("precision", "single").lower() == "double"
         f0_floor = float(request.form.get("f0_floor", 71.0))
         f0_ceil = float(request.form.get("f0_ceil", 800.0))
+        f0_device = request.form.get("f0_device", "auto")
+        crepe_model = request.form.get("crepe_model", "full")
 
         # 是否根据 F0 细化音高
         refine_pitch = request.form.get("auto_note_pitch", "false").lower() == "true"
@@ -650,6 +661,8 @@ def pipeline_project_only():
             f0_ceil=f0_ceil,
             refine_pitch=refine_pitch,
             export_pitch_line=export_pitch_line,
+            f0_device=f0_device,
+            crepe_model=crepe_model,
         )
 
         if result.get("success"):
@@ -677,14 +690,18 @@ def pipeline_f0_only():
     try:
         wav_path = request.form.get("wav_path")
         method = request.form.get("method", "dio")
+        f0_device = request.form.get("f0_device", "auto")
+        crepe_model = request.form.get("crepe_model", "full")
+        f0_floor = float(request.form.get("f0_floor", 71.0))
+        f0_ceil = float(request.form.get("f0_ceil", 800.0))
 
         if not wav_path:
             return jsonify({"error": "缺少 wav_path"}), 400
 
-        if method not in ["dio", "harvest"]:
+        if method not in ["dio", "harvest", "crepe", "rmvpe"]:
             return jsonify({
                 "error": f"不支持的方法: {method}",
-                "supported": ["dio", "harvest"]
+                "supported": ["dio", "harvest", "crepe", "rmvpe"]
             }), 400
 
         # 验证文件存在
@@ -692,7 +709,14 @@ def pipeline_f0_only():
             return jsonify({"error": f"WAV 文件不存在: {wav_path}"}), 400
 
         logger.info(f"F0 提取模式启动: {method} 方法")
-        result = pipeline.process_f0_only(wav_path, method=method)
+        result = pipeline.process_f0_only(
+            wav_path,
+            method=method,
+            f0_floor=f0_floor,
+            f0_ceil=f0_ceil,
+            f0_device=f0_device,
+            crepe_model=crepe_model,
+        )
 
         if result.get("success"):
             return jsonify(result), 200

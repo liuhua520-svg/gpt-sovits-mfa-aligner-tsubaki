@@ -50,6 +50,8 @@ class AudioProcessingPipeline:
         f0_ceil: float = 800.0,
         refine_pitch: bool = False,
         export_pitch_line: bool = True,
+        f0_device: str = "auto",
+        crepe_model: str = "full",
     ) -> Dict:
         config = AudioProcessingConfig(
             bpm=bpm,
@@ -62,6 +64,8 @@ class AudioProcessingPipeline:
             use_double_precision=use_double_precision,
             f0_floor=f0_floor,
             f0_ceil=f0_ceil,
+            f0_device=f0_device,
+            crepe_model=crepe_model,
         )
 
         import time
@@ -103,8 +107,8 @@ class AudioProcessingPipeline:
             logger.info("[ 步骤 2/3 ] 音高提取...")
             try:
                 audio_data = self.tsubaki_processor.process_audio_f0(wav_path, config)
-                if not audio_data:
-                    logger.warning("⚠ F0 提取失败或 PyWORLD 未安装，继续处理")
+                if not audio_data or not audio_data.get("success"):
+                    logger.warning(f"⚠ F0 提取失败({audio_data.get('error') if audio_data else 'unknown'})，继续处理（不含音高曲线）")
                     audio_data = None
             except Exception as e:
                 logger.warning(f"⚠ 音高提取异常: {e}，继续处理")
@@ -223,6 +227,8 @@ class AudioProcessingPipeline:
         f0_ceil: float = 800.0,
         refine_pitch: bool = False,
         export_pitch_line: bool = True,
+        f0_device: str = "auto",
+        crepe_model: str = "full",
     ) -> Dict:
         """仅执行工程文件生成（已有 WAV 和 LAB）"""
         import time
@@ -245,13 +251,15 @@ class AudioProcessingPipeline:
                 use_double_precision=use_double_precision,
                 refine_pitch=refine_pitch,
                 export_pitch_line=export_pitch_line,
+                f0_device=f0_device,
+                crepe_model=crepe_model,
             )
 
             audio_data = None
             try:
                 audio_data = self.tsubaki_processor.process_audio_f0(wav_path, config)
-                if not audio_data:
-                    logger.warning("⚠ F0 提取失败或 PyWORLD 未安装，继续生成工程文件")
+                if not audio_data or not audio_data.get("success"):
+                    logger.warning(f"⚠ F0 提取失败({audio_data.get('error') if audio_data else 'unknown'})，继续生成工程文件（不含音高曲线）")
                     audio_data = None
             except Exception as e:
                 logger.warning(f"⚠ 音高提取异常: {e}，继续生成工程文件")
@@ -286,13 +294,15 @@ class AudioProcessingPipeline:
         f0_smooth: bool = True,
         f0_smooth_window: int = 5,
         use_double_precision: bool = False,
+        f0_device: str = "auto",
+        crepe_model: str = "full",
     ) -> Dict:
         """仅执行 F0 提取"""
         import time
         start_time = time.time()
 
         try:
-            logger.info("[ F0 模式 ] 提取音高")
+            logger.info(f"[ F0 模式 ] 提取音高 (method={method})")
 
             config = AudioProcessingConfig(
                 f0_method=method,
@@ -301,11 +311,13 @@ class AudioProcessingPipeline:
                 f0_smooth=f0_smooth,
                 f0_smooth_window=f0_smooth_window,
                 use_double_precision=use_double_precision,
+                f0_device=f0_device,
+                crepe_model=crepe_model,
             )
 
             audio_data = self.tsubaki_processor.process_audio_f0(wav_path, config)
 
-            if audio_data:
+            if audio_data and audio_data.get("success"):
                 logger.info("✓ F0 提取完成")
                 return {
                     "success": True,
@@ -318,7 +330,7 @@ class AudioProcessingPipeline:
             else:
                 return {
                     "success": False,
-                    "error": "F0 提取失败",
+                    "error": (audio_data or {}).get("error", "F0 提取失败"),
                     "processing_time": int((time.time() - start_time) * 1000)
                 }
 
@@ -338,6 +350,7 @@ class AudioProcessingPipeline:
 
     def get_status(self) -> Dict:
         from mfa_utils import MFAChecker
+        from f0_extractors import get_f0_backend_status
 
         mfa_status = MFAChecker.get_status()
         pyworld_available = self.tsubaki_processor.process_audio_f0.__globals__.get("pw") is not None
@@ -348,6 +361,7 @@ class AudioProcessingPipeline:
             "mfa": mfa_status,
             "audio_processing": {
                 "pyworld_available": pyworld_available,
-                "supported_formats": list(self.tsubaki_processor.SUPPORTED_FORMATS.keys())
+                "supported_formats": list(self.tsubaki_processor.SUPPORTED_FORMATS.keys()),
+                "f0_backends": get_f0_backend_status(),
             }
         }

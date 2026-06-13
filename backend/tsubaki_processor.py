@@ -53,7 +53,13 @@ class AudioProcessingConfig:
     # F0 提取参数
     f0_floor: float = 71.0
     f0_ceil: float = 800.0
-    f0_method: str = "dio"  # 'dio' 或 'harvest'
+    f0_method: str = "dio"  # 'dio' / 'harvest' / 'crepe' / 'rmvpe'
+
+    # CREPE / RMVPE 运行设备："auto"（自动选择 cuda，否则 cpu）/ "cpu" / "cuda"
+    f0_device: str = "auto"
+
+    # CREPE 模型规格："full"（精度高）或 "tiny"（速度快）
+    crepe_model: str = "full"
 
     # F0 细化参数
     f0_smooth: bool = True
@@ -77,6 +83,8 @@ class AudioProcessingConfig:
             "f0_floor": self.f0_floor,
             "f0_ceil": self.f0_ceil,
             "f0_method": self.f0_method,
+            "f0_device": self.f0_device,
+            "crepe_model": self.crepe_model,
             "f0_smooth": self.f0_smooth,
             "f0_smooth_window": self.f0_smooth_window,
             "refine_pitch": self.refine_pitch,
@@ -546,11 +554,21 @@ class TsubakiProcessor:
     # F0 提取
     # ----------------------------
     def process_audio_f0(self, audio_path: str, config: AudioProcessingConfig) -> Dict:
-        """提取 WORLD F0 基频，修复平滑与无声段处理"""
+        """提取基频 F0。
 
-        import pyworld as pw
+        支持四种方法：
+            - dio / harvest : PyWORLD（本地 DSP 算法，速度快，无额外依赖）
+            - crepe         : torchcrepe 神经网络（抗噪，需要 torch + torchcrepe）
+            - rmvpe         : RMVPE 深度模型（对人声极为鲁棒，需要 torch + 模型权重）
+
+        无论使用哪种方法，统一返回 {"success": True, "f0": ndarray, "t": ndarray, "sr": int}，
+        其中 f0 为 Hz（未发声 = 0），t 为对应时间戳（秒）。该结果可直接传入
+        _build_svp_project_text / _build_utau_project_text 写入 pitchDelta / pitd 曲线。
+        """
         import numpy as np
         import soundfile as sf
+
+        method = (config.f0_method or "dio").strip().lower()
 
         try:
             x, sr = sf.read(audio_path)
@@ -558,14 +576,36 @@ class TsubakiProcessor:
                 x = np.mean(x, axis=1)
             x = x.astype(np.float64)
 
-            # pick algorithm
-            if config.f0_method.lower()=="harvest":
+            if method == "harvest":
+                import pyworld as pw
                 f0, t = pw.harvest(
                     x, sr,
                     f0_floor=config.f0_floor, f0_ceil=config.f0_ceil,
                     frame_period=5.0
                 )
+
+            elif method == "crepe":
+                from f0_extractors import extract_f0_crepe
+                f0, t = extract_f0_crepe(
+                    x, sr,
+                    f0_floor=config.f0_floor,
+                    f0_ceil=config.f0_ceil,
+                    model_size=config.crepe_model,
+                    device=config.f0_device,
+                )
+
+            elif method == "rmvpe":
+                from f0_extractors import extract_f0_rmvpe
+                f0, t = extract_f0_rmvpe(
+                    x, sr,
+                    f0_floor=config.f0_floor,
+                    f0_ceil=config.f0_ceil,
+                    device=config.f0_device,
+                )
+
             else:
+                # 默认 / 'dio'
+                import pyworld as pw
                 _f0, t = pw.dio(
                     x, sr,
                     f0_floor=config.f0_floor, f0_ceil=config.f0_ceil,
@@ -573,31 +613,42 @@ class TsubakiProcessor:
                 )
                 f0 = pw.stonemask(x, _f0, t, sr)
 
-            # force float64
+            # 统一类型
             f0 = np.asarray(f0, dtype=np.float64)
             t  = np.asarray(t,  dtype=np.float64)
 
-            # 线性插值无声段
-            voiced_idx = np.nonzero(f0>0)[0]
-            if len(voiced_idx)>1:
-                unvoiced_idx = np.where(f0==0)[0]
-                f0[unvoiced_idx] = np.interp(
-                    unvoiced_idx, voiced_idx, f0[voiced_idx]
-                )
+            # 线性插值无声段（仅当存在足够的有声帧时）
+            voiced_idx = np.nonzero(f0 > 0)[0]
+            if len(voiced_idx) > 1:
+                unvoiced_idx = np.where(f0 == 0)[0]
+                if len(unvoiced_idx) > 0:
+                    f0[unvoiced_idx] = np.interp(
+                        unvoiced_idx, voiced_idx, f0[voiced_idx]
+                    )
 
-            # optional smoothing
-            if config.f0_smooth and len(f0)>2:
+            # 可选平滑（移动平均）
+            if config.f0_smooth and len(f0) > 2:
                 win = int(config.f0_smooth_window)
-                if win%2==0:
-                    win+=1
-                padded = np.pad(f0, win//2, mode="edge")
-                f0 = np.convolve(padded, np.ones(win)/win, mode="valid")
+                if win % 2 == 0:
+                    win += 1
+                if win > 1:
+                    padded = np.pad(f0, win // 2, mode="edge")
+                    f0 = np.convolve(padded, np.ones(win) / win, mode="valid")
 
-            return {"success":True, "f0":f0, "t":t, "sr":sr}
+            return {"success": True, "f0": f0, "t": t, "sr": sr, "method": method}
 
+        except ImportError as e:
+            logger.error(f"F0 提取失败（依赖缺失，method={method}）: {e}")
+            return {
+                "success": False,
+                "error": f"F0 方法 '{method}' 所需依赖未安装: {e}",
+            }
+        except FileNotFoundError as e:
+            logger.error(f"F0 提取失败（缺少模型权重，method={method}）: {e}")
+            return {"success": False, "error": str(e)}
         except Exception as e:
-            logger.error("F0 提取失败:"+str(e))
-            return {"success":False,"error":str(e)}
+            logger.error("F0 提取失败:" + str(e), exc_info=True)
+            return {"success": False, "error": str(e)}
 
     # ----------------------------
     # SVP 生成（完整修复版）
