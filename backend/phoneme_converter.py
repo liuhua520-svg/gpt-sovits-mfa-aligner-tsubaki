@@ -601,3 +601,221 @@ def convert_lab_file(lab_content: str, language: str = "ja") -> str:
     # Phase 3: merge '-' segments for all languages
     merged = merge_lab_silence(converted)
     return "\n".join(f"{s} {e} {p}" for s, e, p in merged)
+
+
+# ══════════════════════════════════════════════════════════════
+# Hiragana ↔ Katakana
+# ══════════════════════════════════════════════════════════════
+
+_HIRAGANA_START = 0x3041  # ぁ
+_HIRAGANA_END   = 0x3096  # ゖ
+_HIRA_TO_KATA   = 0x60   # codepoint offset to katakana block
+
+
+def hiragana_to_katakana(text: str) -> str:
+    """Convert hiragana characters to katakana (one-to-one codepoint shift)."""
+    return "".join(
+        chr(ord(c) + _HIRA_TO_KATA)
+        if _HIRAGANA_START <= ord(c) <= _HIRAGANA_END
+        else c
+        for c in text
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# Japanese merged C+V LAB builder  (合并辅音 / 平假名 / 片假名)
+# ══════════════════════════════════════════════════════════════
+
+def build_ja_merged_lab(
+    entries: list[tuple[int, int, str]],
+    output: str = "romaji",
+) -> list[tuple[int, int, str]]:
+    """
+    Merge consecutive consonant-onset + vowel segments into a single entry
+    whose time span covers *both* the consonant and the vowel.
+
+    Unlike build_ja_hiragana_lab(), which emits a '-' note for the consonant
+    and a separate note for the vowel, this function produces **one** merged
+    entry: (consonant_start, vowel_end, label).
+
+    Parameters
+    ----------
+    entries : list of (start_100ns, end_100ns, romaji_phoneme)
+              Input must already be in romaji (IPA → romaji conversion should
+              be done beforehand via convert_phoneme(ph, 'ja')).
+    output  :
+        'romaji'   → keep as merged romaji string  (e.g. 'sa', 'N', 'pu', 'ru')
+        'hiragana' → convert to hiragana            (e.g. 'さ', 'ん', 'ぷ', 'る')
+        'katakana' → convert to katakana            (e.g. 'サ', 'ン', 'プ', 'ル')
+
+    Returns
+    -------
+    list of (start_100ns, end_100ns, label)
+
+    Examples
+    --------
+    Input (romaji):
+        (50000,  1450000, 's')
+        (1450000, 2200000, 'a')
+        (2200000, 3050000, 'N')
+        (3050000, 3800000, 'p')
+        (3800000, 4750000, 'u')
+        (4750000, 5250000, 'r')
+        (5250000, 7000000, 'u')
+
+    output='romaji'   → [(50000,2200000,'sa'), (2200000,3050000,'N'),
+                          (3050000,4750000,'pu'), (4750000,7000000,'ru')]
+    output='hiragana' → [(50000,2200000,'さ'), (2200000,3050000,'ん'),
+                          (3050000,4750000,'ぷ'), (4750000,7000000,'る')]
+    output='katakana' → [(50000,2200000,'サ'), (2200000,3050000,'ン'),
+                          (3050000,4750000,'プ'), (4750000,7000000,'ル')]
+    """
+
+    def _mora_label() -> str:
+        if output == "hiragana":
+            return "ん"
+        if output == "katakana":
+            return "ン"
+        return "N"
+
+    def _cv_label(cv: str) -> str:
+        """Convert a C+V romaji string to the target script."""
+        if output in ("hiragana", "katakana"):
+            # Try full CV key first, then fall back to vowel-only
+            hira = (
+                JA_CV_TO_HIRAGANA.get(cv)
+                or JA_CV_TO_HIRAGANA.get(cv[-1:], cv)
+            )
+            return hiragana_to_katakana(hira) if output == "katakana" else hira
+        return cv  # romaji passthrough
+
+    result: list[tuple[int, int, str]] = []
+    n = len(entries)
+    # pending = (start_100ns, end_100ns, romaji_consonant) awaiting a vowel
+    pending: tuple[int, int, str] | None = None
+
+    i = 0
+    while i < n:
+        start, end, ph = entries[i]
+
+        # ── Vowel ────────────────────────────────────────────
+        if ph in JA_VOWELS:
+            if pending is not None:
+                cv = pending[2] + ph
+                # Merged entry: consonant_start → vowel_end
+                result.append((pending[0], end, _cv_label(cv)))
+                pending = None
+            else:
+                result.append((start, end, _cv_label(ph)))
+            i += 1
+            continue
+
+        # ── Hard mora nasal (N / ɴ) ── always becomes ん/ン/N ──────────
+        if ph in JA_MORA_NASAL_PHONEMES:
+            if pending is not None:
+                # Flush pending consonant without a vowel → '-'
+                result.append((pending[0], pending[1], "-"))
+                pending = None
+            result.append((start, end, _mora_label()))
+            i += 1
+            continue
+
+        # ── Ambiguous nasal (n / m / ng / ny) ────────────────────────
+        if ph in JA_AMBIGUOUS_NASALS:
+            next_ph = entries[i + 1][2] if i + 1 < n else None
+            is_mora = (next_ph is None) or (next_ph not in JA_VOWELS)
+            if is_mora:
+                if pending is not None:
+                    result.append((pending[0], pending[1], "-"))
+                    pending = None
+                result.append((start, end, _mora_label()))
+            else:
+                # Treat as consonant onset (will combine with next vowel)
+                if pending is not None:
+                    result.append((pending[0], pending[1], "-"))
+                pending = (start, end, ph)
+            i += 1
+            continue
+
+        # ── Other consonant ────────────────────────────────────────────
+        if pending is not None:
+            result.append((pending[0], pending[1], "-"))
+        pending = (start, end, ph)
+        i += 1
+
+    # Trailing consonant with no following vowel → '-'
+    if pending is not None:
+        result.append((pending[0], pending[1], "-"))
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════
+# Universal phoneme-mode transformer for LAB segment lists
+# ══════════════════════════════════════════════════════════════
+
+#: Labels treated as silence; pass through untouched by the merge algorithm.
+_MERGE_SILENCE: frozenset[str] = frozenset(
+    {"sil", "pau", "sp", "spn", "br", "silence", "noise", "ap", "blank"}
+)
+
+
+def apply_phoneme_mode(
+    segments: list[tuple[int, int, str]],
+    mode: str,
+) -> list[tuple[int, int, str]]:
+    """
+    Apply a phoneme-mode transformation to a flat list of LAB segments.
+
+    Parameters
+    ----------
+    segments : list of (start_100ns, end_100ns, label)
+               Labels are expected to be romaji phonemes (or already hiragana/
+               mixed) – no IPA-to-romaji conversion is performed here.
+    mode     :
+        'none'     → return segments unchanged
+        'merge'    → merge C+V pairs into romaji syllables (s+a → sa)
+        'hiragana' → merge C+V and convert to hiragana     (s+a → さ)
+        'katakana' → merge C+V and convert to katakana     (s+a → サ)
+
+    Returns
+    -------
+    Transformed list of (start_100ns, end_100ns, label), sorted by start time.
+
+    Notes
+    -----
+    • Silence segments (sil / pau / sp etc.) are passed through unchanged and
+      act as phrase boundaries that break the merge context.
+    • This function is designed for use in "project-only" mode where the user
+      provides a raw MFA LAB file with individual romaji phonemes for Japanese.
+    • For non-Japanese LAB files the merge algorithm may produce unexpected
+      results; use mode='none' for Chinese / English / Korean LAB files.
+    """
+    if mode == "none":
+        return list(segments)
+
+    phoneme_output = "romaji" if mode == "merge" else mode
+
+    # Split on silence boundaries, process each phoneme run with
+    # build_ja_merged_lab(), then reassemble with silence in place.
+    result: list[tuple[int, int, str]] = []
+    phoneme_buf: list[tuple[int, int, str]] = []
+
+    def _flush() -> None:
+        if phoneme_buf:
+            merged = build_ja_merged_lab(phoneme_buf, output=phoneme_output)
+            result.extend(merged)
+            phoneme_buf.clear()
+
+    for seg in segments:
+        label = seg[2]
+        if label.strip().lower() in _MERGE_SILENCE:
+            _flush()
+            result.append(seg)
+        else:
+            phoneme_buf.append(seg)
+
+    _flush()
+
+    result.sort(key=lambda x: x[0])
+    return result

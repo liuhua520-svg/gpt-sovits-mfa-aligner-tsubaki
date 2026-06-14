@@ -1072,6 +1072,7 @@ class TsubakiProcessor:
         project_title: str = "Project",
         config: Optional[AudioProcessingConfig] = None,
         audio_f0_data: Optional[Dict] = None,
+        phoneme_mode: str = "none",
     ) -> Dict:
         """完整工程文件生成入口：读取 WAV + LAB，生成 SVP / USTX 文件。"""
         try:
@@ -1086,6 +1087,34 @@ class TsubakiProcessor:
 
             segments          = self._load_lab_segments(lab_path)
             audio_duration_sec = self._read_audio_duration_sec(wav_path)
+
+            # ── 音素转换模式 (project-only 专用) ──────────────────────────────
+            # 在将 LAB 段落写入工程文件之前，可选地把独立的辅音+元音对合并为
+            # 音节级标签：
+            #   'none'     → 不转换，保持原始 LAB 标签（默认）
+            #   'merge'    → 合并辅音，如 s + a → sa
+            #   'hiragana' → 合并后转平假名，如 s + a → さ，N → ん
+            #   'katakana' → 合并后转片假名，如 s + a → サ，N → ン
+            if phoneme_mode and phoneme_mode != "none":
+                try:
+                    from phoneme_converter import apply_phoneme_mode
+                    seg_tuples = [
+                        (s.start_time, s.end_time, s.label) for s in segments
+                    ]
+                    converted = apply_phoneme_mode(seg_tuples, phoneme_mode)
+                    segments = [
+                        LabelSegment(start_time=t[0], end_time=t[1], label=t[2])
+                        for t in converted
+                    ]
+                    logger.info(
+                        f"音素转换完成 (mode={phoneme_mode}): "
+                        f"{len(segments)} 个音节段落"
+                    )
+                except Exception as _pm_err:
+                    logger.warning(
+                        f"音素转换失败 (mode={phoneme_mode}): {_pm_err}，"
+                        f"回退到原始音素"
+                    )
 
             f0, t, sr = None, None, None
             if audio_f0_data and audio_f0_data.get("success"):

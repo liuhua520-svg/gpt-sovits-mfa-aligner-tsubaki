@@ -608,6 +608,12 @@ def pipeline_project_only():
         # 是否导出音高线到工程文件
         export_pitch_line = request.form.get("export_pitch_line", "false").lower() == "true"
 
+        # 音素转换模式: none / merge / hiragana / katakana
+        phoneme_mode = request.form.get("phoneme_mode", "none")
+        if phoneme_mode not in ("none", "merge", "hiragana", "katakana"):
+            logger.warning(f"未知 phoneme_mode '{phoneme_mode}'，回退到 'none'")
+            phoneme_mode = "none"
+
         # 兼容两种输入：
         # 1) 前端上传文件：wav_file + lab_file
         # 2) 已有路径：wav_path + lab_path
@@ -663,6 +669,7 @@ def pipeline_project_only():
             export_pitch_line=export_pitch_line,
             f0_device=f0_device,
             crepe_model=crepe_model,
+            phoneme_mode=phoneme_mode,
         )
 
         if result.get("success"):

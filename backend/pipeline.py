@@ -229,6 +229,7 @@ class AudioProcessingPipeline:
         export_pitch_line: bool = True,
         f0_device: str = "auto",
         crepe_model: str = "full",
+        phoneme_mode: str = "none",
     ) -> Dict:
         """仅执行工程文件生成（已有 WAV 和 LAB）"""
         import time
@@ -272,6 +273,7 @@ class AudioProcessingPipeline:
                 project_title=project_title,
                 config=config,
                 audio_f0_data=audio_data,
+                phoneme_mode=phoneme_mode,
             )
 
             result["processing_time"] = int((time.time() - start_time) * 1000)
