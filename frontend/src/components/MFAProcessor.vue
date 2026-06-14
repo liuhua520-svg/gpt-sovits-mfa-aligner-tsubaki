@@ -118,6 +118,34 @@
           </el-select>
         </el-form-item>
 
+        <el-form-item v-if="processingMode === 'project-only'" label="音素转换">
+          <el-radio-group v-model="formData.phonemeMode">
+            <el-radio value="none">不转换</el-radio>
+            <el-radio value="merge">合并辅音</el-radio>
+            <el-radio value="hiragana">平假名</el-radio>
+            <el-radio value="katakana">片假名</el-radio>
+          </el-radio-group>
+          <div class="help-text">
+            <small v-if="formData.phonemeMode === 'none'">
+              保持 LAB 中的原始音素标签不变（适用于所有语言）
+            </small>
+            <small v-else-if="formData.phonemeMode === 'merge'">
+              将辅音与后续元音合并为罗马字音节（s + a → sa，N → N，p + u → pu）
+            </small>
+            <small v-else-if="formData.phonemeMode === 'hiragana'">
+              合并辅音+元音并转换为平假名（s + a → さ，N → ん，p + u → ぷ）
+            </small>
+            <small v-else>
+              合并辅音+元音并转换为片假名（s + a → サ，N → ン，p + u → プ）
+            </small>
+          </div>
+          <div class="help-text" style="margin-top:4px">
+            <small style="color:#909399">
+              ⚠ 合并/假名转换适用于含逐个音素的日语 LAB 文件（如原始 MFA 输出）
+            </small>
+          </div>
+        </el-form-item>
+
         <el-form-item v-if="processingMode === 'full' || processingMode === 'project-only'" label="音轨名">
           <el-input
             v-model="formData.projectTitle"
@@ -552,6 +580,7 @@ interface FormData {
   language: string
   outputFormat: string
   projectTitle: string
+  phonemeMode: 'none' | 'merge' | 'hiragana' | 'katakana'
 }
 
 interface AdvancedConfig {
@@ -605,7 +634,8 @@ const formData = ref<FormData>({
   text: '',
   language: 'cmn',
   outputFormat: 'sv',
-  projectTitle: 'Project'
+  projectTitle: 'Project',
+  phonemeMode: 'none'
 })
 
 const advancedConfig = ref<AdvancedConfig>({
@@ -898,6 +928,7 @@ const processAudio = async () => {
       formDataObj.append('lab_file', formData.value.labFile)
       formDataObj.append('format', formData.value.outputFormat)
       formDataObj.append('title', formData.value.projectTitle)
+      formDataObj.append('phoneme_mode', formData.value.phonemeMode)
       formDataObj.append('bpm', advancedConfig.value.bpm.toString())
       formDataObj.append('base_pitch', advancedConfig.value.base_pitch.toString())
       formDataObj.append('f0_method', advancedConfig.value.f0_method)
@@ -1103,7 +1134,8 @@ const reset = () => {
     text: '',
     language: 'cmn',
     outputFormat: 'sv',
-    projectTitle: 'Project'
+    projectTitle: 'Project',
+    phonemeMode: 'none'
   }
   result.value = null
   error.value = ''
