@@ -195,6 +195,39 @@
                       <span>Harvest (精确)</span>
                       <el-icon class="icon-tip"><InfoFilled /></el-icon>
                     </el-radio>
+                    <el-radio label="crepe" :disabled="systemStatus.audio_processing?.f0_backends?.crepe?.available === false">
+                      <span>CREPE (神经网络，抗噪)</span>
+                      <el-icon class="icon-tip"><InfoFilled /></el-icon>
+                    </el-radio>
+                    <el-radio label="rmvpe" :disabled="systemStatus.audio_processing?.f0_backends?.rmvpe?.available === false">
+                      <span>RMVPE (深度模型，最鲁棒)</span>
+                      <el-icon class="icon-tip"><InfoFilled /></el-icon>
+                    </el-radio>
+                  </el-radio-group>
+                  <p v-if="advancedConfig.f0_method === 'crepe' && systemStatus.audio_processing?.f0_backends?.crepe?.available === false" class="help-text">
+                    ⚠ 未检测到 torch / torchcrepe，请先安装依赖
+                  </p>
+                  <p v-if="advancedConfig.f0_method === 'rmvpe' && systemStatus.audio_processing?.f0_backends?.rmvpe?.available === false" class="help-text">
+                    ⚠ 未检测到 RMVPE 模型权重，请下载 rmvpe.pt 并放入 models/rmvpe/ 目录
+                  </p>
+                </el-form-item>
+              </el-col>
+
+              <el-col v-if="advancedConfig.f0_method === 'crepe'" :xs="24" :sm="12">
+                <el-form-item label="CREPE 模型规格">
+                  <el-radio-group v-model="advancedConfig.crepe_model">
+                    <el-radio label="full">Full (精度高)</el-radio>
+                    <el-radio label="tiny">Tiny (速度快)</el-radio>
+                  </el-radio-group>
+                </el-form-item>
+              </el-col>
+
+              <el-col v-if="advancedConfig.f0_method === 'crepe' || advancedConfig.f0_method === 'rmvpe'" :xs="24" :sm="12">
+                <el-form-item label="运行设备">
+                  <el-radio-group v-model="advancedConfig.f0_device">
+                    <el-radio label="auto">自动 (优先 GPU)</el-radio>
+                    <el-radio label="cpu">CPU</el-radio>
+                    <el-radio label="cuda">CUDA (GPU)</el-radio>
                   </el-radio-group>
                 </el-form-item>
               </el-col>
@@ -264,7 +297,8 @@
               <p><strong>基准音高:</strong> 工程文件的默认基准音（60 = C4）</p>
               <p><strong>自动音符音高:</strong> 音符块将自动放置在音频识别出的实际 MIDI 键位上</p>
               <p><strong>导出连续音高:</strong> 是否将精细的基频起伏数据（F0）以参数线形式导入到工程底部</p>
-              <p><strong>DIO vs Harvest:</strong> DIO 快速但可能不够精确；Harvest 慢但更精确</p>
+              <p><strong>DIO / Harvest / CREPE / RMVPE：</strong>DIO 最快但偶有跳音；Harvest 更精确但稍慢；CREPE 基于神经网络，对噪声/伴奏有较强鲁棒性；RMVPE 是目前对人声最鲁棒的深度模型，推荐在条件允许时优先使用（CREPE/RMVPE 需要 torch，RMVPE 还需额外下载模型权重）</p>
+              <p><strong>运行设备：</strong>CREPE/RMVPE 可选择 CPU 或 CUDA(GPU)，GPU 可大幅加速；"自动"会在检测到可用 GPU 时优先使用</p>
               <p><strong>F0 范围:</strong> 女声通常 150-300Hz，男声 80-150Hz，根据需要调整</p>
             </el-alert>
           </el-collapse-item>
@@ -351,7 +385,9 @@
                     <li>基准音高: {{ midiNoteToName(result.config.base_pitch) }} (MIDI {{ result.config.base_pitch }})</li>
                     <li>自动音符音高: {{ result.config.auto_note_pitch ? '已启用' : '已禁用' }}</li>
                     <li>导出连续音高: {{ result.config.export_pitch_line ? '已启用' : '已禁用' }}</li>
-                    <li>F0 方法: {{ result.config.f0_method }}</li>
+                    <li>F0 方法: {{ result.config.f0_method?.toUpperCase?.() || result.config.f0_method }}</li>
+                    <li v-if="result.config.f0_method === 'crepe'">CREPE 模型: {{ result.config.crepe_model }}</li>
+                    <li v-if="result.config.f0_method === 'crepe' || result.config.f0_method === 'rmvpe'">运行设备: {{ result.config.f0_device }}</li>
                     <li>精度: {{ result.config.use_double_precision ? '双精度 (Float64)' : '单精度 (Float32)' }}</li>
                   </ul>
                 </el-col>
@@ -457,7 +493,23 @@
                   :type="systemStatus.audio_processing?.pyworld_available ? 'success' : 'warning'" 
                   size="small"
                 >
-                  PyWORLD (F0提取): {{ systemStatus.audio_processing?.pyworld_available ? '✓' : '✗' }}
+                  PyWORLD (DIO/Harvest): {{ systemStatus.audio_processing?.pyworld_available ? '✓' : '✗' }}
+                </el-tag>
+              </div>
+              <div class="model-item">
+                <el-tag
+                  :type="systemStatus.audio_processing?.f0_backends?.crepe?.available ? 'success' : 'info'"
+                  size="small"
+                >
+                  CREPE: {{ systemStatus.audio_processing?.f0_backends?.crepe?.available ? '✓' : '✗' }}
+                </el-tag>
+              </div>
+              <div class="model-item">
+                <el-tag
+                  :type="systemStatus.audio_processing?.f0_backends?.rmvpe?.available ? 'success' : 'info'"
+                  size="small"
+                >
+                  RMVPE: {{ systemStatus.audio_processing?.f0_backends?.rmvpe?.available ? '✓' : '✗' }}
                 </el-tag>
               </div>
             </div>
@@ -507,12 +559,23 @@ interface AdvancedConfig {
   base_pitch: number
   auto_note_pitch: boolean
   export_pitch_line: boolean
-  f0_method: 'dio' | 'harvest'
+  f0_method: 'dio' | 'harvest' | 'crepe' | 'rmvpe'
+  f0_device: 'auto' | 'cpu' | 'cuda'
+  crepe_model: 'full' | 'tiny'
   precision: 'single' | 'double'
   f0_smooth: boolean
   f0_smooth_window: number
   f0_floor: number
   f0_ceil: number
+}
+
+interface F0BackendStatus {
+  available: boolean
+  torch?: boolean
+  torchcrepe?: boolean
+  cuda?: boolean
+  model_path?: string
+  model_found?: boolean
 }
 
 interface SystemStatus {
@@ -524,6 +587,12 @@ interface SystemStatus {
   audio_processing?: {
     pyworld_available: boolean
     supported_formats: string[]
+    f0_backends?: {
+      dio?: F0BackendStatus
+      harvest?: F0BackendStatus
+      crepe?: F0BackendStatus
+      rmvpe?: F0BackendStatus
+    }
   }
 }
 
@@ -545,6 +614,8 @@ const advancedConfig = ref<AdvancedConfig>({
   auto_note_pitch: true,
   export_pitch_line: true,
   f0_method: 'dio',
+  f0_device: 'auto',
+  crepe_model: 'full',
   precision: 'double',
   f0_smooth: true,
   f0_smooth_window: 5,
@@ -568,7 +639,13 @@ const systemStatus = ref<SystemStatus>({
   },
   audio_processing: {
     pyworld_available: false,
-    supported_formats: []
+    supported_formats: [],
+    f0_backends: {
+      dio: { available: true },
+      harvest: { available: true },
+      crepe: { available: false },
+      rmvpe: { available: false }
+    }
   }
 })
 
@@ -673,6 +750,8 @@ const normalizeResult = (payload: any) => {
       auto_note_pitch: advancedConfig.value.auto_note_pitch,
       export_pitch_line: advancedConfig.value.export_pitch_line,
       f0_method: advancedConfig.value.f0_method,
+      f0_device: advancedConfig.value.f0_device,
+      crepe_model: advancedConfig.value.crepe_model,
       use_double_precision: advancedConfig.value.precision === 'double'
     }
   }
@@ -822,6 +901,8 @@ const processAudio = async () => {
       formDataObj.append('bpm', advancedConfig.value.bpm.toString())
       formDataObj.append('base_pitch', advancedConfig.value.base_pitch.toString())
       formDataObj.append('f0_method', advancedConfig.value.f0_method)
+      formDataObj.append('f0_device', advancedConfig.value.f0_device)
+      formDataObj.append('crepe_model', advancedConfig.value.crepe_model)
       formDataObj.append('f0_smooth', advancedConfig.value.f0_smooth.toString())
       formDataObj.append('f0_smooth_window', advancedConfig.value.f0_smooth_window.toString())
       formDataObj.append('precision', advancedConfig.value.precision)
@@ -905,6 +986,8 @@ const processAudio = async () => {
       formDataObj.append('bpm', advancedConfig.value.bpm.toString())
       formDataObj.append('base_pitch', advancedConfig.value.base_pitch.toString())
       formDataObj.append('f0_method', advancedConfig.value.f0_method)
+      formDataObj.append('f0_device', advancedConfig.value.f0_device)
+      formDataObj.append('crepe_model', advancedConfig.value.crepe_model)
       formDataObj.append('f0_smooth', advancedConfig.value.f0_smooth.toString())
       formDataObj.append('f0_smooth_window', advancedConfig.value.f0_smooth_window.toString())
       formDataObj.append('precision', advancedConfig.value.precision)
