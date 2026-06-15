@@ -1,0 +1,94 @@
+# THIRD_PARTY_NOTICES
+
+This repository includes third-party software and data packages in addition to the project source code.
+
+Project source code:
+- Repository: `liuhua520-svg/gpt-sovits-mfa-aligner-tsubaki`
+- Upstream project license: MIT
+- Keep the project `LICENSE` file in the distribution.
+
+The dependency list below is based on the direct dependencies declared in:
+- `backend/requirements.txt`
+- `frontend/package.json`
+
+If you redistribute a packaged build or binary bundle, keep this notice together with the project license and any upstream notices required by the listed dependencies.
+
+---
+
+## 1. Project license
+
+The project itself is licensed under the MIT License.
+
+Copyright (c) 2026 xiaohuang12345-ts
+
+See the repository `LICENSE` file for the full text of the MIT License.
+
+---
+
+## 2. Third-party dependencies
+
+### 2.1 Python backend dependencies
+
+#### MIT License
+- flask-cors
+- montreal-forced-aligner
+- pypinyin
+- textgrid
+- pycantonese
+- pyworld
+- torchcrepe
+
+#### BSD 3-Clause / BSD-style
+- Flask
+- soundfile
+- numpy
+- torch
+
+#### Apache License 2.0
+- sudachipy
+- sudachidict-core
+- jamo
+
+#### ISC License
+- librosa
+
+#### Notes
+- `pycantonese` includes separately licensed corpus/data resources. Those data resources are not all under the same license as the Python package itself.
+- `sudachidict-core` provides dictionary data; keep the upstream dictionary notices together with any redistributed package data.
+- `torch` and `librosa` are listed as backend dependencies and may pull in additional transitive dependencies in your environment.
+
+---
+
+### 2.2 Frontend dependencies
+
+#### MIT License
+- vue
+- element-plus
+- @element-plus/icons-vue
+- axios
+- @vitejs/plugin-vue
+- @vue/tsconfig
+- vite
+- vue-tsc
+- terser
+
+#### Other notes
+- `typescript` is included as a frontend development dependency and should be treated according to the license stated by its upstream package metadata in the version you ship.
+- If you redistribute a production bundle generated from the frontend, keep the license notices for all bundled dependencies that your build toolchain emits.
+
+---
+
+## 3. Suggested distribution package contents
+
+When shipping this project, include at least:
+
+- `LICENSE`
+- `THIRD_PARTY_NOTICES.md`
+- any upstream license files required by your packaging process
+- any additional notices for bundled fonts, models, corpora, or dictionary data if they are redistributed
+
+---
+
+## 4. Verification note
+
+This notice file is intended for the direct dependencies declared in the repository manifests at the time of review. If you change dependency versions or add new packages, review the new package metadata and update this file accordingly.
