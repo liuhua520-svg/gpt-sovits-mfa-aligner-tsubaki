@@ -174,7 +174,7 @@
                   <div class="pitch-input-group">
                     <el-input-number
                       v-model="advancedConfig.base_pitch"
-                      :min="21"
+                      :min="12"
                       :max="108"
                       :step="1"
                       controls-position="right"
@@ -762,7 +762,19 @@ const updateProcessingStep = (index: number, status: string, message: string) =>
 }
 
 const extractProjectPath = (payload: any): string => {
-  return payload?.project_file || payload?.projectPath || payload?.project_path || payload?.svp_path || payload?.ustx_path || ''
+  return payload?.project_file || payload?.projectPath || payload?.project_path || payload?.output_path || payload?.svp_path || payload?.ustx_path || ''
+}
+
+const SIL_PHONES = new Set(['sp', 'spn', 'sil', 'silence', 'pau', 'breath', 'noise', 'ap', 'blank'])
+
+// 统计 LAB 文件中的非静音标注段数
+const countLabSegments = (labContent: string): number => {
+  if (!labContent) return 0
+  return labContent.trim().split('\n').filter(line => {
+    const parts = line.trim().split(/\s+/)
+    const phone = (parts[2] || '').toLowerCase()
+    return phone && !SIL_PHONES.has(phone)
+  }).length
 }
 
 const normalizeResult = (payload: any) => {
@@ -787,7 +799,7 @@ const normalizeResult = (payload: any) => {
   }
 }
 
-// 异步任务轮询
+// 异步任务轮询（通用版，不含模式相关的步骤更新）
 const waitForJobFinished = (jobId: string): Promise<any> => {
   clearJobPolling()
   currentJobId.value = jobId
@@ -804,29 +816,13 @@ const waitForJobFinished = (jobId: string): Promise<any> => {
 
         const job = data.job || {}
 
-        if (job.status === 'queued') {
-          updateProcessingStep(0, '等待', '任务已提交，等待后台执行')
-          updateProcessingStep(1, '等待', '等待 F0 提取')
-          updateProcessingStep(2, '等待', '等待工程文件生成')
-        } else if (job.status === 'running') {
-          updateProcessingStep(0, '进行中', 'MFA / 后续处理正在执行...')
-        } else if (job.status === 'done') {
-          const payload = job.result || job
-          const projectPath = extractProjectPath(payload)
-
-          if (!projectPath && processingMode.value === 'full') {
-            throw new Error('任务已完成，但未找到工程文件输出')
-          }
-
-          updateProcessingStep(0, '完成', 'MFA 已完成')
-          updateProcessingStep(1, '完成', 'F0 提取已完成')
-          updateProcessingStep(2, '完成', `工程文件已生成: ${getFileName(projectPath)}`)
-
-          resolve(payload)
+        if (job.status === 'done') {
+          resolve(job.result || job)
           return
         } else if (job.status === 'failed') {
           throw new Error(job.error || '处理失败')
         }
+        // queued / running: 继续轮询
 
         jobPollTimer = window.setTimeout(tick, 1500)
       } catch (e) {
@@ -861,7 +857,7 @@ const refreshStatus = async () => {
 }
 
 const openGitHub = () => {
-  window.open('https://github.com/liuhua520-svg/gpt-sovits-mfa-aligner', '_blank')
+  window.open('https://github.com/liuhua520-svg/SVS-Lab-Aligner', '_blank')
 }
 
 const handleExceed = () => {
@@ -916,9 +912,9 @@ const processAudio = async () => {
     result.value = null
     currentJobId.value = ''
     resetProcessingSteps()
-    updateProcessingStep(0, '完成', '工程文件模式：已跳过 MFA 自动标注')
-    updateProcessingStep(1, '进行中', '准备生成工程文件...')
-    updateProcessingStep(2, '等待', '等待开始工程文件生成')
+    updateProcessingStep(0, '跳过', '工程文件模式：已跳过 MFA 自动标注')
+    updateProcessingStep(1, '进行中', 'F0 提取 + 工程文件生成中，请耐心等待...')
+    updateProcessingStep(2, '等待', '等待工程文件生成')
 
     let progressTimer: number | null = null
 
@@ -943,7 +939,7 @@ const processAudio = async () => {
       formDataObj.append('export_pitch_line', advancedConfig.value.export_pitch_line.toString())
 
       progressTimer = window.setInterval(() => {
-        if (progressPercent.value < 90) progressPercent.value += 3
+        if (progressPercent.value < 30) progressPercent.value += 3
       }, 400)
 
       const res = await fetch('/api/pipeline/project-only', {
@@ -954,9 +950,28 @@ const processAudio = async () => {
 
       if (!res.ok) throw new Error(data.error || '提交失败')
 
-      const normalized = normalizeResult(data)
-      if (!data.success) throw new Error(data.error || '工程文件生成失败')
+      // 异步任务轮询（后端返回 job_id）
+      if (data.job_id) {
+        if (progressTimer !== null) { window.clearInterval(progressTimer); progressTimer = null }
+        progressPercent.value = 35
 
+        const finalPayload = await waitForJobFinished(data.job_id)
+        const normalized = normalizeResult(finalPayload)
+
+        if (!normalized.projectPath) throw new Error('工程文件未生成，无法视为处理成功')
+
+        result.value = normalized
+        progressPercent.value = 100
+        updateProcessingStep(0, '跳过', '工程文件模式不需要 MFA 标注')
+        updateProcessingStep(1, '完成', 'F0 提取已完成')
+        updateProcessingStep(2, '完成', `工程文件已生成: ${getFileName(normalized.projectPath)}`)
+        ElMessage.success('✅ 工程文件生成成功！')
+        return
+      }
+
+      // 向下兼容：同步结果回退（后端仍为同步时生效）
+      if (!data.success) throw new Error(data.error || '工程文件生成失败')
+      const normalized = normalizeResult(data)
       result.value = normalized
       progressPercent.value = 100
       updateProcessingStep(0, '跳过', '工程文件模式不需要 MFA 标注')
@@ -966,11 +981,11 @@ const processAudio = async () => {
     } catch (e: any) {
       error.value = e?.message || String(e)
       ElMessage.error(`❌ ${error.value}`)
-    } {{
+    } finally {
       if (progressTimer !== null) window.clearInterval(progressTimer)
       clearJobPolling()
       processing.value = false
-    }}
+    }
     return
   }
 
@@ -1029,7 +1044,7 @@ const processAudio = async () => {
     }
 
     progressTimer = window.setInterval(() => {
-      if (progressPercent.value < 90) progressPercent.value += 3
+      if (progressPercent.value < 30) progressPercent.value += 3
     }, 400)
 
     const endpoint = processingMode.value === 'full' ? '/api/pipeline/full' : '/api/pipeline/mfa-only'
@@ -1038,20 +1053,51 @@ const processAudio = async () => {
 
     if (!res.ok) throw new Error(data.error || '提交失败')
 
-    if (processingMode.value === 'full') {
-      if (data.job_id) {
-        progressPercent.value = 92
-        const finalPayload = await waitForJobFinished(data.job_id)
-        const normalized = normalizeResult(finalPayload)
-        if (!normalized.projectPath) throw new Error('工程文件未生成，无法视为处理成功')
-        result.value = normalized
-        progressPercent.value = 100
-        ElMessage.success('✅ 处理成功！')
-        return
+    // full 和 mfa-only 均走异步轮询（后端返回 job_id）
+    if (data.job_id) {
+      if (progressTimer !== null) { window.clearInterval(progressTimer); progressTimer = null }
+      progressPercent.value = 35
+
+      if (processingMode.value === 'mfa-only') {
+        updateProcessingStep(0, '进行中', 'MFA 自动标注中，请耐心等待...')
+        updateProcessingStep(1, '等待', '仅标注模式将跳过此步骤')
+        updateProcessingStep(2, '等待', '仅标注模式将跳过此步骤')
+      } else {
+        updateProcessingStep(0, '进行中', 'MFA 标注 + F0 提取 + 工程文件生成中...')
+        updateProcessingStep(1, '等待', '等待 F0 提取')
+        updateProcessingStep(2, '等待', '等待工程文件生成')
       }
 
+      const finalPayload = await waitForJobFinished(data.job_id)
+      const normalized = normalizeResult(finalPayload)
+
+      if (processingMode.value === 'full') {
+        if (!normalized.projectPath) throw new Error('工程文件未生成，无法视为处理成功')
+        updateProcessingStep(0, '完成', 'MFA 已完成')
+        updateProcessingStep(1, '完成', 'F0 提取已完成')
+        updateProcessingStep(2, '完成', `工程文件已生成: ${getFileName(normalized.projectPath)}`)
+      } else {
+        // mfa-only
+        if (!normalized.labContent) throw new Error('LAB 内容为空，MFA 处理失败')
+        const segCount = countLabSegments(normalized.labContent)
+        updateProcessingStep(0, '完成', `${segCount} 个标注段`)
+        updateProcessingStep(1, '跳过', '仅标注模式未执行 F0 提取')
+        updateProcessingStep(2, '跳过', '仅标注模式未生成工程文件')
+      }
+
+      result.value = normalized
+      progressPercent.value = 100
+      ElMessage.success('✅ 处理成功！')
+      return
+    }
+
+    // 向下兼容：full 模式同步结果回退
+    if (processingMode.value === 'full') {
       const normalized = normalizeResult(data)
       if (data.success && normalized.projectPath) {
+        updateProcessingStep(0, '完成', 'MFA 已完成')
+        updateProcessingStep(1, '完成', 'F0 提取已完成')
+        updateProcessingStep(2, '完成', `工程文件已生成: ${getFileName(normalized.projectPath)}`)
         result.value = normalized
         progressPercent.value = 100
         ElMessage.success('✅ 处理成功！')
@@ -1060,12 +1106,14 @@ const processAudio = async () => {
       throw new Error(data.error || '工程文件未生成，无法视为处理成功')
     }
 
-    // 仅标注模式
+    // mfa-only 同步回退（后端已异步，此分支仅做兼容保留）
     if (!data.success) throw new Error(data.error || 'MFA 处理失败')
     const normalized = normalizeResult(data)
+    if (!normalized.labContent) throw new Error('LAB 内容为空，MFA 处理失败')
+    const segCount = countLabSegments(normalized.labContent)
     result.value = normalized
     progressPercent.value = 100
-    updateProcessingStep(0, '完成', `${data.segments || '?'} 个标注段`)
+    updateProcessingStep(0, '完成', `${segCount} 个标注段`)
     updateProcessingStep(1, '跳过', '仅标注模式未执行 F0 提取')
     updateProcessingStep(2, '跳过', '仅标注模式未生成工程文件')
     ElMessage.success('✅ 处理成功！')
