@@ -579,13 +579,91 @@ def pipeline_mfa_only():
         return jsonify({"error": str(e)}), 500
 
 
+def run_project_only_job(
+    job_id: str,
+    wav_path: str,
+    lab_path: str,
+    output_format: str,
+    project_title: str,
+    bpm: float,
+    base_pitch: int,
+    f0_method: str,
+    f0_smooth: bool,
+    f0_smooth_window: int,
+    use_double_precision: bool,
+    f0_floor: float,
+    f0_ceil: float,
+    refine_pitch: bool,
+    export_pitch_line: bool,
+    f0_device: str,
+    crepe_model: str,
+    phoneme_mode: str,
+):
+    try:
+        set_job(
+            job_id,
+            status="running",
+            started_at=datetime.now().isoformat(),
+        )
+
+        result = pipeline.process_project_only(
+            wav_path=wav_path,
+            lab_path=lab_path,
+            output_format=output_format,
+            project_title=project_title,
+            bpm=bpm,
+            base_pitch=base_pitch,
+            f0_method=f0_method,
+            f0_smooth=f0_smooth,
+            f0_smooth_window=f0_smooth_window,
+            use_double_precision=use_double_precision,
+            f0_floor=f0_floor,
+            f0_ceil=f0_ceil,
+            refine_pitch=refine_pitch,
+            export_pitch_line=export_pitch_line,
+            f0_device=f0_device,
+            crepe_model=crepe_model,
+            phoneme_mode=phoneme_mode,
+        )
+
+        if result.get("success"):
+            # 统一补齐前端常见字段
+            result.setdefault("project_path", result.get("project_path") or result.get("output_path"))
+            result.setdefault("project_format", result.get("project_format", output_format))
+            result.setdefault("requested_format", output_format)
+            result.setdefault("project_title", project_title)
+            set_job(
+                job_id,
+                status="done",
+                finished_at=datetime.now().isoformat(),
+                result=result,
+            )
+        else:
+            set_job(
+                job_id,
+                status="failed",
+                finished_at=datetime.now().isoformat(),
+                error=result.get("error", "工程生成失败"),
+                result=result,
+            )
+
+    except Exception as e:
+        logger.exception("后台工程文件任务异常")
+        set_job(
+            job_id,
+            status="failed",
+            finished_at=datetime.now().isoformat(),
+            error=str(e),
+        )
+
+
 @app.route("/api/pipeline/project-only", methods=["POST"])
 def pipeline_project_only():
     """
-    仅执行工程文件生成：
+    仅执行工程文件生成（异步后台任务版）：
     - 只需要 WAV + LAB
     - 不需要 text
-    - 继续复用 pipeline.process_project_only(...)
+    - 立即返回 job_id，前端轮询 /api/pipeline/job/<job_id>
     """
     try:
         # 读取工程参数
@@ -648,43 +726,47 @@ def pipeline_project_only():
             return jsonify({"error": f"LAB 文件不存在: {lab_path}"}), 400
 
         logger.info(
-            "工程文件模式启动: format=%s wav=%s lab=%s",
+            "工程文件模式启动 (异步): format=%s wav=%s lab=%s",
             output_format, wav_path, lab_path
         )
 
-        result = pipeline.process_project_only(
-            wav_path=wav_path,
-            lab_path=lab_path,
-            output_format=output_format,
-            project_title=project_title,
-            bpm=bpm,
-            base_pitch=base_pitch,
-            f0_method=f0_method,
-            f0_smooth=f0_smooth,
-            f0_smooth_window=f0_smooth_window,
-            use_double_precision=use_double_precision,
-            f0_floor=f0_floor,
-            f0_ceil=f0_ceil,
-            refine_pitch=refine_pitch,
-            export_pitch_line=export_pitch_line,
-            f0_device=f0_device,
-            crepe_model=crepe_model,
-            phoneme_mode=phoneme_mode,
+        job_id = uuid.uuid4().hex
+        set_job(
+            job_id,
+            status="queued",
+            created_at=datetime.now().isoformat(),
         )
 
-        if result.get("success"):
-            # 统一补齐前端常见字段，方便直接显示
-            result.setdefault("project_path", result.get("project_path") or result.get("output_path"))
-            result.setdefault("project_format", result.get("project_format", output_format))
-            result.setdefault("requested_format", output_format)
-            result.setdefault("project_title", project_title)
-            return jsonify(result), 200
+        Thread(
+            target=run_project_only_job,
+            daemon=True,
+            args=(
+                job_id,
+                wav_path,
+                lab_path,
+                output_format,
+                project_title,
+                bpm,
+                base_pitch,
+                f0_method,
+                f0_smooth,
+                f0_smooth_window,
+                use_double_precision,
+                f0_floor,
+                f0_ceil,
+                refine_pitch,
+                export_pitch_line,
+                f0_device,
+                crepe_model,
+                phoneme_mode,
+            ),
+        ).start()
 
         return jsonify({
-            "success": False,
-            "error": result.get("error", "工程生成失败"),
-            "processing_time": result.get("processing_time", 0),
-        }), 500
+            "success": True,
+            "job_id": job_id,
+            "status": "queued",
+        }), 202
 
     except Exception as e:
         logger.error("工程文件生成异常: %s", e, exc_info=True)

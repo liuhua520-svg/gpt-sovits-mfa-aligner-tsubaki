@@ -49,6 +49,13 @@ JA_IPA_TO_ROMAJI: dict[str, str] = {
     "i̥":  "i",   # U+0069 + U+0325  清i
     "ɨ̥":  "u",   # U+0268 + U+0325  清中央元音
 
+    # ── 无声化元音 MFA ASCII 记号 ────────────────────────────
+    # MFA japanese_mfa 模型在 TextGrid / LAB 中以大写字母标注无声化
+    # (devoiced) 元音；需映射到对应小写罗马字，以便后续平假名转换正确。
+    # 例：sh + I → shi → し，s + U → su → す
+    "I":  "i",   # 无声化 /i/ (し・ち・に・き・ひ 等)
+    "U":  "u",   # 无声化 /u/ (す・つ・く・ふ 等)
+
     # ── 塞音 (Stops) ──────────────────────────────────────────
     "p":  "p",   "b":  "b",
     "t":  "t",   "d":  "d",
@@ -447,15 +454,16 @@ def build_ja_hiragana_lab(
         start, end, ph = entries[i]
 
         # ── Vowel ────────────────────────────────────────────
-        if ph in JA_VOWELS:
+        if ph.lower() in JA_VOWELS:
+            ph_v = ph.lower()   # normalize devoiced I → i, U → u
             if pending is not None:
-                cv = pending[2] + ph
-                hiragana = JA_CV_TO_HIRAGANA.get(cv) or JA_CV_TO_HIRAGANA.get(ph, ph)
+                cv = pending[2] + ph_v
+                hiragana = JA_CV_TO_HIRAGANA.get(cv) or JA_CV_TO_HIRAGANA.get(ph_v, ph)
                 # consonant segment → '-'
                 result.append((pending[0], pending[1], "-"))
                 pending = None
             else:
-                hiragana = JA_CV_TO_HIRAGANA.get(ph, ph)
+                hiragana = JA_CV_TO_HIRAGANA.get(ph_v, ph)
             result.append((start, end, hiragana))
             i += 1
             continue
@@ -471,7 +479,7 @@ def build_ja_hiragana_lab(
         if ph in JA_AMBIGUOUS_NASALS:
             # Look ahead: if followed by a vowel, treat as consonant onset
             next_ph = entries[i + 1][2] if i + 1 < n else None
-            is_mora = (next_ph is None) or (next_ph not in JA_VOWELS)
+            is_mora = (next_ph is None) or (next_ph.lower() not in JA_VOWELS)
             if is_mora:
                 flush_pending_as_dash()
                 result.append((start, end, "ん"))
@@ -699,14 +707,15 @@ def build_ja_merged_lab(
         start, end, ph = entries[i]
 
         # ── Vowel ────────────────────────────────────────────
-        if ph in JA_VOWELS:
+        if ph.lower() in JA_VOWELS:
+            ph_v = ph.lower()   # normalize devoiced I → i, U → u
             if pending is not None:
-                cv = pending[2] + ph
+                cv = pending[2] + ph_v
                 # Merged entry: consonant_start → vowel_end
                 result.append((pending[0], end, _cv_label(cv)))
                 pending = None
             else:
-                result.append((start, end, _cv_label(ph)))
+                result.append((start, end, _cv_label(ph_v)))
             i += 1
             continue
 
@@ -723,7 +732,7 @@ def build_ja_merged_lab(
         # ── Ambiguous nasal (n / m / ng / ny) ────────────────────────
         if ph in JA_AMBIGUOUS_NASALS:
             next_ph = entries[i + 1][2] if i + 1 < n else None
-            is_mora = (next_ph is None) or (next_ph not in JA_VOWELS)
+            is_mora = (next_ph is None) or (next_ph.lower() not in JA_VOWELS)
             if is_mora:
                 if pending is not None:
                     result.append((pending[0], pending[1], "-"))
