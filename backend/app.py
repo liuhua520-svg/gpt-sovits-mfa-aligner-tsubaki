@@ -15,6 +15,7 @@ from flask_cors import CORS
 from mfa_utils import MFAChecker
 from mfa_processor import MFAProcessor
 from pipeline import AudioProcessingPipeline
+from alt_aligners import get_alt_aligner_status
 
 logging.basicConfig(
     level=logging.INFO,
@@ -168,6 +169,29 @@ def pipeline_status():
 
 
 # 新增
+@app.route("/api/aligner/status", methods=["GET"])
+def aligner_status():
+    """检查所有对齐后端（MFA / WhisperX / Qwen3）的可用状态"""
+    try:
+        mfa_ok, mfa_msg = MFAChecker.check_mfa_installed()
+        alt_status = get_alt_aligner_status()
+        return jsonify({
+            "success": True,
+            "backends": {
+                "mfa": {
+                    "available": mfa_ok,
+                    "message": mfa_msg,
+                    "requires_text": True,
+                    "description": "Montreal Forced Aligner（传统音素对齐）",
+                },
+                **alt_status,
+            }
+        }), 200
+    except Exception as e:
+        logger.error(f"查询对齐器状态失败: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/pipeline/job/<job_id>", methods=["GET"])
 def pipeline_job_status(job_id):
     job = get_job(job_id)
@@ -288,6 +312,7 @@ def run_pipeline_job(
     export_pitch_line: bool,
     f0_device: str = "auto",
     crepe_model: str = "full",
+    aligner_backend: str = "mfa",
 ):
     try:
         set_job(
@@ -334,6 +359,7 @@ def run_pipeline_job(
             export_pitch_line=export_pitch_line,
             f0_device=f0_device,
             crepe_model=crepe_model,
+            aligner_backend=aligner_backend,
         )
 
         if result.get("success"):
@@ -416,6 +442,10 @@ def pipeline_full_process():
             == "true"
         )
 
+        aligner_backend = request.form.get("aligner_backend", "mfa")
+        if aligner_backend not in ("mfa", "whisperx", "qwen3_asr", "qwen3_aligner"):
+            aligner_backend = "mfa"
+
         stem, wav_path, lab_path = build_job_paths(
             audio_file.filename or "audio.wav"
         )
@@ -457,6 +487,7 @@ def pipeline_full_process():
                 export_pitch_line,
                 f0_device,
                 crepe_model,
+                aligner_backend,
             ),
         ).start()
 
@@ -477,7 +508,8 @@ def pipeline_full_process():
 # 替换原有的 pipeline_mfa_only 函数，新增 run_mfa_only_job 异步任务
 # =====================================================================
 
-def run_mfa_only_job(job_id: str, wav_path: str, text: str, language: str):
+def run_mfa_only_job(job_id: str, wav_path: str, text: str, language: str,
+                     aligner_backend: str = "mfa", f0_device: str = "auto"):
     try:
         set_job(
             job_id,
@@ -501,8 +533,10 @@ def run_mfa_only_job(job_id: str, wav_path: str, text: str, language: str):
 
         compat_audio_file = FileStorageWrapper(wav_path)
 
-        # 执行耗时的 MFA 标注
-        result = pipeline.process_mfa_only(compat_audio_file, text, language)
+        # 执行对齐标注
+        result = pipeline.process_mfa_only(compat_audio_file, text, language,
+                                           aligner_backend=aligner_backend,
+                                           f0_device=f0_device)
 
         if result.get("success"):
             set_job(
@@ -536,15 +570,20 @@ def pipeline_mfa_only():
     try:
         if "audio_file" not in request.files:
             return jsonify({"error": "缺少 audio_file"}), 400
-        if "text" not in request.form:
-            return jsonify({"error": "缺少 text"}), 400
 
         audio_file = request.files["audio_file"]
         text = request.form.get("text", "").strip()
         language = request.form.get("language", "cmn")
 
-        if not audio_file or not text:
-            return jsonify({"error": "输入无效"}), 400
+        aligner_backend = request.form.get("aligner_backend", "mfa")
+        if aligner_backend not in ("mfa", "whisperx", "qwen3_asr", "qwen3_aligner"):
+            aligner_backend = "mfa"
+        f0_device = request.form.get("f0_device", "auto")
+
+        # WhisperX / Qwen3-ASR 支持纯 ASR 模式，文本可选
+        text_optional = aligner_backend in ("whisperx", "qwen3_asr")
+        if not audio_file or (not text and not text_optional):
+            return jsonify({"error": "输入无效（MFA / Qwen3-ForcedAligner 模式需要文本）"}), 400
 
         # 1. 马上保存文件，生成路径
         stem, wav_path, lab_path = build_job_paths(audio_file.filename or "audio.wav")
@@ -558,13 +597,13 @@ def pipeline_mfa_only():
             created_at=datetime.now().isoformat(),
         )
 
-        logger.info(f"MFA 标注模式启动，投递后台任务: {job_id}")
+        logger.info(f"标注模式启动 (backend={aligner_backend})，投递后台任务: {job_id}")
 
         # 3. 启动后台线程执行耗时任务
         Thread(
             target=run_mfa_only_job,
             daemon=True,
-            args=(job_id, str(wav_path), text, language),
+            args=(job_id, str(wav_path), text, language, aligner_backend, f0_device),
         ).start()
 
         # 4. 立即返回 job_id 供前端轮询
@@ -572,10 +611,11 @@ def pipeline_mfa_only():
             "success": True,
             "job_id": job_id,
             "status": "queued",
+            "aligner_backend": aligner_backend,
         }), 202
 
     except Exception as e:
-        logger.error("MFA 模式异常: %s", e, exc_info=True)
+        logger.error("标注模式异常: %s", e, exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
