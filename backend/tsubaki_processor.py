@@ -108,38 +108,37 @@ def _split_lyrics_to_words(text: str) -> List[str]:
 
     规则：
     - CJK 汉字、平假名、片假名、韩文 → 每个字符单独一个元素
+    - 单独的 "-" 保留为占位符
     - 拉丁字母等 → 以空白符为分隔符拆成单词
-    - 空格、标点、换行跳过
+    - 空格、其他标点、换行跳过
     """
     import unicodedata
+
     result: List[str] = []
     i = 0
     while i < len(text):
         ch = text[i]
         cp = ord(ch)
-        # CJK 统一汉字 / 拓展A / 拓展B（代理对简化处理）
+
         if (
             (0x4E00 <= cp <= 0x9FFF)
             or (0x3400 <= cp <= 0x4DBF)
             or (0x20000 <= cp <= 0x2A6DF)
-            # 平假名
             or (0x3040 <= cp <= 0x309F)
-            # 片假名
             or (0x30A0 <= cp <= 0x30FF)
-            # 韩文音节
             or (0xAC00 <= cp <= 0xD7A3)
-            # 韩文字母（Jamo）
             or (0x1100 <= cp <= 0x11FF)
         ):
             result.append(ch)
             i += 1
         elif ch in (' ', '\t', '\n', '\r'):
             i += 1
+        elif ch == '-':
+            result.append('-')
+            i += 1
         elif unicodedata.category(ch).startswith('P'):
-            # 标点跳过
             i += 1
         else:
-            # 拉丁字母等：以空白为边界收集单词
             j = i
             while j < len(text) and text[j] not in (' ', '\t', '\n', '\r'):
                 j += 1
@@ -147,6 +146,7 @@ def _split_lyrics_to_words(text: str) -> List[str]:
             if word:
                 result.append(word)
             i = j
+
     return result
 
 
@@ -1360,7 +1360,8 @@ class TsubakiProcessor:
     def _apply_midi_lyrics_to_segments(self, segments, lyric_words: List[str]):
         """
         用 MIDI 歌词覆盖段落 label。
-        保留显式静音段（sil/pau/sp/spn），其余段按顺序写入歌词。
+        静音段只在歌词当前位置也是占位符 '-' 时才消费一个 token，
+        这样可以避免把后面的词前移。
         """
         if not lyric_words:
             return segments
@@ -1373,12 +1374,20 @@ class TsubakiProcessor:
             label = (seg.label or "").strip()
             lower = label.lower()
 
-            # 显式静音段保留
             if lower in silence_tokens:
-                out.append(seg)
+                if idx < len(lyric_words) and lyric_words[idx] == "-":
+                    out.append(
+                        LabelSegment(
+                            start_time=seg.start_time,
+                            end_time=seg.end_time,
+                            label="-",
+                        )
+                    )
+                    idx += 1
+                else:
+                    out.append(seg)
                 continue
 
-            # 非静音段：优先写入 MIDI 歌词
             if idx < len(lyric_words):
                 new_label = lyric_words[idx]
                 idx += 1
