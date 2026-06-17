@@ -87,6 +87,85 @@ def parse_midi_notes(midi_path: str) -> Tuple[float, List[Tuple[float, float, in
     return bpm, notes_result
 
 
+def build_midi_from_segments(
+    segments: List[Tuple[float, float, int, str]],
+    bpm: float = 120.0,
+    output_path: str = "output.mid",
+    ticks_per_beat: int = 480,
+    default_velocity: int = 80,
+) -> str:
+    """
+    从段落列表生成 MIDI 文件。
+
+    Parameters
+    ----------
+    segments : list of (start_sec, end_sec, pitch_midi, label)
+        段落列表。label 仅供参考，不写入 MIDI。
+    bpm : float
+        每分钟拍数，写入 set_tempo 事件。
+    output_path : str
+        输出 .mid 文件路径。
+    ticks_per_beat : int
+        MIDI 分辨率，默认 480 ticks/beat。
+    default_velocity : int
+        音符力度（0-127），默认 80。
+
+    Returns
+    -------
+    str : 实际写入的文件路径（同 output_path）。
+    """
+    try:
+        import mido
+    except ImportError:
+        raise ImportError("请安装 mido 库以使用 MIDI 导出功能: pip install mido")
+
+    def sec_to_ticks(sec: float) -> int:
+        return int(round(sec * (bpm / 60.0) * ticks_per_beat))
+
+    mid = mido.MidiFile(ticks_per_beat=ticks_per_beat)
+    track = mido.MidiTrack()
+    mid.tracks.append(track)
+
+    # --- meta events ---
+    tempo = int(round(60_000_000 / max(bpm, 1e-6)))
+    track.append(mido.MetaMessage("set_tempo", tempo=tempo, time=0))
+    track.append(mido.MetaMessage(
+        "time_signature", numerator=4, denominator=4,
+        clocks_per_click=24, notated_32nd_notes_per_beat=8, time=0
+    ))
+
+    # --- note events: interleave note_on and note_off by absolute tick ---
+    events: List[Tuple[int, int, str, int]] = []  # (abs_tick, sort_key, type, pitch)
+    for start_sec, end_sec, pitch, _label in segments:
+        pitch = max(0, min(127, int(pitch)))
+        t_on  = sec_to_ticks(float(start_sec))
+        t_off = max(t_on + 1, sec_to_ticks(float(end_sec)))
+        events.append((t_on,  1, "note_on",  pitch))   # sort_key=1: on before off at same tick
+        events.append((t_off, 0, "note_off", pitch))   # sort_key=0: off first at same tick
+
+    # note_off 先于同 tick 的 note_on（防止零长度音符音量爆炸）
+    events.sort(key=lambda e: (e[0], e[1]))
+
+    prev_tick = 0
+    for abs_tick, _sk, etype, pitch in events:
+        delta = max(0, abs_tick - prev_tick)
+        prev_tick = abs_tick
+        if etype == "note_on":
+            track.append(mido.Message("note_on",  note=pitch,
+                                      velocity=default_velocity, time=delta))
+        else:
+            track.append(mido.Message("note_off", note=pitch,
+                                      velocity=0, time=delta))
+
+    track.append(mido.MetaMessage("end_of_track", time=0))
+    mid.save(output_path)
+    logger.info(
+        f"MIDI 导出完成: {output_path}  "
+        f"({len(segments)} 个音符, BPM={bpm:.1f})"
+    )
+    return output_path
+
+
 def map_segment_to_midi_pitch(
     lab_start_sec: float,
     lab_end_sec: float,

@@ -599,6 +599,7 @@ def run_project_only_job(
     crepe_model: str,
     phoneme_mode: str,
     midi_path: str,           # MIDI 文件路径（空字符串 = 未导入）
+    lyrics_text: str = "",
 ):
     try:
         set_job(
@@ -690,29 +691,32 @@ def pipeline_project_only():
 
         # 音素转换模式: none / merge / hiragana / katakana
         phoneme_mode = request.form.get("phoneme_mode", "none")
+        lyrics_text   = request.form.get("lyrics_text", "").strip()   # ← 追加
         if phoneme_mode not in ("none", "merge", "hiragana", "katakana"):
             logger.warning(f"未知 phoneme_mode '{phoneme_mode}'，回退到 'none'")
             phoneme_mode = "none"
 
-        # 兼容两种输入：
-        # 1) 前端上传文件：wav_file + lab_file
-        # 2) 已有路径：wav_path + lab_path
+        # 兼容两种输入方式：
+        # 1) 前端上传文件：wav_file（必选）+ lab_file（可选）
+        # 2) 已有路径：wav_path（必选）+ lab_path（可选）
+        # LAB 和 MIDI 至少需要提供其中一个。
         wav_path = request.form.get("wav_path")
-        lab_path = request.form.get("lab_path")
+        lab_path = request.form.get("lab_path") or ""
 
         wav_file = request.files.get("wav_file")
         lab_file = request.files.get("lab_file")
 
-        if wav_file is not None and lab_file is not None:
-            # 用 WAV 文件名作为同名基底，确保 wav/lab 成对保存
+        if wav_file is not None:
             stem, wav_path_obj, lab_path_obj = build_job_paths(wav_file.filename or "audio.wav")
             wav_file.save(str(wav_path_obj))
-            lab_file.save(str(lab_path_obj))
             wav_path = str(wav_path_obj)
-            lab_path = str(lab_path_obj)
 
-        if not wav_path or not lab_path:
-            return jsonify({"error": "请提供 wav_path/lab_path 或 wav_file/lab_file"}), 400
+            if lab_file is not None and lab_file.filename:
+                lab_file.save(str(lab_path_obj))
+                lab_path = str(lab_path_obj)
+
+        if not wav_path:
+            return jsonify({"error": "请提供 wav_file 或 wav_path"}), 400
 
         # ── MIDI 文件（可选）──────────────────────────────────────────────────
         midi_path = ""
@@ -725,6 +729,7 @@ def pipeline_project_only():
             midi_path = str(midi_path_obj)
             logger.info(f"MIDI 文件已保存: {midi_path}")
 
+        # ── 格式校验 + 文件存在性校验 ─────────────────────────────────────
         supported_formats = pipeline.get_supported_formats().get("formats", [])
         if output_format not in supported_formats:
             return jsonify({
@@ -735,12 +740,18 @@ def pipeline_project_only():
         if not os.path.exists(wav_path):
             return jsonify({"error": f"WAV 文件不存在: {wav_path}"}), 400
 
-        if not os.path.exists(lab_path):
-            return jsonify({"error": f"LAB 文件不存在: {lab_path}"}), 400
+        lab_exists  = bool(lab_path  and os.path.exists(lab_path))
+        midi_exists = bool(midi_path and os.path.exists(midi_path))
+
+        if not lab_exists and not midi_exists:
+            return jsonify({
+                "error": "请提供 LAB 文件或 MIDI 文件（至少提供其中一个）",
+                "hint":  "通过 lab_file/lab_path 上传 LAB，或通过 midi_file 上传 MIDI"
+            }), 400
 
         logger.info(
             "工程文件模式启动 (异步): format=%s wav=%s lab=%s midi=%s",
-            output_format, wav_path, lab_path, midi_path or "(无)",
+            output_format, wav_path, lab_path or "(无 LAB)", midi_path or "(无 MIDI)",
         )
 
         job_id = uuid.uuid4().hex
@@ -756,7 +767,7 @@ def pipeline_project_only():
             args=(
                 job_id,
                 wav_path,
-                lab_path,
+                lab_path or "",   # 空字符串 = 不提供 LAB
                 output_format,
                 project_title,
                 bpm,
@@ -772,7 +783,7 @@ def pipeline_project_only():
                 f0_device,
                 crepe_model,
                 phoneme_mode,
-                midi_path,          # 新增：MIDI 文件路径
+                midi_path,
             ),
         ).start()
 
@@ -879,6 +890,16 @@ def list_work_dir_files():
                 "size": lab_file.stat().st_size,
                 "modified": lab_file.stat().st_mtime
             })
+
+        # 列出 MIDI 文件
+        for mid_file in WORK_DIR.glob("*.mid"):
+            files.append({
+                "name": mid_file.name,
+                "path": str(mid_file),
+                "type": "midi",
+                "size": mid_file.stat().st_size,
+                "modified": mid_file.stat().st_mtime
+            })
         
         # 列出工程文件
         for project_file in WORK_DIR.glob("**/*.ustx"):
@@ -957,7 +978,7 @@ def clear_work_dir():
         import shutil
         
         # 只删除特定类型的文件
-        patterns = ["*.wav", "*.lab", "**/*.ustx", "*.txt", "*.TextGrid"]
+        patterns = ["*.wav", "*.lab", "*.mid", "**/*.ustx", "**/*.svp", "*.txt", "*.TextGrid"]
         
         deleted_count = 0
         for pattern in patterns:

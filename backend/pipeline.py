@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 from mfa_processor import MFAProcessor
 from tsubaki_processor import TsubakiProcessor, AudioProcessingConfig
@@ -214,7 +214,7 @@ class AudioProcessingPipeline:
     def process_project_only(
         self,
         wav_path: str,
-        lab_path: str,
+        lab_path: Optional[str] = None,   # 可选：与 midi_path 至少提供一个
         output_format: str = "sv",
         project_title: str = "Project",
         bpm: float = 120.0,
@@ -231,16 +231,36 @@ class AudioProcessingPipeline:
         crepe_model: str = "full",
         phoneme_mode: str = "none",
         midi_path: str = None,           # MIDI 文件路径（可选）
+        lyrics_text: str = "",
     ) -> Dict:
-        """仅执行工程文件生成（已有 WAV 和 LAB）"""
+        """仅执行工程文件生成（已有 WAV 以及 LAB/MIDI 之一）"""
         import time
         start_time = time.time()
 
         try:
             logger.info("[ 工程文件模式 ] 生成项目文件")
             logger.info(f" 音频: {wav_path}")
-            logger.info(f" 标注: {lab_path}")
+            logger.info(f" 标注: {lab_path or '(无 LAB)'}")
+            logger.info(f" MIDI: {midi_path or '(无 MIDI)'}")
             logger.info(f" 格式: {output_format}")
+
+            # ── 输入检查 ─────────────────────────────────────────────────────
+            if not Path(wav_path).exists():
+                return {
+                    "success": False,
+                    "error": f"WAV 文件不存在: {wav_path}",
+                    "processing_time": 0,
+                }
+
+            lab_exists  = bool(lab_path  and Path(lab_path).exists())
+            midi_exists = bool(midi_path and Path(midi_path).exists())
+
+            if not lab_exists and not midi_exists:
+                return {
+                    "success": False,
+                    "error": "需要 LAB 文件或 MIDI 文件（至少提供其中一个）",
+                    "processing_time": 0,
+                }
 
             config = AudioProcessingConfig(
                 bpm=bpm,
@@ -269,13 +289,14 @@ class AudioProcessingPipeline:
 
             result = self.tsubaki_processor.process_full_pipeline(
                 wav_path=wav_path,
-                lab_path=lab_path,
+                lab_path=lab_path if lab_exists else None,
                 output_format=output_format,
                 project_title=project_title,
                 config=config,
                 audio_f0_data=audio_data,
                 phoneme_mode=phoneme_mode,
-                midi_path=midi_path,
+                midi_path=midi_path or None,
+                lyrics_text=lyrics_text,
             )
 
             result["processing_time"] = int((time.time() - start_time) * 1000)

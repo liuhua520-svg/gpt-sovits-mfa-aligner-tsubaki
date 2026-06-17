@@ -102,6 +102,54 @@ _BLICKS_PER_SECOND = 10_000_000      # 1 秒 = 10,000,000 blicks (100ns)
 _TICKS_PER_SECOND_DEFAULT = 480.0    # USTX default resolution per quarter note
 
 
+def _split_lyrics_to_words(text: str) -> List[str]:
+    """
+    将歌词文本拆分为按音符对应的字/词列表。
+
+    规则：
+    - CJK 汉字、平假名、片假名、韩文 → 每个字符单独一个元素
+    - 拉丁字母等 → 以空白符为分隔符拆成单词
+    - 空格、标点、换行跳过
+    """
+    import unicodedata
+    result: List[str] = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        cp = ord(ch)
+        # CJK 统一汉字 / 拓展A / 拓展B（代理对简化处理）
+        if (
+            (0x4E00 <= cp <= 0x9FFF)
+            or (0x3400 <= cp <= 0x4DBF)
+            or (0x20000 <= cp <= 0x2A6DF)
+            # 平假名
+            or (0x3040 <= cp <= 0x309F)
+            # 片假名
+            or (0x30A0 <= cp <= 0x30FF)
+            # 韩文音节
+            or (0xAC00 <= cp <= 0xD7A3)
+            # 韩文字母（Jamo）
+            or (0x1100 <= cp <= 0x11FF)
+        ):
+            result.append(ch)
+            i += 1
+        elif ch in (' ', '\t', '\n', '\r'):
+            i += 1
+        elif unicodedata.category(ch).startswith('P'):
+            # 标点跳过
+            i += 1
+        else:
+            # 拉丁字母等：以空白为边界收集单词
+            j = i
+            while j < len(text) and text[j] not in (' ', '\t', '\n', '\r'):
+                j += 1
+            word = text[i:j].strip()
+            if word:
+                result.append(word)
+            i = j
+    return result
+
+
 class TsubakiProcessor:
     """
     工程文件生成器。
@@ -127,18 +175,20 @@ class TsubakiProcessor:
     """
 
     SUPPORTED_FORMATS = {
-        "sv": "Synthesizer V Project (.svp)",
+        "sv":   "Synthesizer V Project (.svp)",
         "ustx": "OpenUtau Project (.ustx)",
         "utau": "OpenUtau Project (.ustx) [alias]",
+        "midi": "MIDI 标准文件 (.mid)",
     }
 
     OUTPUT_ALIASES = {
-        "svp": "sv",
-        "synthv": "sv",
+        "svp":           "sv",
+        "synthv":        "sv",
         "synthesizer_v": "sv",
-        "synthesizerv": "sv",
-        "openutau": "ustx",
-        "utau": "ustx",
+        "synthesizerv":  "sv",
+        "openutau":      "ustx",
+        "utau":          "ustx",
+        "mid":           "midi",
     }
 
     # 真正的静音标签：跳过（不生成音符），但用 '-' 填充其占用的时间段
@@ -202,6 +252,45 @@ class TsubakiProcessor:
                     continue
                 label = " ".join(parts[2:]).strip()
                 segments.append(LabelSegment(start_time=start_time, end_time=end_time, label=label))
+        return segments
+
+    @staticmethod
+    def _segments_from_midi_notes(
+        midi_notes: List[Tuple[float, float, int]],
+        label: str = "-",
+        lyric_words: Optional[List[str]] = None,
+    ) -> List[LabelSegment]:
+        """
+        将 MIDI 音符列表转换为 LabelSegment 列表。
+
+        每个 MIDI 音符对应一个 LabelSegment。
+        音高信息由调用处通过 midi_notes + map_segment_to_midi_pitch 获取，
+        不需要编码在 label 内。
+
+        Parameters
+        ----------
+        midi_notes : list of (start_sec, end_sec, pitch)
+        label : str
+            未提供 lyric_words 或超出长度时的兜底歌词，默认 '-'
+        lyric_words : list of str, optional
+            按音符顺序对应的歌词字/词列表。提供时逐一写入对应音符；
+            列表比音符少时，超出部分使用 label 填充。
+        """
+        segments: List[LabelSegment] = []
+        for i, (start_sec, end_sec, _pitch) in enumerate(midi_notes):
+            start_100ns = int(round(float(start_sec) * 10_000_000))
+            end_100ns   = int(round(float(end_sec)   * 10_000_000))
+            if end_100ns > start_100ns:
+                note_label = (
+                    lyric_words[i]
+                    if lyric_words and i < len(lyric_words)
+                    else label
+                )
+                segments.append(LabelSegment(
+                    start_time=start_100ns,
+                    end_time=end_100ns,
+                    label=note_label,
+                ))
         return segments
 
     def _default_svp_note(self, lyric: str, tone: int, onset: int = 0, duration: int = 0) -> Dict:
@@ -1081,65 +1170,54 @@ class TsubakiProcessor:
     def process_full_pipeline(
         self,
         wav_path: str,
-        lab_path: str,
+        lab_path: Optional[str] = None,   # 可选：提供 LAB 或 MIDI 之一即可
         output_format: str = "sv",
         project_title: str = "Project",
         config: Optional[AudioProcessingConfig] = None,
         audio_f0_data: Optional[Dict] = None,
         phoneme_mode: str = "none",
         midi_path: Optional[str] = None,   # MIDI 文件路径（可选）
+        lyrics_text: str = "",             # 纯 MIDI 模式下的用户歌词原文
     ) -> Dict:
-        """完整工程文件生成入口：读取 WAV + LAB，生成 SVP / USTX 文件。"""
+        """完整工程文件生成入口。
+
+        输入约束
+        ────────
+        • wav_path  —— 始终必须（F0 提取来源）
+        • lab_path  —— 可选；提供时从 LAB 读取音素段落
+        • midi_path —— 可选；提供时解析 BPM + 音符音高；
+                        若同时缺少 lab_path，则从 MIDI 音符自动生成段落
+
+        至少需要 lab_path 或 midi_path 其中一个。
+
+        输出格式
+        ────────
+        sv / svp        → Synthesizer V .svp
+        ustx / utau     → OpenUtau .ustx
+        midi / mid      → MIDI 标准文件 .mid
+        """
         try:
             config   = config or AudioProcessingConfig()
             wav_path = str(wav_path)
-            lab_path = str(lab_path)
 
+            # ── 文件检查 ───────────────────────────────────────────────────────
             if not Path(wav_path).exists():
                 return {"success": False, "error": f"WAV 文件不存在: {wav_path}"}
-            if not Path(lab_path).exists():
-                return {"success": False, "error": f"LAB 文件不存在: {lab_path}"}
 
-            segments          = self._load_lab_segments(lab_path)
+            lab_exists  = bool(lab_path  and Path(str(lab_path)).exists())
+            midi_exists = bool(midi_path and Path(str(midi_path)).exists())
+
+            if not lab_exists and not midi_exists:
+                return {
+                    "success": False,
+                    "error": "需要 LAB 文件或 MIDI 文件（至少提供其中一个）",
+                }
+
             audio_duration_sec = self._read_audio_duration_sec(wav_path)
 
-            # ── 音素转换模式 (project-only 专用) ──────────────────────────────
-            # 在将 LAB 段落写入工程文件之前，可选地把独立的辅音+元音对合并为
-            # 音节级标签：
-            #   'none'     → 不转换，保持原始 LAB 标签（默认）
-            #   'merge'    → 合并辅音，如 s + a → sa
-            #   'hiragana' → 合并后转平假名，如 s + a → さ，N → ん
-            #   'katakana' → 合并后转片假名，如 s + a → サ，N → ン
-            if phoneme_mode and phoneme_mode != "none":
-                try:
-                    from phoneme_converter import apply_phoneme_mode
-                    seg_tuples = [
-                        (s.start_time, s.end_time, s.label) for s in segments
-                    ]
-                    converted = apply_phoneme_mode(seg_tuples, phoneme_mode)
-                    segments = [
-                        LabelSegment(start_time=t[0], end_time=t[1], label=t[2])
-                        for t in converted
-                    ]
-                    logger.info(
-                        f"音素转换完成 (mode={phoneme_mode}): "
-                        f"{len(segments)} 个音节段落"
-                    )
-                except Exception as _pm_err:
-                    logger.warning(
-                        f"音素转换失败 (mode={phoneme_mode}): {_pm_err}，"
-                        f"回退到原始音素"
-                    )
-
-            f0, t, sr = None, None, None
-            if audio_f0_data and audio_f0_data.get("success"):
-                f0 = audio_f0_data.get("f0")
-                t  = audio_f0_data.get("t")
-                sr = audio_f0_data.get("sr")
-
-            # ── MIDI 导入：解析音符音高 + 覆盖 BPM ──────────────────────────
+            # ── ① MIDI 优先解析（BPM + 音符，供后续用） ───────────────────────
             midi_notes = None
-            if midi_path and Path(midi_path).exists():
+            if midi_exists:
                 try:
                     from dataclasses import replace as _dc_replace
                     from midi_processor import parse_midi_notes
@@ -1147,11 +1225,64 @@ class TsubakiProcessor:
                     if midi_bpm and midi_bpm > 0:
                         config = _dc_replace(config, bpm=float(midi_bpm))
                         logger.info(f"✓ MIDI BPM 已覆盖 config.bpm → {midi_bpm:.1f}")
-                    logger.info(f"✓ MIDI 音符导入: {len(midi_notes)} 个音符")
+                    logger.info(f"✓ MIDI 音符导入: {len(midi_notes)} 个")
                 except Exception as _midi_err:
                     logger.warning(f"⚠ MIDI 解析失败，回退到默认模式: {_midi_err}")
                     midi_notes = None
 
+            # ── ② 段落来源：优先 LAB，否则从 MIDI 音符生成 ──────────────────
+            if lab_exists:
+                segments = self._load_lab_segments(str(lab_path))
+
+                # 音素转换模式（仅 LAB 来源有效）
+                if phoneme_mode and phoneme_mode != "none":
+                    try:
+                        from phoneme_converter import apply_phoneme_mode
+                        seg_tuples = [
+                            (s.start_time, s.end_time, s.label) for s in segments
+                        ]
+                        converted = apply_phoneme_mode(seg_tuples, phoneme_mode)
+                        segments = [
+                            LabelSegment(start_time=t[0], end_time=t[1], label=t[2])
+                            for t in converted
+                        ]
+                        logger.info(
+                            f"音素转换完成 (mode={phoneme_mode}): "
+                            f"{len(segments)} 个音节段落"
+                        )
+                    except Exception as _pm_err:
+                        logger.warning(
+                            f"音素转换失败 (mode={phoneme_mode}): {_pm_err}，"
+                            f"回退到原始音素"
+                        )
+            else:
+                # 纯 MIDI 模式：从 MIDI 音符自动生成段落
+                if not midi_notes:
+                    return {
+                        "success": False,
+                        "error": "MIDI 文件解析失败，无法生成段落",
+                    }
+                lyric_words = (
+                    _split_lyrics_to_words(lyrics_text)
+                    if lyrics_text and lyrics_text.strip()
+                    else None
+                )
+                segments = self._segments_from_midi_notes(
+                    midi_notes, lyric_words=lyric_words
+                )
+                logger.info(
+                    f"✓ 从 MIDI 生成段落: {len(segments)} 个"
+                    f"（歌词字数: {len(lyric_words) if lyric_words else 0}）"
+                )
+
+            # ── ③ F0 数据 ─────────────────────────────────────────────────────
+            f0, t, sr = None, None, None
+            if audio_f0_data and audio_f0_data.get("success"):
+                f0 = audio_f0_data.get("f0")
+                t  = audio_f0_data.get("t")
+                sr = audio_f0_data.get("sr")
+
+            # ── ④ 生成输出文件 ───────────────────────────────────────────────
             fmt = self._normalize_output_format(output_format)
 
             if fmt == "sv":
@@ -1162,6 +1293,7 @@ class TsubakiProcessor:
                     midi_notes=midi_notes,
                 )
                 out_path = self.work_dir / f"{Path(wav_path).stem}.svp"
+                out_path.write_text(project_text, encoding="utf-8")
 
             elif fmt == "ustx":
                 project_text = self._build_utau_project_text(
@@ -1171,14 +1303,26 @@ class TsubakiProcessor:
                     midi_notes=midi_notes,
                 )
                 out_path = self.work_dir / f"{Path(wav_path).stem}.ustx"
+                out_path.write_text(project_text, encoding="utf-8")
+
+            elif fmt == "midi":
+                out_path = self.work_dir / f"{Path(wav_path).stem}.mid"
+                self._build_midi_output(
+                    output_path=str(out_path),
+                    segments=segments,
+                    config=config,
+                    f0=f0, t=t,
+                    midi_notes=midi_notes,
+                )
 
             else:
                 return {
                     "success": False,
-                    "error": f"不支持的格式: {output_format}。支持: sv / ustx / utau",
+                    "error": (
+                        f"不支持的格式: {output_format}。"
+                        "支持: sv / ustx / utau / midi"
+                    ),
                 }
-
-            out_path.write_text(project_text, encoding="utf-8")
 
             return {
                 "success":     True,
@@ -1191,6 +1335,61 @@ class TsubakiProcessor:
         except Exception as e:
             logger.error(f"工程文件生成失败: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
+
+    def _build_midi_output(
+        self,
+        output_path: str,
+        segments: List[LabelSegment],
+        config: AudioProcessingConfig,
+        f0: Optional[np.ndarray] = None,
+        t: Optional[np.ndarray] = None,
+        midi_notes: Optional[List] = None,
+    ) -> None:
+        """
+        将段落列表写成 MIDI 文件。
+
+        音高优先级（与 SVP/USTX 生成保持一致）：
+          1. MIDI 导入音符（midi_notes 覆盖）
+          2. F0 中位音高（refine_pitch=True 时）
+          3. config.base_pitch 默认值
+        """
+        from midi_processor import build_midi_from_segments, map_segment_to_midi_pitch
+
+        note_data: List[Tuple[float, float, int, str]] = []
+        base_tone = int(config.base_pitch)
+
+        for seg in segments:
+            if self._is_true_silence(seg.label):
+                continue
+            if seg.end_time <= seg.start_time:
+                continue
+
+            start_sec = self._lab_time_to_seconds(seg.start_time)
+            end_sec   = self._lab_time_to_seconds(seg.end_time)
+
+            tone = base_tone
+            if midi_notes is not None:
+                tone = map_segment_to_midi_pitch(
+                    start_sec, end_sec, midi_notes,
+                    base_pitch=base_tone,
+                )
+            elif config.refine_pitch and f0 is not None and t is not None and len(f0) > 0:
+                mask = (t >= start_sec) & (t < end_sec)
+                voiced = f0[mask]
+                voiced = voiced[voiced > 0]
+                if len(voiced) > 0:
+                    midi_vals = 69.0 + 12.0 * np.log2(voiced / 440.0)
+                    tone = int(round(float(np.median(midi_vals))))
+                    tone = max(12, min(127, tone))
+
+            note_data.append((start_sec, end_sec, tone, seg.label))
+
+        build_midi_from_segments(
+            segments=note_data,
+            bpm=config.bpm,
+            output_path=output_path,
+        )
+
 
 def _f0_worker(audio_path: str, config_dict: dict, q: mp.Queue) -> None:
     """
