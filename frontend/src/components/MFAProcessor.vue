@@ -49,6 +49,67 @@
           </div>
         </el-form-item>
 
+        <!-- 对齐后端选择器（project-only 模式不需要对齐） -->
+        <el-form-item v-if="processingMode !== 'project-only'" label="对齐后端">
+          <el-radio-group v-model="alignerBackend">
+            <el-radio value="mfa">
+              <span>MFA</span>
+              <el-tag
+                :type="systemStatus.mfa?.installed ? 'success' : 'danger'"
+                size="small" style="margin-left:4px"
+              >{{ systemStatus.mfa?.installed ? '✓' : '✗' }}</el-tag>
+            </el-radio>
+            <el-radio value="whisperx">
+              <span>WhisperX</span>
+              <el-tag
+                :type="alignerStatus['whisperx']?.available ? 'success' : 'info'"
+                size="small" style="margin-left:4px"
+              >{{ alignerStatus['whisperx']?.available ? '✓' : '需安装' }}</el-tag>
+            </el-radio>
+            <el-radio value="qwen3_asr">
+              <span>Qwen3-ASR</span>
+              <el-tag
+                :type="alignerStatus['qwen3_asr']?.available ? 'success' : 'info'"
+                size="small" style="margin-left:4px"
+              >{{ alignerStatus['qwen3_asr']?.available ? '✓' : '需安装' }}</el-tag>
+            </el-radio>
+            <el-radio value="qwen3_aligner">
+              <span>Qwen3-FA</span>
+              <el-tag
+                :type="alignerStatus['qwen3_aligner']?.available ? 'success' : 'info'"
+                size="small" style="margin-left:4px"
+              >{{ alignerStatus['qwen3_aligner']?.available ? '✓' : '需安装' }}</el-tag>
+            </el-radio>
+          </el-radio-group>
+          <div class="help-text" style="margin-top:6px">
+            <small v-if="alignerBackend === 'mfa'">
+              🎯 <strong>MFA</strong>：基于 Kaldi 的音素级强制对齐，精度高但需要提前安装 MFA 及语言模型。<em>需要参考文本。</em>
+            </small>
+            <small v-else-if="alignerBackend === 'whisperx'">
+              🤖 <strong>WhisperX</strong>：Whisper ASR + wav2vec2 强制对齐，无需预先安装语言模型，支持字符级时间戳。
+              <em>文本可选（留空则自动转录）。</em>
+            </small>
+            <small v-else-if="alignerBackend === 'qwen3_asr'">
+              🌐 <strong>Qwen3-ASR-1.7B</strong>：Qwen3 自动语音识别，对中文多口音更鲁棒。
+              <em>文本可选（留空则自动转录）。</em>
+            </small>
+            <small v-else-if="alignerBackend === 'qwen3_aligner'">
+              📌 <strong>Qwen3-ForcedAligner-0.6B</strong>：轻量级神经网络强制对齐，专为歌声设计。
+              <em>需要参考文本。</em>
+            </small>
+          </div>
+          <el-alert
+            v-if="alignerBackend !== 'mfa' && !alignerStatus[alignerBackend]?.available"
+            type="warning" :closable="false" show-icon style="margin-top:8px"
+          >
+            <template #title>{{ alignerStatus[alignerBackend]?.message || '请安装对应依赖' }}</template>
+            <div style="font-size:12px;margin-top:4px">
+              <span v-if="alignerBackend === 'whisperx'">pip install whisperx</span>
+              <span v-else>pip install transformers torch torchaudio accelerate</span>
+            </div>
+          </el-alert>
+        </el-form-item>
+
 		<!-- LAB / MIDI 单文件上传（仅 project-only 模式） -->
 		<el-form-item v-if="processingMode === 'project-only'" label="LAB / MIDI 文件">
 		  <el-upload
@@ -103,11 +164,14 @@
             v-model="formData.text"
             type="textarea"
             :rows="4"
-            placeholder="粘贴文本内容"
+            :placeholder="isTextOptional ? '（可选）留空则自动转录，或粘贴参考文本提升精度' : '粘贴文本内容'"
             show-word-limit
           />
           <div class="help-text">
-            当前字符数：{{ formData.text.length }}
+            <span v-if="isTextOptional" style="color:#67c23a">
+              ✓ {{ alignerBackend === 'whisperx' ? 'WhisperX' : 'Qwen3-ASR' }} 支持纯 ASR 模式，文本留空也可处理
+            </span>
+            <span v-else>当前字符数：{{ formData.text.length }}</span>
           </div>
         </el-form-item>
 
@@ -129,13 +193,13 @@
           </el-radio-group>
           <div class="mode-help">
             <small v-if="processingMode === 'mfa-only'">
-              只进行 MFA 自动标注，生成 LAB 文件
+              只进行自动标注，生成 LAB 文件（使用 {{ alignerBackendLabel }} 后端）
             </small>
             <small v-else-if="processingMode === 'full'">
-              执行完整流程：标注 → F0提取 → 工程文件生成
+              执行完整流程：{{ alignerBackendLabel }} 标注 → F0提取 → 工程文件生成
             </small>
             <small v-else>
-              直接整合现有 WAV 和 LAB / MIDI 文件生成工程文件，跳过 MFA 自动标注
+              直接整合现有 WAV 和 LAB / MIDI 文件生成工程文件，跳过自动标注
             </small>
           </div>
         </el-form-item>
@@ -144,7 +208,6 @@
           <el-select v-model="formData.outputFormat" placeholder="选择输出格式">
             <el-option label="Synthesizer V Studio (.svp)" value="sv" />
             <el-option label="OpenUtau/UTAU (.ustx)" value="utau" />
-            <el-option label="MIDI 标准文件 (.mid)" value="midi" />
           </el-select>
         </el-form-item>
 
@@ -585,6 +648,21 @@
               </div>
             </div>
           </el-col>
+
+          <el-col :xs="24">
+            <div class="label">替代对齐后端:</div>
+            <div class="model-list">
+              <div v-for="(info, key) in alignerStatus" :key="key" class="model-item">
+                <el-tag :type="info.available ? 'success' : 'info'" size="small">
+                  {{ key === 'whisperx' ? 'WhisperX' : key === 'qwen3_asr' ? 'Qwen3-ASR-1.7B' : 'Qwen3-FA-0.6B' }}:
+                  {{ info.available ? '✓ 可用' : '✗ 未安装' }}
+                </el-tag>
+                <span v-if="!info.available" class="help-text" style="font-size:11px;margin-left:6px">
+                  {{ key === 'whisperx' ? 'pip install whisperx' : 'pip install transformers torch' }}
+                </span>
+              </div>
+            </div>
+          </el-col>
         </el-row>
       </el-card>
     </div>
@@ -667,10 +745,17 @@ interface SystemStatus {
       rmvpe?: F0BackendStatus
     }
   }
+  alt_aligners?: Record<string, { available: boolean; message: string; requires_text?: boolean }>
 }
 
 // 核心表单与模式状态（合并唯一声明）
 const processingMode = ref<ProcessingMode>('mfa-only')
+const alignerBackend = ref<string>('mfa')   // 对齐后端选择
+const alignerStatus = ref<Record<string, any>>({
+  whisperx:      { available: false, message: '检查中...' },
+  qwen3_asr:     { available: false, message: '检查中...' },
+  qwen3_aligner: { available: false, message: '检查中...' },
+})
 
 const formData = ref<FormData>({
   audioFile: null,
@@ -751,7 +836,26 @@ const normalizedModels = computed(() => {
 })
 
 const isReady = computed(() => {
+  // 替代后端不依赖 MFA 模型，只要后端可用或是 MFA 时检查模型
+  if (alignerBackend.value !== 'mfa') {
+    return alignerStatus.value[alignerBackend.value]?.available ?? false
+  }
   return !!(systemStatus.value.mfa?.installed && normalizedModels.value[formData.value.language as keyof typeof normalizedModels.value])
+})
+
+// WhisperX / Qwen3-ASR 支持纯 ASR 模式（文本可选）
+const isTextOptional = computed(() =>
+  ['whisperx', 'qwen3_asr'].includes(alignerBackend.value)
+)
+
+const alignerBackendLabel = computed(() => {
+  const labels: Record<string, string> = {
+    mfa: 'MFA',
+    whisperx: 'WhisperX',
+    qwen3_asr: 'Qwen3-ASR',
+    qwen3_aligner: 'Qwen3-FA',
+  }
+  return labels[alignerBackend.value] || alignerBackend.value
 })
 
 // 根据不同模式控制提交按钮的禁用状态
@@ -759,7 +863,8 @@ const isSubmitDisabled = computed(() => {
   if (processingMode.value === 'project-only') {
     return !formData.value.audioFile || (!formData.value.labFile && !formData.value.midiFile)
   }
-  return !formData.value.audioFile || !formData.value.text.trim() || !isReady.value
+  const noText = !formData.value.text.trim() && !isTextOptional.value
+  return !formData.value.audioFile || noText || !isReady.value
 })
 
 const handleLabMidiExceed = () => {
@@ -836,8 +941,12 @@ const clearJobPolling = () => {
 }
 
 const resetProcessingSteps = () => {
+  const stageLabel = alignerBackend.value === 'mfa' ? 'MFA 自动标注'
+    : alignerBackend.value === 'whisperx' ? 'WhisperX 对齐'
+    : alignerBackend.value === 'qwen3_asr' ? 'Qwen3-ASR 转录'
+    : 'Qwen3-FA 强制对齐'
   processingDetails.value = [
-    { stage: '1. MFA 自动标注', status: '等待', message: '准备进行音频对齐' },
+    { stage: `1. ${stageLabel}`, status: '等待', message: '准备进行音频对齐' },
     { stage: '2. F0 音高提取', status: '等待', message: '提取音频基频信息' },
     { stage: '3. 工程文件生成', status: '等待', message: '生成 Synthesizer V / OpenUtau 工程文件' }
   ]
@@ -924,10 +1033,22 @@ const waitForJobFinished = (jobId: string): Promise<any> => {
 const checkSystemStatus = async () => {
   checkingStatus.value = true
   try {
-    const res = await fetch('/api/pipeline/status')
-    const data = await res.json()
-    if (data.success) {
-      systemStatus.value = data.status
+    const [pipelineRes, alignerRes] = await Promise.all([
+      fetch('/api/pipeline/status'),
+      fetch('/api/aligner/status'),
+    ])
+    const pipelineData = await pipelineRes.json()
+    if (pipelineData.success) {
+      systemStatus.value = pipelineData.status
+      // 同步 alt_aligners 到 alignerStatus（如果 pipeline/status 已经包含了）
+      if (pipelineData.status?.alt_aligners) {
+        alignerStatus.value = pipelineData.status.alt_aligners
+      }
+    }
+    const alignerData = await alignerRes.json()
+    if (alignerData.success && alignerData.backends) {
+      const { mfa: _mfa, ...altBacks } = alignerData.backends
+      alignerStatus.value = altBacks
     }
     emit('status-changed')
   } catch (e) {
@@ -1118,18 +1239,18 @@ if (processingMode.value === 'project-only') {
 }
 
   // ============================================================
-  // 分支 2) 其他传统模式：需要输入文本和模型校验
+  // 分支 2) 其他传统模式：需要音频，非 ASR 后端需要文本
   // ============================================================
   if (!formData.value.audioFile) {
     ElMessage.warning('请选择音频文件')
     return
   }
-  if (!formData.value.text.trim()) {
-    ElMessage.warning('请输入文本')
+  if (!formData.value.text.trim() && !isTextOptional.value) {
+    ElMessage.warning('请输入文本（MFA / Qwen3-ForcedAligner 模式需要参考文本）')
     return
   }
   if (!isReady.value) {
-    ElMessage.error('系统未准备好或语言模型未下载')
+    ElMessage.error('当前对齐后端未就绪，请检查系统状态')
     return
   }
 
@@ -1153,6 +1274,7 @@ if (processingMode.value === 'project-only') {
     formDataObj.append('audio_file', formData.value.audioFile)
     formDataObj.append('text', formData.value.text)
     formDataObj.append('language', formData.value.language)
+    formDataObj.append('aligner_backend', alignerBackend.value)
 
     if (processingMode.value === 'full') {
       formDataObj.append('format', formData.value.outputFormat)
@@ -1187,11 +1309,11 @@ if (processingMode.value === 'project-only') {
       progressPercent.value = 35
 
       if (processingMode.value === 'mfa-only') {
-        updateProcessingStep(0, '进行中', 'MFA 自动标注中，请耐心等待...')
+        updateProcessingStep(0, '进行中', `${alignerBackendLabel.value} 对齐中，请耐心等待...`)
         updateProcessingStep(1, '等待', '仅标注模式将跳过此步骤')
         updateProcessingStep(2, '等待', '仅标注模式将跳过此步骤')
       } else {
-        updateProcessingStep(0, '进行中', 'MFA 标注 + F0 提取 + 工程文件生成中...')
+        updateProcessingStep(0, '进行中', `${alignerBackendLabel.value} 标注 + F0 提取 + 工程文件生成中...`)
         updateProcessingStep(1, '等待', '等待 F0 提取')
         updateProcessingStep(2, '等待', '等待工程文件生成')
       }
@@ -1321,6 +1443,7 @@ const reset = () => {
   progressPercent.value = 0
   currentJobId.value = ''
   resetProcessingSteps()
+  // alignerBackend 保留用户选择，不重置
 }
 
 const newProcess = () => {
