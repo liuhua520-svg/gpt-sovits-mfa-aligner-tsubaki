@@ -49,57 +49,54 @@
           </div>
         </el-form-item>
 
-        <!-- LAB / MIDI 合并上传（仅 project-only 模式） -->
-        <el-form-item v-if="processingMode === 'project-only'" label="LAB / MIDI 文件">
-          <el-upload
-            :key="labMidiUploadKey"
-            drag
-            action="#"
-            :auto-upload="false"
-            :multiple="true"
-            :limit="2"
-            :on-exceed="handleLabMidiExceed"
-            @change="handleLabMidiChange"
-            accept=".lab,.mid,.midi"
-          >
-            <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
-            <div class="el-upload__text">
-              拖拽或<em>点击选择</em>文件（可同时选择 LAB + MIDI）
-            </div>
-            <template #tip>
-              <div class="el-upload__tip">
-                <strong>.lab</strong>（可选）音素标注文件
-                &nbsp;·&nbsp;
-                <strong>.mid / .midi</strong>（可选）MIDI 音符 / BPM 来源
-                <br><span style="color:#e6a23c">⚠ LAB 和 MIDI 至少上传一项</span>
-              </div>
-            </template>
-          </el-upload>
+		<!-- LAB / MIDI 单文件上传（仅 project-only 模式） -->
+		<el-form-item v-if="processingMode === 'project-only'" label="LAB / MIDI 文件">
+		  <el-upload
+			:key="labMidiUploadKey"
+			drag
+			action="#"
+			:auto-upload="false"
+			:limit="1"
+			:on-exceed="handleLabMidiExceed"
+			@change="handleLabMidiChange"
+			accept=".lab,.mid,.midi"
+		  >
+			<el-icon class="el-icon--upload"><UploadFilled /></el-icon>
+			<div class="el-upload__text">
+			  拖拽或<em>点击选择</em>一个文件（LAB 或 MIDI）
+			</div>
+			<template #tip>
+			  <div class="el-upload__tip">
+				只允许导入一个文件：
+				<strong>.lab</strong> 音素标注
+				或
+				<strong>.mid / .midi</strong> MIDI 音符 / BPM 来源
+			  </div>
+			</template>
+		  </el-upload>
 
-          <!-- 已选文件状态行 -->
-          <div v-if="formData.labFile" class="file-info" style="margin-top:6px">
-            📄 {{ formData.labFile.name }} ({{ formatFileSize(formData.labFile.size) }})
-          </div>
-          <div v-if="formData.midiFile" class="file-info midi-loaded" style="margin-top:4px">
-            🎹 {{ formData.midiFile.name }} ({{ formatFileSize(formData.midiFile.size) }})
-            <span v-if="midiInfo.loaded" class="midi-bpm-tag">BPM {{ midiInfo.bpm }}</span>
-          </div>
+		  <div v-if="formData.labFile" class="file-info" style="margin-top:6px">
+			📄 {{ formData.labFile.name }} ({{ formatFileSize(formData.labFile.size) }})
+		  </div>
+		  <div v-if="formData.midiFile" class="file-info midi-loaded" style="margin-top:4px">
+			🎹 {{ formData.midiFile.name }} ({{ formatFileSize(formData.midiFile.size) }})
+			<span v-if="midiInfo.loaded" class="midi-bpm-tag">BPM {{ midiInfo.bpm }}</span>
+		  </div>
 
-          <!-- MIDI 接管提示 -->
-          <el-alert
-            v-if="midiLoaded"
-            type="info"
-            :closable="false"
-            show-icon
-            style="margin-top:8px"
-          >
-            <template #title>已导入 MIDI — 以下选项已由 MIDI 数据接管</template>
-            <p style="margin:4px 0 0;font-size:12px;color:#606266">
-              🔒 自动音符音高 &nbsp;·&nbsp; BPM &nbsp;·&nbsp; 基准音高 (MIDI Note)
-              <br>将直接从 MIDI 文件中读取，手动调整已被禁用
-            </p>
-          </el-alert>
-        </el-form-item>
+		  <el-alert
+			v-if="midiLoaded"
+			type="info"
+			:closable="false"
+			show-icon
+			style="margin-top:8px"
+		  >
+			<template #title>已导入 MIDI — 以下选项已由 MIDI 数据接管</template>
+			<p style="margin:4px 0 0;font-size:12px;color:#606266">
+			  🔒 自动音符音高 &nbsp;·&nbsp; BPM &nbsp;·&nbsp; 基准音高 (MIDI Note)
+			  <br>将直接从 MIDI 文件中读取，手动调整已被禁用
+			</p>
+		  </el-alert>
+		</el-form-item>
 
         <el-form-item v-if="processingMode !== 'project-only'" label="输入文本">
           <el-input
@@ -128,7 +125,7 @@
           <el-radio-group v-model="processingMode">
             <el-radio value="mfa-only">仅标注 (快速)</el-radio>
             <el-radio value="full">完整处理 (标注+F0+工程文件)</el-radio>
-            <el-radio value="project-only">仅生成工程 (WAV + LAB)</el-radio>
+            <el-radio value="project-only">仅生成工程 (WAV + LAB / MIDI)</el-radio>
           </el-radio-group>
           <div class="mode-help">
             <small v-if="processingMode === 'mfa-only'">
@@ -138,7 +135,7 @@
               执行完整流程：标注 → F0提取 → 工程文件生成
             </small>
             <small v-else>
-              直接整合现有 WAV 和 LAB / MIDI 生成工程文件，跳过 MFA 自动标注（LAB 与 MIDI 至少选一）
+              直接整合现有 WAV 和 LAB / MIDI 文件生成工程文件，跳过 MFA 自动标注
             </small>
           </div>
         </el-form-item>
@@ -738,10 +735,11 @@ let jobPollTimer: number | null = null
 
 // MIDI 导入状态
 const midiInfo = ref<{ bpm: number; loaded: boolean }>({ bpm: 120, loaded: false })
-const midiLoaded = computed(() => processingMode.value === 'project-only' && !!formData.value.midiFile)
-
-// LAB+MIDI 合并上传控件的 key（用于强制重置组件）
 const labMidiUploadKey = ref(0)
+
+const midiLoaded = computed(() => processingMode.value === 'project-only' && !!formData.value.midiFile)
+const hasNotationFile = computed(() => !!formData.value.labFile || !!formData.value.midiFile)
+const selectedNotationFile = computed(() => formData.value.labFile || formData.value.midiFile)
 
 // 计算属性
 const normalizedModels = computed(() => {
@@ -759,11 +757,44 @@ const isReady = computed(() => {
 // 根据不同模式控制提交按钮的禁用状态
 const isSubmitDisabled = computed(() => {
   if (processingMode.value === 'project-only') {
-    // project-only: 需要 WAV + (LAB 或 MIDI 至少一项)
     return !formData.value.audioFile || (!formData.value.labFile && !formData.value.midiFile)
   }
   return !formData.value.audioFile || !formData.value.text.trim() || !isReady.value
 })
+
+const handleLabMidiExceed = () => {
+  ElMessage.error('只能选择一个文件：LAB 或 MIDI')
+}
+
+const handleLabMidiChange = (file: any) => {
+  const raw: File | null = file?.raw || null
+  if (!raw) return
+
+  const ext = raw.name.toLowerCase().split('.').pop() || ''
+
+  // 先清空，确保只保留一个文件
+  formData.value.labFile = null
+  formData.value.midiFile = null
+  midiInfo.value = { bpm: 120, loaded: false }
+
+  if (ext === 'lab') {
+    formData.value.labFile = raw
+    labMidiUploadKey.value += 1
+    return
+  }
+
+  if (ext === 'mid' || ext === 'midi') {
+    formData.value.midiFile = raw
+    extractMidiBpm(raw).then(({ bpm }) => {
+      midiInfo.value = { bpm, loaded: true }
+    })
+    labMidiUploadKey.value += 1
+    return
+  }
+
+  ElMessage.error('只支持 .lab / .mid / .midi 文件')
+  labMidiUploadKey.value += 1
+}
 
 onMounted(() => {
   checkSystemStatus()
@@ -921,57 +952,11 @@ const handleExceed = () => {
 }
 
 const handleAudioSelect = (file: any) => {
-  formData.value.audioFile = file.raw || null
-}
+  const raw: File | null = file?.raw || null
+  if (!raw) return
 
-const handleLabSelect = (file: any) => {
-  formData.value.labFile = file.raw || null
-}
-
-const handleMidiSelect = (file: any) => {
-  formData.value.midiFile = file.raw || null
-  if (formData.value.midiFile) {
-    extractMidiBpm(formData.value.midiFile).then(({ bpm }) => {
-      midiInfo.value = { bpm, loaded: true }
-    })
-  } else {
-    midiInfo.value = { bpm: 120, loaded: false }
-  }
-}
-
-/**
- * LAB+MIDI 合并上传 - 文件列表变化时
- * 从当前 fileList 中分别提取 .lab 和 .mid/.midi 文件。
- */
-const handleLabMidiChange = (_file: any, fileList: any[]) => {
-  const labEntry  = fileList.find((f: any) => {
-    const name = (f.raw?.name || f.name || '').toLowerCase()
-    return name.endsWith('.lab')
-  })
-  const midiEntry = fileList.find((f: any) => {
-    const name = (f.raw?.name || f.name || '').toLowerCase()
-    return name.endsWith('.mid') || name.endsWith('.midi')
-  })
-
-  formData.value.labFile  = labEntry?.raw  || null
-  formData.value.midiFile = midiEntry?.raw || null
-
-  if (formData.value.midiFile) {
-    extractMidiBpm(formData.value.midiFile).then(({ bpm }) => {
-      midiInfo.value = { bpm, loaded: true }
-      // MIDI BPM 自动同步到 advanced 设置，方便用户查看
-      advancedConfig.value.bpm = bpm
-    })
-  } else {
-    midiInfo.value = { bpm: 120, loaded: false }
-  }
-}
-
-/**
- * LAB+MIDI 合并上传 - 超过文件数限制时提示
- */
-const handleLabMidiExceed = () => {
-  ElMessage.warning('最多可同时上传 1 个 LAB 文件 + 1 个 MIDI 文件（共 2 个）')
+  formData.value.audioFile = raw
+  error.value = ''
 }
 
 /**
@@ -1026,106 +1011,111 @@ const processAudio = async () => {
   // ============================================================
   // 分支 1) 仅工程文件模式：WAV + LAB -> 直接转工程文件
   // ============================================================
-  if (processingMode.value === 'project-only') {
-    if (!formData.value.audioFile) {
-      ElMessage.warning('请选择 WAV 文件')
-      return
+if (processingMode.value === 'project-only') {
+  if (!formData.value.audioFile) {
+    ElMessage.warning('请选择 WAV 文件')
+    return
+  }
+
+  const notationFile = selectedNotationFile.value
+  if (!notationFile) {
+    ElMessage.warning('请选择 LAB 或 MIDI 文件')
+    return
+  }
+
+  const notationExt = notationFile.name.toLowerCase().split('.').pop() || ''
+  if (!['lab', 'mid', 'midi'].includes(notationExt)) {
+    ElMessage.warning('请选择有效的 LAB / MIDI 文件')
+    return
+  }
+
+  clearJobPolling()
+  processing.value = true
+  progressPercent.value = 0
+  error.value = ''
+  result.value = null
+  currentJobId.value = ''
+  resetProcessingSteps()
+  updateProcessingStep(0, '跳过', '工程文件模式：已跳过 MFA 自动标注')
+  updateProcessingStep(1, '进行中', 'F0 提取 + 工程文件生成中，请耐心等待...')
+  updateProcessingStep(2, '等待', '等待工程文件生成')
+
+  let progressTimer: number | null = null
+
+  try {
+    const formDataObj = new FormData()
+    formDataObj.append('wav_file', formData.value.audioFile)
+    formDataObj.append('format', formData.value.outputFormat)
+    formDataObj.append('title', formData.value.projectTitle)
+    formDataObj.append('phoneme_mode', formData.value.phonemeMode)
+    formDataObj.append('bpm', advancedConfig.value.bpm.toString())
+    formDataObj.append('base_pitch', advancedConfig.value.base_pitch.toString())
+    formDataObj.append('f0_method', advancedConfig.value.f0_method)
+    formDataObj.append('f0_device', advancedConfig.value.f0_device)
+    formDataObj.append('crepe_model', advancedConfig.value.crepe_model)
+    formDataObj.append('f0_smooth', advancedConfig.value.f0_smooth.toString())
+    formDataObj.append('f0_smooth_window', advancedConfig.value.f0_smooth_window.toString())
+    formDataObj.append('precision', advancedConfig.value.precision)
+    formDataObj.append('f0_floor', advancedConfig.value.f0_floor.toString())
+    formDataObj.append('f0_ceil', advancedConfig.value.f0_ceil.toString())
+    formDataObj.append('auto_note_pitch', advancedConfig.value.auto_note_pitch.toString())
+    formDataObj.append('export_pitch_line', advancedConfig.value.export_pitch_line.toString())
+
+    // 只传一个标注文件：LAB 或 MIDI 二选一
+    if (notationExt === 'lab') {
+      formDataObj.append('lab_file', notationFile)
+    } else {
+      formDataObj.append('midi_file', notationFile)
     }
-    if (!formData.value.labFile && !formData.value.midiFile) {
-      ElMessage.warning('请选择 LAB 文件或 MIDI 文件（至少一项）')
-      return
-    }
 
-    clearJobPolling()
-    processing.value = true
-    progressPercent.value = 0
-    error.value = ''
-    result.value = null
-    currentJobId.value = ''
-    resetProcessingSteps()
-    updateProcessingStep(0, '跳过', '工程文件模式：已跳过 MFA 自动标注')
-    updateProcessingStep(1, '进行中', 'F0 提取 + 工程文件生成中，请耐心等待...')
-    updateProcessingStep(2, '等待', '等待工程文件生成')
+    progressTimer = window.setInterval(() => {
+      if (progressPercent.value < 30) progressPercent.value += 3
+    }, 400)
 
-    let progressTimer: number | null = null
+    const res = await fetch('/api/pipeline/project-only', {
+      method: 'POST',
+      body: formDataObj,
+    })
+    const data = await res.json()
 
-    try {
-      const formDataObj = new FormData()
-      formDataObj.append('wav_file', formData.value.audioFile)
-      // LAB 可选：有就传，没有就依赖 MIDI
-      if (formData.value.labFile) {
-        formDataObj.append('lab_file', formData.value.labFile)
-      }
-      formDataObj.append('format', formData.value.outputFormat)
-      formDataObj.append('title', formData.value.projectTitle)
-      formDataObj.append('phoneme_mode', formData.value.phonemeMode)
-      formDataObj.append('bpm', advancedConfig.value.bpm.toString())
-      formDataObj.append('base_pitch', advancedConfig.value.base_pitch.toString())
-      formDataObj.append('f0_method', advancedConfig.value.f0_method)
-      formDataObj.append('f0_device', advancedConfig.value.f0_device)
-      formDataObj.append('crepe_model', advancedConfig.value.crepe_model)
-      formDataObj.append('f0_smooth', advancedConfig.value.f0_smooth.toString())
-      formDataObj.append('f0_smooth_window', advancedConfig.value.f0_smooth_window.toString())
-      formDataObj.append('precision', advancedConfig.value.precision)
-      formDataObj.append('f0_floor', advancedConfig.value.f0_floor.toString())
-      formDataObj.append('f0_ceil', advancedConfig.value.f0_ceil.toString())
-      formDataObj.append('auto_note_pitch', advancedConfig.value.auto_note_pitch.toString())
-      formDataObj.append('export_pitch_line', advancedConfig.value.export_pitch_line.toString())
-      // MIDI 可选：有就传
-      if (formData.value.midiFile) {
-        formDataObj.append('midi_file', formData.value.midiFile)
-      }
+    if (!res.ok) throw new Error(data.error || '提交失败')
 
-      progressTimer = window.setInterval(() => {
-        if (progressPercent.value < 30) progressPercent.value += 3
-      }, 400)
+    if (data.job_id) {
+      if (progressTimer !== null) { window.clearInterval(progressTimer); progressTimer = null }
+      progressPercent.value = 35
 
-      const res = await fetch('/api/pipeline/project-only', {
-        method: 'POST',
-        body: formDataObj,
-      })
-      const data = await res.json()
+      const finalPayload = await waitForJobFinished(data.job_id)
+      const normalized = normalizeResult(finalPayload)
 
-      if (!res.ok) throw new Error(data.error || '提交失败')
+      if (!normalized.projectPath) throw new Error('工程文件未生成，无法视为处理成功')
 
-      // 异步任务轮询（后端返回 job_id）
-      if (data.job_id) {
-        if (progressTimer !== null) { window.clearInterval(progressTimer); progressTimer = null }
-        progressPercent.value = 35
-
-        const finalPayload = await waitForJobFinished(data.job_id)
-        const normalized = normalizeResult(finalPayload)
-
-        if (!normalized.projectPath) throw new Error('工程文件未生成，无法视为处理成功')
-
-        result.value = normalized
-        progressPercent.value = 100
-        updateProcessingStep(0, '跳过', '工程文件模式不需要 MFA 标注')
-        updateProcessingStep(1, '完成', 'F0 提取已完成')
-        updateProcessingStep(2, '完成', `工程文件已生成: ${getFileName(normalized.projectPath)}`)
-        ElMessage.success('✅ 工程文件生成成功！')
-        return
-      }
-
-      // 向下兼容：同步结果回退（后端仍为同步时生效）
-      if (!data.success) throw new Error(data.error || '工程文件生成失败')
-      const normalized = normalizeResult(data)
       result.value = normalized
       progressPercent.value = 100
       updateProcessingStep(0, '跳过', '工程文件模式不需要 MFA 标注')
       updateProcessingStep(1, '完成', 'F0 提取已完成')
-      updateProcessingStep(2, '完成', `工程文件已生成: ${getFileName(normalized.projectPath || '')}`)
+      updateProcessingStep(2, '完成', `工程文件已生成: ${getFileName(normalized.projectPath)}`)
       ElMessage.success('✅ 工程文件生成成功！')
-    } catch (e: any) {
-      error.value = e?.message || String(e)
-      ElMessage.error(`❌ ${error.value}`)
-    } finally {
-      if (progressTimer !== null) window.clearInterval(progressTimer)
-      clearJobPolling()
-      processing.value = false
+      return
     }
-    return
+
+    if (!data.success) throw new Error(data.error || '工程文件生成失败')
+    const normalized = normalizeResult(data)
+    result.value = normalized
+    progressPercent.value = 100
+    updateProcessingStep(0, '跳过', '工程文件模式不需要 MFA 标注')
+    updateProcessingStep(1, '完成', 'F0 提取已完成')
+    updateProcessingStep(2, '完成', `工程文件已生成: ${getFileName(normalized.projectPath || '')}`)
+    ElMessage.success('✅ 工程文件生成成功！')
+  } catch (e: any) {
+    error.value = e?.message || String(e)
+    ElMessage.error(`❌ ${error.value}`)
+  } finally {
+    if (progressTimer !== null) window.clearInterval(progressTimer)
+    clearJobPolling()
+    processing.value = false
   }
+  return
+}
 
   // ============================================================
   // 分支 2) 其他传统模式：需要输入文本和模型校验
@@ -1325,7 +1315,7 @@ const reset = () => {
     phonemeMode: 'none'
   }
   midiInfo.value = { bpm: 120, loaded: false }
-  labMidiUploadKey.value++   // 强制重置上传组件
+  labMidiUploadKey.value += 1
   result.value = null
   error.value = ''
   progressPercent.value = 0
