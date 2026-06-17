@@ -1220,8 +1220,9 @@ class TsubakiProcessor:
             if midi_exists:
                 try:
                     from dataclasses import replace as _dc_replace
-                    from midi_processor import parse_midi_notes
-                    midi_bpm, midi_notes = parse_midi_notes(midi_path)
+                    from midi_processor import parse_midi_notes_with_lyrics
+                    midi_bpm, midi_notes, midi_lyrics = parse_midi_notes_with_lyrics(midi_path)
+                    midi_lyric_words = self._midi_lyrics_to_words(midi_lyrics)
                     if midi_bpm and midi_bpm > 0:
                         config = _dc_replace(config, bpm=float(midi_bpm))
                         logger.info(f"✓ MIDI BPM 已覆盖 config.bpm → {midi_bpm:.1f}")
@@ -1234,42 +1235,36 @@ class TsubakiProcessor:
             if lab_exists:
                 segments = self._load_lab_segments(str(lab_path))
 
-                # 音素转换模式（仅 LAB 来源有效）
+                # 如果 MIDI 里有歌词，就覆盖 LAB 的 label
+                if midi_lyric_words:
+                    segments = self._apply_midi_lyrics_to_segments(segments, midi_lyric_words)
+
                 if phoneme_mode and phoneme_mode != "none":
                     try:
                         from phoneme_converter import apply_phoneme_mode
-                        seg_tuples = [
-                            (s.start_time, s.end_time, s.label) for s in segments
-                        ]
+                        seg_tuples = [(s.start_time, s.end_time, s.label) for s in segments]
                         converted = apply_phoneme_mode(seg_tuples, phoneme_mode)
                         segments = [
                             LabelSegment(start_time=t[0], end_time=t[1], label=t[2])
                             for t in converted
                         ]
-                        logger.info(
-                            f"音素转换完成 (mode={phoneme_mode}): "
-                            f"{len(segments)} 个音节段落"
-                        )
+                        logger.info(f"音素转换完成 (mode={phoneme_mode}): {len(segments)} 个音节段落")
                     except Exception as _pm_err:
-                        logger.warning(
-                            f"音素转换失败 (mode={phoneme_mode}): {_pm_err}，"
-                            f"回退到原始音素"
-                        )
+                        logger.warning(f"音素转换失败 (mode={phoneme_mode}): {_pm_err}，回退到原始音素")
             else:
-                # 纯 MIDI 模式：从 MIDI 音符自动生成段落
                 if not midi_notes:
-                    return {
-                        "success": False,
-                        "error": "MIDI 文件解析失败，无法生成段落",
-                    }
-                lyric_words = (
-                    _split_lyrics_to_words(lyrics_text)
-                    if lyrics_text and lyrics_text.strip()
-                    else None
-                )
+                    return {"success": False, "error": "MIDI 文件解析失败，无法生成段落"}
+
+                # 纯 MIDI 模式：优先用 MIDI 自带歌词；没有的话再用外部 lyrics_text
+                lyric_words = midi_lyric_words
+                if not lyric_words and lyrics_text and lyrics_text.strip():
+                    lyric_words = _split_lyrics_to_words(lyrics_text)
+
                 segments = self._segments_from_midi_notes(
-                    midi_notes, lyric_words=lyric_words
+                    midi_notes,
+                    lyric_words=lyric_words
                 )
+
                 logger.info(
                     f"✓ 从 MIDI 生成段落: {len(segments)} 个"
                     f"（歌词字数: {len(lyric_words) if lyric_words else 0}）"
@@ -1335,6 +1330,61 @@ class TsubakiProcessor:
         except Exception as e:
             logger.error(f"工程文件生成失败: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
+
+    def _midi_lyrics_to_words(self, midi_lyrics) -> List[str]:
+        """
+        把 MIDI lyrics meta event 转成顺序词表。
+        这里复用你现有的 _split_lyrics_to_words 逻辑。
+        """
+        words: List[str] = []
+        if not midi_lyrics:
+            return words
+
+        for ev in midi_lyrics:
+            txt = (ev.text or "").strip()
+            if not txt:
+                continue
+            words.extend(_split_lyrics_to_words(txt))
+        return words
+
+
+    def _apply_midi_lyrics_to_segments(self, segments, lyric_words: List[str]):
+        """
+        用 MIDI 歌词覆盖段落 label。
+        保留显式静音段（sil/pau/sp/spn），其余段按顺序写入歌词。
+        """
+        if not lyric_words:
+            return segments
+
+        silence_tokens = {"sil", "pau", "sp", "spn", "rest"}
+        out = []
+        idx = 0
+
+        for seg in segments:
+            label = (seg.label or "").strip()
+            lower = label.lower()
+
+            # 显式静音段保留
+            if lower in silence_tokens:
+                out.append(seg)
+                continue
+
+            # 非静音段：优先写入 MIDI 歌词
+            if idx < len(lyric_words):
+                new_label = lyric_words[idx]
+                idx += 1
+            else:
+                new_label = label
+
+            out.append(
+                LabelSegment(
+                    start_time=seg.start_time,
+                    end_time=seg.end_time,
+                    label=new_label,
+                )
+            )
+
+        return out
 
     def _build_midi_output(
         self,
