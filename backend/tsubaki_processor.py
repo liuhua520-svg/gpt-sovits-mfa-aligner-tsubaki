@@ -1217,19 +1217,28 @@ class TsubakiProcessor:
 
             # ── ① MIDI 优先解析（BPM + 音符，供后续用） ───────────────────────
             midi_notes = None
+            midi_lyric_words = []
+
             if midi_exists:
                 try:
                     from dataclasses import replace as _dc_replace
                     from midi_processor import parse_midi_notes_with_lyrics
+
                     midi_bpm, midi_notes, midi_lyrics = parse_midi_notes_with_lyrics(midi_path)
-                    midi_lyric_words = self._midi_lyrics_to_words(midi_lyrics)
+
                     if midi_bpm and midi_bpm > 0:
                         config = _dc_replace(config, bpm=float(midi_bpm))
                         logger.info(f"✓ MIDI BPM 已覆盖 config.bpm → {midi_bpm:.1f}")
+
                     logger.info(f"✓ MIDI 音符导入: {len(midi_notes)} 个")
+
+                    midi_lyric_words = self._midi_lyrics_to_words(midi_lyrics)
+                    logger.info(f"✓ MIDI 歌词导入: {len(midi_lyric_words)} 个词")
+
                 except Exception as _midi_err:
                     logger.warning(f"⚠ MIDI 解析失败，回退到默认模式: {_midi_err}")
                     midi_notes = None
+                    midi_lyric_words = []
 
             # ── ② 段落来源：优先 LAB，否则从 MIDI 音符生成 ──────────────────
             if lab_exists:
