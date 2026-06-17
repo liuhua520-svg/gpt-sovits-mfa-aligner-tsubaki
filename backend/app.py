@@ -664,9 +664,12 @@ def run_project_only_job(
 def pipeline_project_only():
     """
     仅执行工程文件生成（异步后台任务版）：
-    - 只需要 WAV + LAB
-    - 不需要 text
-    - 立即返回 job_id，前端轮询 /api/pipeline/job/<job_id>
+    - 需要 WAV
+    - LAB / MIDI 至少提供一个
+    - 支持三种上传方式：
+      1) wav_file + lab_file
+      2) wav_file + midi_file
+      3) wav_file + notation_file（自动按扩展名识别 .lab / .mid / .midi）
     """
     try:
         # 读取工程参数
@@ -682,52 +685,58 @@ def pipeline_project_only():
         f0_ceil = float(request.form.get("f0_ceil", 800.0))
         f0_device = request.form.get("f0_device", "auto")
         crepe_model = request.form.get("crepe_model", "full")
-
-        # 是否根据 F0 细化音高
         refine_pitch = request.form.get("auto_note_pitch", "false").lower() == "true"
-
-        # 是否导出音高线到工程文件
         export_pitch_line = request.form.get("export_pitch_line", "false").lower() == "true"
-
-        # 音素转换模式: none / merge / hiragana / katakana
         phoneme_mode = request.form.get("phoneme_mode", "none")
-        lyrics_text   = request.form.get("lyrics_text", "").strip()   # ← 追加
+        lyrics_text = request.form.get("lyrics_text", "").strip()
+
         if phoneme_mode not in ("none", "merge", "hiragana", "katakana"):
             logger.warning(f"未知 phoneme_mode '{phoneme_mode}'，回退到 'none'")
             phoneme_mode = "none"
 
         # 兼容两种输入方式：
-        # 1) 前端上传文件：wav_file（必选）+ lab_file（可选）
-        # 2) 已有路径：wav_path（必选）+ lab_path（可选）
-        # LAB 和 MIDI 至少需要提供其中一个。
+        # 1) 前端上传文件：wav_file（必选）+ lab_file / midi_file / notation_file（二选一）
+        # 2) 已有路径：wav_path（必选）+ lab_path / midi_path（二选一）
         wav_path = request.form.get("wav_path")
         lab_path = request.form.get("lab_path") or ""
+        midi_path = ""
 
         wav_file = request.files.get("wav_file")
         lab_file = request.files.get("lab_file")
+        midi_file = request.files.get("midi_file")
+        notation_file = request.files.get("notation_file")
 
         if wav_file is not None:
             stem, wav_path_obj, lab_path_obj = build_job_paths(wav_file.filename or "audio.wav")
             wav_file.save(str(wav_path_obj))
             wav_path = str(wav_path_obj)
 
-            if lab_file is not None and lab_file.filename:
-                lab_file.save(str(lab_path_obj))
-                lab_path = str(lab_path_obj)
+            def _save_notation_as_path(storage):
+                nonlocal lab_path, midi_path
+                if storage is None or not storage.filename:
+                    return
+                filename = storage.filename.lower()
+                if filename.endswith(".lab"):
+                    storage.save(str(lab_path_obj))
+                    lab_path = str(lab_path_obj)
+                elif filename.endswith(".mid") or filename.endswith(".midi"):
+                    midi_stem = sanitize_stem(storage.filename)
+                    midi_stem = fit_stem_to_limit(str(WORK_DIR), f"{midi_stem}_{uuid.uuid4().hex[:6]}")
+                    midi_path_obj = WORK_DIR / f"{midi_stem}.mid"
+                    storage.save(str(midi_path_obj))
+                    midi_path = str(midi_path_obj)
+                else:
+                    raise ValueError("notation_file 只支持 .lab / .mid / .midi")
+
+            # 优先使用统一入口 notation_file；没有的话再兼容旧字段
+            if notation_file is not None and notation_file.filename:
+                _save_notation_as_path(notation_file)
+            else:
+                _save_notation_as_path(lab_file)
+                _save_notation_as_path(midi_file)
 
         if not wav_path:
             return jsonify({"error": "请提供 wav_file 或 wav_path"}), 400
-
-        # ── MIDI 文件（可选）──────────────────────────────────────────────────
-        midi_path = ""
-        midi_file = request.files.get("midi_file")
-        if midi_file is not None and midi_file.filename:
-            midi_stem = sanitize_stem(midi_file.filename)
-            midi_stem = fit_stem_to_limit(str(WORK_DIR), f"{midi_stem}_{uuid.uuid4().hex[:6]}")
-            midi_path_obj = WORK_DIR / f"{midi_stem}.mid"
-            midi_file.save(str(midi_path_obj))
-            midi_path = str(midi_path_obj)
-            logger.info(f"MIDI 文件已保存: {midi_path}")
 
         # ── 格式校验 + 文件存在性校验 ─────────────────────────────────────
         supported_formats = pipeline.get_supported_formats().get("formats", [])
@@ -740,18 +749,21 @@ def pipeline_project_only():
         if not os.path.exists(wav_path):
             return jsonify({"error": f"WAV 文件不存在: {wav_path}"}), 400
 
-        lab_exists  = bool(lab_path  and os.path.exists(lab_path))
+        lab_exists = bool(lab_path and os.path.exists(lab_path))
         midi_exists = bool(midi_path and os.path.exists(midi_path))
 
         if not lab_exists and not midi_exists:
             return jsonify({
                 "error": "请提供 LAB 文件或 MIDI 文件（至少提供其中一个）",
-                "hint":  "通过 lab_file/lab_path 上传 LAB，或通过 midi_file 上传 MIDI"
+                "hint": "通过 lab_file / notation_file 上传 LAB，或通过 midi_file / notation_file 上传 MIDI"
             }), 400
 
         logger.info(
             "工程文件模式启动 (异步): format=%s wav=%s lab=%s midi=%s",
-            output_format, wav_path, lab_path or "(无 LAB)", midi_path or "(无 MIDI)",
+            output_format,
+            wav_path,
+            lab_path or "(无 LAB)",
+            midi_path or "(无 MIDI)",
         )
 
         job_id = uuid.uuid4().hex
@@ -767,7 +779,7 @@ def pipeline_project_only():
             args=(
                 job_id,
                 wav_path,
-                lab_path or "",   # 空字符串 = 不提供 LAB
+                lab_path or "",
                 output_format,
                 project_title,
                 bpm,
@@ -784,6 +796,7 @@ def pipeline_project_only():
                 crepe_model,
                 phoneme_mode,
                 midi_path,
+                lyrics_text,
             ),
         ).start()
 
