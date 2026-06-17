@@ -598,6 +598,7 @@ def run_project_only_job(
     f0_device: str,
     crepe_model: str,
     phoneme_mode: str,
+    midi_path: str,           # MIDI 文件路径（空字符串 = 未导入）
 ):
     try:
         set_job(
@@ -624,6 +625,7 @@ def run_project_only_job(
             f0_device=f0_device,
             crepe_model=crepe_model,
             phoneme_mode=phoneme_mode,
+            midi_path=midi_path or None,
         )
 
         if result.get("success"):
@@ -712,6 +714,17 @@ def pipeline_project_only():
         if not wav_path or not lab_path:
             return jsonify({"error": "请提供 wav_path/lab_path 或 wav_file/lab_file"}), 400
 
+        # ── MIDI 文件（可选）──────────────────────────────────────────────────
+        midi_path = ""
+        midi_file = request.files.get("midi_file")
+        if midi_file is not None and midi_file.filename:
+            midi_stem = sanitize_stem(midi_file.filename)
+            midi_stem = fit_stem_to_limit(str(WORK_DIR), f"{midi_stem}_{uuid.uuid4().hex[:6]}")
+            midi_path_obj = WORK_DIR / f"{midi_stem}.mid"
+            midi_file.save(str(midi_path_obj))
+            midi_path = str(midi_path_obj)
+            logger.info(f"MIDI 文件已保存: {midi_path}")
+
         supported_formats = pipeline.get_supported_formats().get("formats", [])
         if output_format not in supported_formats:
             return jsonify({
@@ -726,8 +739,8 @@ def pipeline_project_only():
             return jsonify({"error": f"LAB 文件不存在: {lab_path}"}), 400
 
         logger.info(
-            "工程文件模式启动 (异步): format=%s wav=%s lab=%s",
-            output_format, wav_path, lab_path
+            "工程文件模式启动 (异步): format=%s wav=%s lab=%s midi=%s",
+            output_format, wav_path, lab_path, midi_path or "(无)",
         )
 
         job_id = uuid.uuid4().hex
@@ -759,6 +772,7 @@ def pipeline_project_only():
                 f0_device,
                 crepe_model,
                 phoneme_mode,
+                midi_path,          # 新增：MIDI 文件路径
             ),
         ).start()
 

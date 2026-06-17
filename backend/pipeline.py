@@ -230,6 +230,7 @@ class AudioProcessingPipeline:
         f0_device: str = "auto",
         crepe_model: str = "full",
         phoneme_mode: str = "none",
+        midi_path: str = None,           # MIDI 文件路径（可选）
     ) -> Dict:
         """仅执行工程文件生成（已有 WAV 和 LAB）"""
         import time
@@ -274,6 +275,7 @@ class AudioProcessingPipeline:
                 config=config,
                 audio_f0_data=audio_data,
                 phoneme_mode=phoneme_mode,
+                midi_path=midi_path,
             )
 
             result["processing_time"] = int((time.time() - start_time) * 1000)

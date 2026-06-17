@@ -663,6 +663,7 @@ class TsubakiProcessor:
         wav_path: str,
         config: AudioProcessingConfig,
         audio_duration_sec: Optional[float] = None,
+        midi_notes: Optional[List] = None,   # MIDI 导入：(start_sec, end_sec, pitch) 列表
     ) -> str:
         """
         生成可被 Synthesizer V 正确识别的 SVP JSON 文本。
@@ -716,7 +717,14 @@ class TsubakiProcessor:
 
             # 下面不再需要 else，原本 else 内部的代码直接靠左对齐正常运行即可
             tone = base_tone
-            if config.refine_pitch and t is not None and f0 is not None and len(f0) > 0:
+            if midi_notes is not None:
+                # ── MIDI 模式：直接从 MIDI 文件读取该段的音符音高 ──
+                from midi_processor import map_segment_to_midi_pitch
+                _start_sec = self._lab_time_to_seconds(seg.start_time)
+                _end_sec   = self._lab_time_to_seconds(seg.end_time)
+                tone = map_segment_to_midi_pitch(_start_sec, _end_sec, midi_notes,
+                                                 base_pitch=base_tone)
+            elif config.refine_pitch and t is not None and f0 is not None and len(f0) > 0:
                 start_sec = self._lab_time_to_seconds(seg.start_time)
                 end_sec   = self._lab_time_to_seconds(seg.end_time)
                 mask      = (t >= start_sec) & (t < end_sec)
@@ -861,6 +869,7 @@ class TsubakiProcessor:
         wav_path: str,
         config: AudioProcessingConfig,
         audio_duration_sec: Optional[float] = None,
+        midi_notes: Optional[List] = None,   # MIDI 导入：(start_sec, end_sec, pitch) 列表
     ) -> str:
         """
         生成 USTX 工程文件内容。
@@ -924,8 +933,13 @@ class TsubakiProcessor:
             dur_tick = max(1, end_pos - pos)
 
             tone = int(config.base_pitch)
-            # refine_pitch：用该段 F0 中位数半音作为音符音高
-            if config.refine_pitch and f0 is not None and t is not None:
+            if midi_notes is not None:
+                # ── MIDI 模式：直接从 MIDI 文件读取该段的音符音高 ──
+                from midi_processor import map_segment_to_midi_pitch
+                tone = map_segment_to_midi_pitch(start_sec, end_sec, midi_notes,
+                                                 base_pitch=int(config.base_pitch))
+            elif config.refine_pitch and f0 is not None and t is not None:
+                # refine_pitch：用该段 F0 中位数半音作为音符音高
                 mask   = (t >= start_sec) & (t < end_sec)
                 seg_f0 = f0[mask]
                 voiced = seg_f0[seg_f0 > 0]
@@ -1073,6 +1087,7 @@ class TsubakiProcessor:
         config: Optional[AudioProcessingConfig] = None,
         audio_f0_data: Optional[Dict] = None,
         phoneme_mode: str = "none",
+        midi_path: Optional[str] = None,   # MIDI 文件路径（可选）
     ) -> Dict:
         """完整工程文件生成入口：读取 WAV + LAB，生成 SVP / USTX 文件。"""
         try:
@@ -1122,6 +1137,21 @@ class TsubakiProcessor:
                 t  = audio_f0_data.get("t")
                 sr = audio_f0_data.get("sr")
 
+            # ── MIDI 导入：解析音符音高 + 覆盖 BPM ──────────────────────────
+            midi_notes = None
+            if midi_path and Path(midi_path).exists():
+                try:
+                    from dataclasses import replace as _dc_replace
+                    from midi_processor import parse_midi_notes
+                    midi_bpm, midi_notes = parse_midi_notes(midi_path)
+                    if midi_bpm and midi_bpm > 0:
+                        config = _dc_replace(config, bpm=float(midi_bpm))
+                        logger.info(f"✓ MIDI BPM 已覆盖 config.bpm → {midi_bpm:.1f}")
+                    logger.info(f"✓ MIDI 音符导入: {len(midi_notes)} 个音符")
+                except Exception as _midi_err:
+                    logger.warning(f"⚠ MIDI 解析失败，回退到默认模式: {_midi_err}")
+                    midi_notes = None
+
             fmt = self._normalize_output_format(output_format)
 
             if fmt == "sv":
@@ -1129,6 +1159,7 @@ class TsubakiProcessor:
                     title=project_title, segments=segments,
                     f0=f0, t=t, sr=sr, wav_path=wav_path,
                     config=config, audio_duration_sec=audio_duration_sec,
+                    midi_notes=midi_notes,
                 )
                 out_path = self.work_dir / f"{Path(wav_path).stem}.svp"
 
@@ -1137,6 +1168,7 @@ class TsubakiProcessor:
                     title=project_title, segments=segments,
                     f0=f0, t=t, sr=sr, wav_path=wav_path,
                     config=config, audio_duration_sec=audio_duration_sec,
+                    midi_notes=midi_notes,
                 )
                 out_path = self.work_dir / f"{Path(wav_path).stem}.ustx"
 
