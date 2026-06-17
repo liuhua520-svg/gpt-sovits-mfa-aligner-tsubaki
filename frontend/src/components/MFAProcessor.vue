@@ -68,9 +68,10 @@
             </div>
             <template #tip>
               <div class="el-upload__tip">
-                <strong>.lab</strong>（必须）标注文件
-                &nbsp;+&nbsp;
-                <strong>.mid / .midi</strong>（可选）导入后音符音高与 BPM 从 MIDI 读取
+                <strong>.lab</strong>（可选）音素标注文件
+                &nbsp;·&nbsp;
+                <strong>.mid / .midi</strong>（可选）MIDI 音符 / BPM 来源
+                <br><span style="color:#e6a23c">⚠ LAB 和 MIDI 至少上传一项</span>
               </div>
             </template>
           </el-upload>
@@ -137,7 +138,7 @@
               执行完整流程：标注 → F0提取 → 工程文件生成
             </small>
             <small v-else>
-              直接整合现有 WAV 和 LAB 文件生成工程文件，跳过 MFA 自动标注
+              直接整合现有 WAV 和 LAB / MIDI 生成工程文件，跳过 MFA 自动标注（LAB 与 MIDI 至少选一）
             </small>
           </div>
         </el-form-item>
@@ -146,6 +147,7 @@
           <el-select v-model="formData.outputFormat" placeholder="选择输出格式">
             <el-option label="Synthesizer V Studio (.svp)" value="sv" />
             <el-option label="OpenUtau/UTAU (.ustx)" value="utau" />
+            <el-option label="MIDI 标准文件 (.mid)" value="midi" />
           </el-select>
         </el-form-item>
 
@@ -738,6 +740,9 @@ let jobPollTimer: number | null = null
 const midiInfo = ref<{ bpm: number; loaded: boolean }>({ bpm: 120, loaded: false })
 const midiLoaded = computed(() => processingMode.value === 'project-only' && !!formData.value.midiFile)
 
+// LAB+MIDI 合并上传控件的 key（用于强制重置组件）
+const labMidiUploadKey = ref(0)
+
 // 计算属性
 const normalizedModels = computed(() => {
   const defaultModels = { cmn: false, eng: false, jpn: false, kor: false, yue: false }
@@ -754,7 +759,8 @@ const isReady = computed(() => {
 // 根据不同模式控制提交按钮的禁用状态
 const isSubmitDisabled = computed(() => {
   if (processingMode.value === 'project-only') {
-    return !formData.value.audioFile || !formData.value.labFile
+    // project-only: 需要 WAV + (LAB 或 MIDI 至少一项)
+    return !formData.value.audioFile || (!formData.value.labFile && !formData.value.midiFile)
   }
   return !formData.value.audioFile || !formData.value.text.trim() || !isReady.value
 })
@@ -934,6 +940,41 @@ const handleMidiSelect = (file: any) => {
 }
 
 /**
+ * LAB+MIDI 合并上传 - 文件列表变化时
+ * 从当前 fileList 中分别提取 .lab 和 .mid/.midi 文件。
+ */
+const handleLabMidiChange = (_file: any, fileList: any[]) => {
+  const labEntry  = fileList.find((f: any) => {
+    const name = (f.raw?.name || f.name || '').toLowerCase()
+    return name.endsWith('.lab')
+  })
+  const midiEntry = fileList.find((f: any) => {
+    const name = (f.raw?.name || f.name || '').toLowerCase()
+    return name.endsWith('.mid') || name.endsWith('.midi')
+  })
+
+  formData.value.labFile  = labEntry?.raw  || null
+  formData.value.midiFile = midiEntry?.raw || null
+
+  if (formData.value.midiFile) {
+    extractMidiBpm(formData.value.midiFile).then(({ bpm }) => {
+      midiInfo.value = { bpm, loaded: true }
+      // MIDI BPM 自动同步到 advanced 设置，方便用户查看
+      advancedConfig.value.bpm = bpm
+    })
+  } else {
+    midiInfo.value = { bpm: 120, loaded: false }
+  }
+}
+
+/**
+ * LAB+MIDI 合并上传 - 超过文件数限制时提示
+ */
+const handleLabMidiExceed = () => {
+  ElMessage.warning('最多可同时上传 1 个 LAB 文件 + 1 个 MIDI 文件（共 2 个）')
+}
+
+/**
  * 从 MIDI 文件的二进制内容中解析第一个 set_tempo 事件，换算成 BPM。
  * 纯浏览器端解析，不需要额外库。
  * MIDI Tempo meta event 格式: 0xFF 0x51 0x03 <3-byte microseconds>
@@ -990,8 +1031,8 @@ const processAudio = async () => {
       ElMessage.warning('请选择 WAV 文件')
       return
     }
-    if (!formData.value.labFile) {
-      ElMessage.warning('请选择 LAB 文件')
+    if (!formData.value.labFile && !formData.value.midiFile) {
+      ElMessage.warning('请选择 LAB 文件或 MIDI 文件（至少一项）')
       return
     }
 
@@ -1011,7 +1052,10 @@ const processAudio = async () => {
     try {
       const formDataObj = new FormData()
       formDataObj.append('wav_file', formData.value.audioFile)
-      formDataObj.append('lab_file', formData.value.labFile)
+      // LAB 可选：有就传，没有就依赖 MIDI
+      if (formData.value.labFile) {
+        formDataObj.append('lab_file', formData.value.labFile)
+      }
       formDataObj.append('format', formData.value.outputFormat)
       formDataObj.append('title', formData.value.projectTitle)
       formDataObj.append('phoneme_mode', formData.value.phonemeMode)
@@ -1027,7 +1071,7 @@ const processAudio = async () => {
       formDataObj.append('f0_ceil', advancedConfig.value.f0_ceil.toString())
       formDataObj.append('auto_note_pitch', advancedConfig.value.auto_note_pitch.toString())
       formDataObj.append('export_pitch_line', advancedConfig.value.export_pitch_line.toString())
-      // MIDI 文件（选填）
+      // MIDI 可选：有就传
       if (formData.value.midiFile) {
         formDataObj.append('midi_file', formData.value.midiFile)
       }
@@ -1281,6 +1325,7 @@ const reset = () => {
     phonemeMode: 'none'
   }
   midiInfo.value = { bpm: 120, loaded: false }
+  labMidiUploadKey.value++   // 强制重置上传组件
   result.value = null
   error.value = ''
   progressPercent.value = 0

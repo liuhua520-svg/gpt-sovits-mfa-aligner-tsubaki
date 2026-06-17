@@ -26,11 +26,11 @@
       <div class="footer-content">
         <p>Audio Processing Aligner v2.0.0 • Built with PyWORLD + MFA + Vue3</p>
         <p>
-          <a href="https://github.com/liuhua520-svg/gpt-sovits-mfa-aligner" target="_blank">
+          <a href="https://github.com/liuhua520-svg/SVS-Lab-Aligner" target="_blank">
             📚 GitHub
           </a>
           |
-          <a href="https://github.com/liuhua520-svg/gpt-sovits-mfa-aligner/issues" target="_blank">
+          <a href="https://github.com/liuhua520-svg/SVS-Lab-Aligner/issues" target="_blank">
             🐛 Issue
           </a>
         </p>
