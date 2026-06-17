@@ -49,24 +49,55 @@
           </div>
         </el-form-item>
 
-        <el-form-item v-if="processingMode === 'project-only'" label="LAB 文件">
+        <!-- LAB / MIDI 合并上传（仅 project-only 模式） -->
+        <el-form-item v-if="processingMode === 'project-only'" label="LAB / MIDI 文件">
           <el-upload
+            :key="labMidiUploadKey"
             drag
             action="#"
             :auto-upload="false"
-            :limit="1"
-            :on-exceed="handleExceed"
-            @change="handleLabSelect"
-            accept=".lab"
+            :multiple="true"
+            :limit="2"
+            :on-exceed="handleLabMidiExceed"
+            @change="handleLabMidiChange"
+            accept=".lab,.mid,.midi"
           >
             <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
             <div class="el-upload__text">
-              拖拽或<em>点击选择</em> LAB 标注文件
+              拖拽或<em>点击选择</em>文件（可同时选择 LAB + MIDI）
             </div>
+            <template #tip>
+              <div class="el-upload__tip">
+                <strong>.lab</strong>（必须）标注文件
+                &nbsp;+&nbsp;
+                <strong>.mid / .midi</strong>（可选）导入后音符音高与 BPM 从 MIDI 读取
+              </div>
+            </template>
           </el-upload>
-          <div v-if="formData.labFile" class="file-info">
-            ✓ {{ formData.labFile.name }} ({{ formatFileSize(formData.labFile.size) }})
+
+          <!-- 已选文件状态行 -->
+          <div v-if="formData.labFile" class="file-info" style="margin-top:6px">
+            📄 {{ formData.labFile.name }} ({{ formatFileSize(formData.labFile.size) }})
           </div>
+          <div v-if="formData.midiFile" class="file-info midi-loaded" style="margin-top:4px">
+            🎹 {{ formData.midiFile.name }} ({{ formatFileSize(formData.midiFile.size) }})
+            <span v-if="midiInfo.loaded" class="midi-bpm-tag">BPM {{ midiInfo.bpm }}</span>
+          </div>
+
+          <!-- MIDI 接管提示 -->
+          <el-alert
+            v-if="midiLoaded"
+            type="info"
+            :closable="false"
+            show-icon
+            style="margin-top:8px"
+          >
+            <template #title>已导入 MIDI — 以下选项已由 MIDI 数据接管</template>
+            <p style="margin:4px 0 0;font-size:12px;color:#606266">
+              🔒 自动音符音高 &nbsp;·&nbsp; BPM &nbsp;·&nbsp; 基准音高 (MIDI Note)
+              <br>将直接从 MIDI 文件中读取，手动调整已被禁用
+            </p>
+          </el-alert>
         </el-form-item>
 
         <el-form-item v-if="processingMode !== 'project-only'" label="输入文本">
@@ -165,7 +196,14 @@
                     :max="300"
                     :step="1"
                     controls-position="right"
+                    :disabled="midiLoaded"
                   />
+                  <span v-if="midiLoaded && midiInfo.loaded" class="midi-lock-tip">
+                    🔒 {{ midiInfo.bpm }} (来自 MIDI)
+                  </span>
+                  <span v-else-if="midiLoaded" class="midi-lock-tip">
+                    🔒 从 MIDI 读取
+                  </span>
                 </el-form-item>
               </el-col>
 
@@ -178,8 +216,10 @@
                       :max="108"
                       :step="1"
                       controls-position="right"
+                      :disabled="midiLoaded"
                     />
                     <span class="pitch-name">{{ midiNoteToName(advancedConfig.base_pitch) }}</span>
+                    <span v-if="midiLoaded" class="midi-lock-tip">🔒 从 MIDI 读取</span>
                   </div>
                 </el-form-item>
               </el-col>
@@ -194,7 +234,11 @@
                     v-model="advancedConfig.auto_note_pitch"
                     active-text="自动对齐实际音高"
                     inactive-text="固定在基准音高"
+                    :disabled="midiLoaded"
                   />
+                  <span v-if="midiLoaded" class="midi-lock-tip" style="display:block;margin-top:4px">
+                    🔒 音符音高由 MIDI 提供
+                  </span>
                 </el-form-item>
               </el-col>
 
@@ -576,6 +620,7 @@ type ProcessingMode = 'mfa-only' | 'full' | 'project-only'
 interface FormData {
   audioFile: File | null
   labFile: File | null
+  midiFile: File | null       // MIDI 文件（仅 project-only 模式）
   text: string
   language: string
   outputFormat: string
@@ -631,6 +676,7 @@ const processingMode = ref<ProcessingMode>('mfa-only')
 const formData = ref<FormData>({
   audioFile: null,
   labFile: null,
+  midiFile: null,
   text: '',
   language: 'cmn',
   outputFormat: 'sv',
@@ -687,6 +733,10 @@ const processingDetails = ref<any[]>([
 
 const currentJobId = ref<string>('')
 let jobPollTimer: number | null = null
+
+// MIDI 导入状态
+const midiInfo = ref<{ bpm: number; loaded: boolean }>({ bpm: 120, loaded: false })
+const midiLoaded = computed(() => processingMode.value === 'project-only' && !!formData.value.midiFile)
 
 // 计算属性
 const normalizedModels = computed(() => {
@@ -872,6 +922,46 @@ const handleLabSelect = (file: any) => {
   formData.value.labFile = file.raw || null
 }
 
+const handleMidiSelect = (file: any) => {
+  formData.value.midiFile = file.raw || null
+  if (formData.value.midiFile) {
+    extractMidiBpm(formData.value.midiFile).then(({ bpm }) => {
+      midiInfo.value = { bpm, loaded: true }
+    })
+  } else {
+    midiInfo.value = { bpm: 120, loaded: false }
+  }
+}
+
+/**
+ * 从 MIDI 文件的二进制内容中解析第一个 set_tempo 事件，换算成 BPM。
+ * 纯浏览器端解析，不需要额外库。
+ * MIDI Tempo meta event 格式: 0xFF 0x51 0x03 <3-byte microseconds>
+ */
+const extractMidiBpm = (file: File): Promise<{ bpm: number }> => {
+  return new Promise((resolve) => {
+    const reader = new FileReader()
+    reader.onload = (e) => {
+      try {
+        const buf = new Uint8Array(e.target!.result as ArrayBuffer)
+        let bpm = 120.0
+        for (let i = 0; i < buf.length - 5; i++) {
+          if (buf[i] === 0xFF && buf[i + 1] === 0x51 && buf[i + 2] === 0x03) {
+            const us = (buf[i + 3] << 16) | (buf[i + 4] << 8) | buf[i + 5]
+            if (us > 0) bpm = Math.round((60_000_000 / us) * 10) / 10
+            break
+          }
+        }
+        resolve({ bpm })
+      } catch {
+        resolve({ bpm: 120 })
+      }
+    }
+    reader.onerror = () => resolve({ bpm: 120 })
+    reader.readAsArrayBuffer(file)
+  })
+}
+
 const downloadModel = async (lang: string) => {
   downloadingLangs.value.push(lang)
   try {
@@ -937,6 +1027,10 @@ const processAudio = async () => {
       formDataObj.append('f0_ceil', advancedConfig.value.f0_ceil.toString())
       formDataObj.append('auto_note_pitch', advancedConfig.value.auto_note_pitch.toString())
       formDataObj.append('export_pitch_line', advancedConfig.value.export_pitch_line.toString())
+      // MIDI 文件（选填）
+      if (formData.value.midiFile) {
+        formDataObj.append('midi_file', formData.value.midiFile)
+      }
 
       progressTimer = window.setInterval(() => {
         if (progressPercent.value < 30) progressPercent.value += 3
@@ -1179,12 +1273,14 @@ const reset = () => {
   formData.value = {
     audioFile: null,
     labFile: null,
+    midiFile: null,
     text: '',
     language: 'cmn',
     outputFormat: 'sv',
     projectTitle: 'Project',
     phonemeMode: 'none'
   }
+  midiInfo.value = { bpm: 120, loaded: false }
   result.value = null
   error.value = ''
   progressPercent.value = 0
@@ -1264,6 +1360,31 @@ const newProcess = () => {
   font-weight: bold;
   font-size: 14px;
   min-width: 50px;
+}
+
+/* MIDI 相关样式 */
+.midi-loaded {
+  background: #f0f9eb !important;
+  color: #67c23a !important;
+  border: 1px solid #c2e7b0;
+}
+
+.midi-bpm-tag {
+  display: inline-block;
+  margin-left: 10px;
+  padding: 1px 8px;
+  background: #67c23a;
+  color: white;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: bold;
+  letter-spacing: 0.5px;
+}
+
+.midi-lock-tip {
+  color: #909399;
+  font-size: 11px;
+  margin-left: 8px;
 }
 
 .icon-tip {
