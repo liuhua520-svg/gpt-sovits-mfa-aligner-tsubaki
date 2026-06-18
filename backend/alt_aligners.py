@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 alt_aligners.py — 替代音素对齐后端
-支持 Qwen3-ASR-1.7B / Qwen3-ForcedAligner-0.6B 作为 MFA 的替代选项
+支持 WhisperX / Qwen3-ASR-1.7B / Qwen3-ForcedAligner-0.6B 作为 MFA 的替代选项
 
 模型文件路径策略（优先级）：
   1. 环境变量 TSUBAKI_MODELS_DIR
@@ -48,11 +48,12 @@ def resolve_models_dir() -> Path:
 
 
 # ── 目录常量 ──────────────────────────────────────────────────────────────────
-_MODELS_DIR: Path = resolve_models_dir()
-_HF_CACHE:    Path = _MODELS_DIR / "hf_cache"     # HuggingFace Hub 缓存
-_HF_HUB:      Path = _HF_CACHE   / "hub"          # transformers 子目录
+_MODELS_DIR:    Path = resolve_models_dir()
+_HF_CACHE:      Path = _MODELS_DIR / "hf_cache"   # HuggingFace Hub 缓存
+_HF_HUB:        Path = _HF_CACHE   / "hub"        # transformers 子目录
+_WHISPER_CACHE: Path = _MODELS_DIR / "whisper"    # OpenAI Whisper 模型缓存
 
-for _d in (_HF_CACHE, _HF_HUB):
+for _d in (_HF_CACHE, _HF_HUB, _WHISPER_CACHE):
     _d.mkdir(parents=True, exist_ok=True)
 
 # 将 HuggingFace 缓存重定向到 backend/models/hf_cache/
@@ -65,7 +66,8 @@ os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")   # 消除 Windows
 
 logger.info(
     f"[alt_aligners] 模型目录: {_MODELS_DIR}\n"
-    f"  HF 缓存 → {_HF_HUB}"
+    f"  HF 缓存   → {_HF_HUB}\n"
+    f"  Whisper缓存 → {_WHISPER_CACHE}"
 )
 
 
@@ -130,6 +132,81 @@ def _normalize_lang(lang: str) -> str:
         "jpn": "ja", "japanese": "ja",
         "kor": "ko", "korean": "ko",
     }.get(lang.lower(), lang.lower())
+
+
+def _to_whisperx_lang(lang: str) -> str:
+    """内部语言代码 → WhisperX / Whisper 语言代码"""
+    return {
+        "cmn": "zh", "zh": "zh", "zh-cn": "zh",
+        "yue": "zh",   # 粤语用 zh 近似；WhisperX 暂无独立粤语对齐模型
+        "eng": "en", "en": "en",
+        "jpn": "ja", "ja": "ja",
+        "kor": "ko", "ko": "ko",
+    }.get(lang.lower(), lang.lower())
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 2b. WhisperX 对齐前文本预处理
+#     WhisperX 强制对齐依赖"单调时间映射假设"：text ≈ audio 的顺序单调映射。
+#     结构化文本（编号、列表符号、markdown 标题、CJK 标点）会破坏该假设，
+#     导致 word-level alignment 失败甚至崩溃。
+#     本函数在对齐前将参考文本口语化，使其对 wav2vec2 模型更友好。
+# ═════════════════════════════════════════════════════════════════════════════
+
+import re as _re
+
+def normalize_text_for_whisperx(text: str, lang: str = "zh") -> str:
+    """
+    将结构化/格式化文本转换为 WhisperX 强制对齐友好的口语化文本。
+
+    处理内容：
+      - 移除列表编号（1. 2. 一、二、①② 等）
+      - 移除 Markdown 标题符号（# ## ###）
+      - 将 CJK 标点替换为空格（，。！？：；「」『』）
+      - 将连续空白压缩为单个空格
+
+    参数
+    ----
+    text : str
+        原始参考文本（可含结构符号）
+    lang : str
+        内部语言短代码（zh / en / ja / ko / yue），目前对所有语言统一处理
+
+    返回
+    ----
+    str
+        口语化清洗后的文本，保留所有可发音字符
+    """
+    if not text:
+        return text
+
+    # ── 1. 移除 Markdown 标题（# / ## / ### 开头）──────────────────────────
+    text = _re.sub(r"^#{1,6}\s*", "", text, flags=_re.MULTILINE)
+
+    # ── 2. 移除行首列表编号 ─────────────────────────────────────────────────
+    #    匹配：1. / 1) / (1) / 一、/ 二、/ ① ② ③ 等各类编号
+    text = _re.sub(r"(?m)^\s*(?:\d+[.、）)]\s*|[①②③④⑤⑥⑦⑧⑨⑩]+\s*|[一二三四五六七八九十]+[、.]\s*)", "", text)
+
+    # ── 3. 移除行内的短编号标记（"一、" 出现在句中也要清除）──────────────────
+    text = _re.sub(r"[一二三四五六七八九十]+[、]", "", text)
+
+    # ── 4. 将 CJK 标点替换为空格（不可发音，且会产生无法对齐的 token）─────────
+    cjk_puncts = r"[，。！？：；、「」『』【】《》〈〉—…·~～｜│「｣『｣]"
+    text = _re.sub(cjk_puncts, " ", text)
+
+    # ── 5. 移除英文引号、括号（对强制对齐同样干扰）──────────────────────────
+    text = _re.sub(r'["""\'()\[\]{}]', " ", text)
+
+    # ── 6. 将换行 / 制表符统一为空格 ─────────────────────────────────────────
+    text = _re.sub(r"[\r\n\t]+", " ", text)
+
+    # ── 7. 压缩多余空白 ───────────────────────────────────────────────────────
+    text = _re.sub(r"\s{2,}", " ", text).strip()
+
+    if text:
+        logger.debug(f"[WhisperX normalize] → {text[:80]}")
+
+    return text
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -256,7 +333,7 @@ class AltAlignerBase:
         word_entries: List[Tuple[float, float, str]],
         text: str,
         language: str,
-        fill_silences: bool = True,
+        fill_silences: bool = False,
     ) -> str:
         """
         将词语 / 字符级时间戳 → LAB 格式，复用 MFAProcessor 的音素转换逻辑。
@@ -371,7 +448,192 @@ class AltAlignerBase:
         return self._mfa._get_audio_duration(audio_path)
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 5. Qwen3ASRAligner
+# 5. WhisperXAligner
+# ═════════════════════════════════════════════════════════════════════════════
+
+class WhisperXAligner(AltAlignerBase):
+    """
+    WhisperX 对齐后端（自动语音识别 + wav2vec2 强制音素对齐）
+    https://github.com/m-bain/whisperx
+
+    优势：
+      - 不需要参考文本（自动转录模式）
+      - 字符级对齐（中日韩），词语级对齐（英语等）
+      - 支持 GPU 加速（CUDA）
+
+    注意：
+      - 结构化文本（编号/列表/Markdown 标题）会破坏"单调时间映射假设"，
+        导致 wav2vec2 对齐失败。本类在调用对齐前自动调用
+        normalize_text_for_whisperx() 进行口语化清洗。
+      - 安装：pip install whisperx
+    """
+
+    def __init__(
+        self,
+        whisper_model: str = "large-v2",
+        device: str = "auto",
+        compute_type: str = "float16",
+        batch_size: int = 16,
+        hf_token: Optional[str] = None,
+    ):
+        super().__init__()
+        self.whisper_model = whisper_model
+        self._device = self._resolve_device(device)
+        # CPU 不支持 float16
+        self.compute_type = compute_type if self._device != "cpu" else "int8"
+        self.batch_size = batch_size
+        self.hf_token = hf_token or os.environ.get("HF_TOKEN")
+
+        self._asr_model = None
+        self._align_models: Dict[str, object] = {}   # {lang_code: (model_a, metadata)}
+
+    # ── 类方法 ──────────────────────────────────────────────────────────────
+    @staticmethod
+    def _resolve_device(device: str) -> str:
+        if device == "auto":
+            try:
+                import torch
+                return "cuda" if torch.cuda.is_available() else "cpu"
+            except ImportError:
+                return "cpu"
+        return device
+
+    @staticmethod
+    def check_available() -> Tuple[bool, str]:
+        try:
+            import whisperx  # noqa: F401
+            return True, "OK"
+        except ImportError as e:
+            return False, f"未安装: pip install whisperx ({e})"
+        except Exception as e:
+            return False, str(e)
+
+    # ── 懒加载 ──────────────────────────────────────────────────────────────
+    def _load_asr(self):
+        if self._asr_model is None:
+            import whisperx
+            logger.info(f"[WhisperX] 加载 ASR 模型: {self.whisper_model} ({self._device})")
+            self._asr_model = whisperx.load_model(
+                self.whisper_model,
+                self._device,
+                compute_type=self.compute_type,
+                download_root=str(_WHISPER_CACHE),
+            )
+            logger.info("[WhisperX] ✓ ASR 模型已加载")
+
+    def _load_align(self, lang_code: str):
+        if lang_code not in self._align_models:
+            import whisperx
+            logger.info(f"[WhisperX] 加载对齐模型: {lang_code}")
+            model_a, metadata = whisperx.load_align_model(
+                language_code=lang_code, device=self._device
+            )
+            self._align_models[lang_code] = (model_a, metadata)
+            logger.info(f"[WhisperX] ✓ 对齐模型 ({lang_code}) 已加载")
+        return self._align_models[lang_code]
+
+    # ── 核心对齐 ─────────────────────────────────────────────────────────────
+    def align(self, audio_path: str, text: Optional[str], language: str) -> Dict:
+        t0 = time.time()
+        try:
+            import whisperx
+
+            wx_lang = _to_whisperx_lang(language)
+            int_lang = _normalize_lang(language)
+
+            # 1. 加载音频
+            audio = whisperx.load_audio(audio_path)
+
+            # 2. ASR
+            self._load_asr()
+            logger.info("[WhisperX] 开始 ASR 转录...")
+            asr_out = self._asr_model.transcribe(
+                audio, batch_size=self.batch_size, language=wx_lang
+            )
+            if not asr_out.get("segments"):
+                return self._err("WhisperX ASR 无输出，请检查音频质量", t0)
+
+            asr_text = " ".join(s.get("text", "") for s in asr_out["segments"]).strip()
+            logger.info(f"[WhisperX] ASR 文本: {asr_text[:80]}")
+
+            # 3. 强制对齐（直接使用 ASR 转录的 segments，不覆盖各 segment 的文本）
+            #    注意：不要把参考文本整体注入所有 segments，否则 WhisperX 会把
+            #    全部字符塞进每个 segment 的时间范围内，导致字符间静音消失、
+            #    句末音节时间被拉伸到下一句开头。
+            model_a, metadata = self._load_align(wx_lang)
+            logger.info("[WhisperX] 开始强制对齐...")
+            aligned = whisperx.align(
+                asr_out["segments"], model_a, metadata, audio, self._device,
+                return_char_alignments=True,   # CJK 关键：字符级对齐
+            )
+
+            # 4. 提取词语时间戳
+            entries = self._extract_entries(aligned, int_lang)
+            if not entries:
+                return self._err("强制对齐无输出，请检查语言代码和音频质量", t0)
+
+            # 5. 转换为 LAB（优先使用用户提供的参考文本驱动音素转换）
+            final_text = text.strip() if text else asr_text
+            lab = self._word_entries_to_lab(entries, final_text, language)
+
+            return {
+                "success": True,
+                "lab_content": lab,
+                "raw_text": final_text,
+                "phoneme_text": asr_text,
+                "audio_duration": self._get_audio_duration_100ns(audio_path),
+                "processing_time": int((time.time() - t0) * 1000),
+                "backend": "whisperx",
+            }
+
+        except ImportError as e:
+            return self._err(
+                f"whisperx 未安装: {e}，请执行 pip install whisperx", t0
+            )
+        except Exception as e:
+            logger.error(f"[WhisperX] 对齐失败: {e}", exc_info=True)
+            return self._err(str(e), t0)
+
+    def _extract_entries(
+        self, aligned: Dict, int_lang: str
+    ) -> List[Tuple[float, float, str]]:
+        """从 WhisperX 对齐结果提取 (start_sec, end_sec, text) 列表"""
+        entries: List[Tuple[float, float, str]] = []
+
+        for seg in aligned.get("segments", []):
+            # CJK 优先使用字符级对齐
+            chars = seg.get("chars", [])
+            words = seg.get("words", [])
+
+            if int_lang in ("zh", "yue", "ja") and chars:
+                for ch in chars:
+                    s = ch.get("start")
+                    e = ch.get("end")
+                    t = (ch.get("char") or ch.get("text") or "").strip()
+                    if s is not None and e is not None and t and not _is_cjk_punct(t):
+                        entries.append((float(s), float(e), t))
+            elif words:
+                for w in words:
+                    s = w.get("start")
+                    e = w.get("end")
+                    t = (w.get("word") or w.get("text") or "").strip()
+                    if s is not None and e is not None and t:
+                        entries.append((float(s), float(e), t))
+
+        entries.sort(key=lambda x: x[0])
+        return entries
+
+    @staticmethod
+    def _err(msg: str, t0: float) -> Dict:
+        return {
+            "success": False,
+            "error": msg,
+            "processing_time": int((time.time() - t0) * 1000),
+        }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 6. Qwen3ASRAligner
 # ═════════════════════════════════════════════════════════════════════════════
 
 class Qwen3ASRAligner(AltAlignerBase):
@@ -466,11 +728,11 @@ class Qwen3ASRAligner(AltAlignerBase):
                     for item in time_stamps:
                         if isinstance(item, list) and len(item) >= 2:
                             s, e = item[0], item[1]
-                            if s is not None and e is not None and not _is_cjk_punct(text):
+                            if s is not None and e is not None and not _is_cjk_punct(t):
                                 entries.append((float(s), float(e), text))
             elif isinstance(time_stamps, list) and len(time_stamps) >= 2 and isinstance(time_stamps[0], (int, float)):
                 s, e = time_stamps[0], time_stamps[1]
-                if s is not None and e is not None and not _is_cjk_punct(text):
+                if s is not None and e is not None and not _is_cjk_punct(t):
                     entries.append((float(s), float(e), text))
             elif isinstance(time_stamps, list) and time_stamps and isinstance(time_stamps[0], dict):
                 for item in time_stamps:
@@ -542,7 +804,7 @@ class Qwen3ASRAligner(AltAlignerBase):
                 entries,
                 final_text,
                 language,
-                fill_silences=True,
+                fill_silences=False,
             )
 
             return {
@@ -564,167 +826,112 @@ class Qwen3ASRAligner(AltAlignerBase):
             }
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 6. Qwen3ForcedAligner
+# 7. Qwen3ForcedAligner
 # ═════════════════════════════════════════════════════════════════════════════
 
 class Qwen3ForcedAligner(AltAlignerBase):
-    """
-    Qwen3-ForcedAligner-0.6B 强制对齐后端（需要参考文本）
-    https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B
-
-    模型文件存放位置：
-      backend/models/hf_cache/hub/models--Qwen--Qwen3-ForcedAligner-0.6B/  (~1.2GB)
-
-    注意：此模型较新，以下实现基于标准 CTC 强制对齐接口 + Seq2Seq 备用路径。
-    若模型 API 有更新，请参照官方文档调整 _load_model() 和 _extract_timestamps()。
-    """
-
     DEFAULT_MODEL = "Qwen/Qwen3-ForcedAligner-0.6B"
 
-    def __init__(self, model_id: str = DEFAULT_MODEL, device: str = "auto"):
-        super().__init__()
-        self.model_id = model_id
-        self._device = self._resolve_device(device)
-        self._model    = None
-        self._processor = None
+    def __init__(self, *args, device="cpu", **kwargs):
+        super().__init__(*args, **kwargs)
 
-    @staticmethod
-    def _resolve_device(device: str) -> str:
-        if device == "auto":
-            try:
-                import torch
-                return "cuda" if torch.cuda.is_available() else "cpu"
-            except ImportError:
-                return "cpu"
-        return device
+        self._device = device
+        self._model = None
+
+        # ✅ 补上这一行（关键修复）
+        self.model_id = kwargs.get("model_id", self.DEFAULT_MODEL)
 
     @staticmethod
     def check_available() -> Tuple[bool, str]:
         try:
-            import transformers  # noqa: F401
-            return True, "transformers 已就绪（需下载 Qwen3-ForcedAligner-0.6B）"
+            import qwen_asr  # noqa: F401
+            return True, "qwen-asr 已就绪"
         except ImportError as e:
-            return (
-                False,
-                f"transformers 导入失败（{e}）。\n"
-                "推荐方案：\n"
-                "   pip uninstall -y transformers funasr\n"
-                "   pip install funasr modelscope\n"
-                "   pip install --upgrade git+https://github.com/huggingface/transformers.git"
-            )
+            return False, f"未安装 qwen-asr: pip install -U qwen-asr ({e})"
 
     def _load_model(self):
         if self._model is not None:
             return
-        from transformers import AutoProcessor
+
         import torch
+        from qwen_asr import Qwen3ForcedAligner as Qwen3FA
 
-        logger.info(
-            f"[Qwen3-FA] 加载模型: {self.model_id}\n"
-            f"  缓存目录 → {_HF_HUB}"
-        )
-        dtype = torch.float16 if "cuda" in self._device else torch.float32
+        device = getattr(self, "_device", "cpu")
+        dtype = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
 
-        # Qwen3-ForcedAligner-0.6B 同样使用 'qwen3_asr' model_type，
-        # 标准 transformers 不含此架构，必须加 trust_remote_code=True
-        # 让 transformers 加载模型仓库自带的 modeling_*.py。
-        common_kwargs = dict(
-            torch_dtype=dtype,
-            cache_dir=str(_HF_HUB),
-            trust_remote_code=True,     # ← 关键：允许加载自定义架构代码
-        )
-        try:
-            from transformers import AutoModelForCTC
-            self._model = AutoModelForCTC.from_pretrained(
-                self.model_id, **common_kwargs
-            ).to(self._device)
-            self._model_type = "ctc"
-        except (ValueError, OSError, KeyError):
-            # 若模型不是 CTC 架构，降级到 Seq2Seq
-            try:
-                from transformers import AutoModelForSpeechSeq2Seq
-                self._model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                    self.model_id, **common_kwargs
-                ).to(self._device)
-                self._model_type = "seq2seq"
-            except Exception as e:
-                raise RuntimeError(
-                    f"[Qwen3-FA] 无法加载模型：{e}\n\n"
-                    "Qwen3-ForcedAligner-0.6B 使用 'qwen3_asr' 自定义架构。\n"
-                    "请确保模型仓库已完整下载（含 modeling_qwen3_asr.py），\n"
-                    "或安装官方推理框架：pip install funasr modelscope\n"
-                    "或从源码安装最新 transformers：\n"
-                    "  pip install git+https://github.com/huggingface/transformers.git"
-                ) from e
-
-        self._processor = AutoProcessor.from_pretrained(
+        self._model = Qwen3FA.from_pretrained(
             self.model_id,
-            cache_dir=str(_HF_HUB),
-            trust_remote_code=True,
+            dtype=dtype,
+            device_map=device,
         )
-        self._model.eval()
-        logger.info(f"[Qwen3-FA] ✓ 模型已加载（类型: {self._model_type}）")
+        # qwen_asr.Qwen3ForcedAligner 是一个普通包装类（非 nn.Module），
+        # 没有 .eval() 方法；真正的底层模型在 self._model.model 上，
+        # 且 align() 内部已用 @torch.inference_mode() 包裹，因此无需也不能调用 .eval()
 
     def align(self, audio_path: str, text: Optional[str], language: str) -> Dict:
         t0 = time.time()
         if not text:
-            return {"success": False,
-                    "error": "Qwen3-ForcedAligner 需要参考文本（text 不能为空）",
-                    "processing_time": 0}
-        try:
-            import torch, numpy as np, soundfile as sf
-
-            self._load_model()
-            int_lang = _normalize_lang(language)
-
-            audio_arr, sr = sf.read(audio_path)
-            if audio_arr.ndim > 1:
-                audio_arr = audio_arr.mean(axis=1)
-            if sr != 16000:
-                try:
-                    import librosa
-                    audio_arr = librosa.resample(
-                        audio_arr.astype(np.float32), orig_sr=sr, target_sr=16000
-                    )
-                    sr = 16000
-                except ImportError:
-                    pass
-
-            total_sec = len(audio_arr) / sr
-            logger.info("[Qwen3-FA] 开始强制对齐...")
-
-            inputs = self._processor(
-                audio_arr, sampling_rate=sr, text=text, return_tensors="pt"
-            )
-            inputs = {k: v.to(self._device) if hasattr(v, "to") else v
-                      for k, v in inputs.items()}
-
-            with torch.no_grad():
-                outputs = self._model(**inputs)
-
-            entries = self._extract_timestamps(outputs, text, int_lang, total_sec)
-            if not entries:
-                return {"success": False, "error": "Qwen3-ForcedAligner 无对齐输出",
-                        "processing_time": int((time.time() - t0) * 1000)}
-
-            lab = self._word_entries_to_lab(entries, text, language, fill_silences=False)
             return {
-                "success":        True,
-                "lab_content":    lab,
-                "raw_text":       text,
-                "phoneme_text":   text,
+                "success": False,
+                "error": "Qwen3-ForcedAligner 需要参考文本（text 不能为空）",
+                "processing_time": 0,
+            }
+
+        try:
+            self._load_model()
+
+            lang_name = _to_qwen_lang_name(language)
+            if not lang_name:
+                return {
+                    "success": False,
+                    "error": f"Qwen3-ForcedAligner 不支持语言: {language}",
+                    "processing_time": int((time.time() - t0) * 1000),
+                }
+
+            results = self._model.align(
+                audio=audio_path,
+                text=text,
+                language=lang_name,
+            )
+
+            # 官方示例里 results[0][0].text / start_time / end_time
+            word_entries = []
+            for item in (results[0] if results else []):
+                tok = (getattr(item, "text", "") or "").strip()
+                if not tok or _is_cjk_punct(tok):
+                    continue
+                word_entries.append(
+                    (float(item.start_time), float(item.end_time), tok)
+                )
+
+            if not word_entries:
+                return {
+                    "success": False,
+                    "error": "Qwen3-ForcedAligner 无对齐输出",
+                    "processing_time": int((time.time() - t0) * 1000),
+                }
+
+            lab = self._word_entries_to_lab(
+                word_entries, text, language, fill_silences=False
+            )
+
+            return {
+                "success": True,
+                "lab_content": lab,
+                "raw_text": text,
+                "phoneme_text": text,
                 "audio_duration": self._get_audio_duration_100ns(audio_path),
                 "processing_time": int((time.time() - t0) * 1000),
-                "backend":        "qwen3_aligner",
+                "backend": "qwen3_aligner",
             }
-        except ImportError as e:
-            return {"success": False,
-                    "error": f"依赖未安装: {e}，请执行 pip install transformers torch torchaudio",
-                    "processing_time": int((time.time() - t0) * 1000)}
+
         except Exception as e:
             logger.error(f"[Qwen3-FA] 失败: {e}", exc_info=True)
-            return {"success": False, "error": str(e),
-                    "processing_time": int((time.time() - t0) * 1000)}
+            return {
+                "success": False,
+                "error": str(e),
+                "processing_time": int((time.time() - t0) * 1000),
+            }
 
     def _extract_timestamps(
         self,
@@ -835,7 +1042,7 @@ class Qwen3ForcedAligner(AltAlignerBase):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 7. 单例缓存与工厂函数
+# 8. 单例缓存与工厂函数
 # ═════════════════════════════════════════════════════════════════════════════
 
 _SINGLETON: Dict[str, AltAlignerBase] = {}
@@ -844,11 +1051,13 @@ _SINGLETON: Dict[str, AltAlignerBase] = {}
 def get_aligner(backend: str, device: str = "auto", **kwargs) -> AltAlignerBase:
     """
     工厂函数：按 backend 名称创建或复用对齐器单例。
-    backend: "qwen3_asr" | "qwen3_aligner"
+    backend: "whisperx" | "qwen3_asr" | "qwen3_aligner"
     """
     global _SINGLETON
     if backend not in _SINGLETON:
-        if backend == "qwen3_asr":
+        if backend == "whisperx":
+            _SINGLETON[backend] = WhisperXAligner(device=device, **kwargs)
+        elif backend == "qwen3_asr":
             _SINGLETON[backend] = Qwen3ASRAligner(device=device, **kwargs)
         elif backend == "qwen3_aligner":
             _SINGLETON[backend] = Qwen3ForcedAligner(device=device, **kwargs)
@@ -859,11 +1068,18 @@ def get_aligner(backend: str, device: str = "auto", **kwargs) -> AltAlignerBase:
 
 def get_alt_aligner_status() -> Dict:
     """检查所有替代对齐后端的可用状态（含模型文件目录信息）"""
+    wx_ok, wx_msg = WhisperXAligner.check_available()
     qa_ok, qa_msg = Qwen3ASRAligner.check_available()
     qf_ok, qf_msg = Qwen3ForcedAligner.check_available()
 
     return {
         "models_dir": str(_MODELS_DIR),        # ← 前端可展示此路径
+        "whisperx": {
+            "available":     wx_ok,
+            "message":       wx_msg,
+            "requires_text": False,
+            "description":   "WhisperX (Whisper ASR + wav2vec2 强制对齐)",
+        },
         "qwen3_asr": {
             "available":     qa_ok,
             "message":       qa_msg,
