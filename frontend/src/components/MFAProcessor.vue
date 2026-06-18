@@ -87,16 +87,19 @@
             </small>
             <small v-else-if="alignerBackend === 'whisperx'">
               🤖 <strong>WhisperX</strong>：Whisper ASR + wav2vec2 强制对齐，无需预先安装语言模型，支持字符级时间戳。
+              对结构化文本（编号/列表/标题）会自动做口语化预处理以提升对齐成功率。
               <em>文本可选（留空则自动转录）。</em>
             </small>
             <small v-else-if="alignerBackend === 'qwen3_asr'">
-              🌐 <strong>Qwen3-ASR-1.7B</strong>：Qwen3 自动语音识别，对中文多口音更鲁棒。
-              <em>文本可选（留空则自动转录）。</em>
+              🌐 <strong>Qwen3-ASR-1.7B</strong>：对中文多口音更鲁棒。<em>文本可选。</em>
             </small>
             <small v-else-if="alignerBackend === 'qwen3_aligner'">
-              📌 <strong>Qwen3-ForcedAligner-0.6B</strong>：轻量级神经网络强制对齐，专为歌声设计。
-              <em>需要参考文本。</em>
+              📌 <strong>Qwen3-ForcedAligner-0.6B</strong>：轻量级神经网络强制对齐，专为歌声设计。<em>需要参考文本。</em>
             </small>
+            <div v-if="alignerBackend !== 'mfa' && alignerStatus.models_dir"
+                 style="margin-top:4px;color:#67c23a;font-size:12px">
+              📁 模型缓存目录：<code>{{ alignerStatus.models_dir }}</code>
+            </div>
           </div>
           <el-alert
             v-if="alignerBackend !== 'mfa' && !alignerStatus[alignerBackend]?.available"
@@ -169,7 +172,7 @@
           />
           <div class="help-text">
             <span v-if="isTextOptional" style="color:#67c23a">
-              ✓ {{ alignerBackend === 'whisperx' ? 'WhisperX' : 'Qwen3-ASR' }} 支持纯 ASR 模式，文本留空也可处理
+              ✓ Qwen3-ASR 支持纯 ASR 模式，文本留空也可处理
             </span>
             <span v-else>当前字符数：{{ formData.text.length }}</span>
           </div>
@@ -652,7 +655,7 @@
           <el-col :xs="24">
             <div class="label">替代对齐后端:</div>
             <div class="model-list">
-              <div v-for="(info, key) in alignerStatus" :key="key" class="model-item">
+              <div v-for="(info, key) in altBackends" :key="key" class="model-item">
                 <el-tag :type="info.available ? 'success' : 'info'" size="small">
                   {{ key === 'whisperx' ? 'WhisperX' : key === 'qwen3_asr' ? 'Qwen3-ASR-1.7B' : 'Qwen3-FA-0.6B' }}:
                   {{ info.available ? '✓ 可用' : '✗ 未安装' }}
@@ -661,6 +664,10 @@
                   {{ key === 'whisperx' ? 'pip install whisperx' : 'pip install transformers torch' }}
                 </span>
               </div>
+            </div>
+            <div v-if="alignerStatus.models_dir" style="margin-top:6px;font-size:12px;color:#909399">
+              📁 模型下载位置：<code style="color:#67c23a">{{ alignerStatus.models_dir }}</code>
+              <span style="margin-left:6px">（非 C 盘，节省系统盘空间）</span>
             </div>
           </el-col>
         </el-row>
@@ -847,6 +854,12 @@ const isReady = computed(() => {
 const isTextOptional = computed(() =>
   ['whisperx', 'qwen3_asr'].includes(alignerBackend.value)
 )
+
+// alignerStatus 去掉 models_dir 字段，只保留后端对象供 v-for 使用
+const altBackends = computed(() => {
+  const { models_dir: _md, ...backends } = alignerStatus.value as any
+  return backends as Record<string, any>
+})
 
 const alignerBackendLabel = computed(() => {
   const labels: Record<string, string> = {
