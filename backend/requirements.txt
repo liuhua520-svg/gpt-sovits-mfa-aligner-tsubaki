@@ -34,12 +34,36 @@ mido>=1.3.0
 # 特点：不需要参考文本；中日韩字符级对齐；支持 GPU
 # whisperx>=3.1.0
 # openai-whisper>=20231117    # 随 whisperx 自动安装
+#
+# ⚠ whisperx 3.8.x 要求 huggingface-hub < 1.0.0，
+#   与 funasr / 新版 transformers（需要 >= 1.0.0）冲突。
+#   如需同时使用 WhisperX 和 Qwen3 后端，请在不同虚拟环境中分别安装：
+#     环境1：whisperx（huggingface-hub 0.x）
+#     环境2：funasr + modelscope（huggingface-hub 1.x）
 
 # ---- Qwen3-ASR-1.7B / Qwen3-ForcedAligner-0.6B ----
-# 安装：pip install transformers accelerate
 # 文档：https://github.com/QwenLM/Qwen3-ASR
 # 特点：Qwen3-ASR 不需要参考文本；Qwen3-FA 需要参考文本；都需要提前下载模型
-# transformers>=4.40.0
+#
+# ★ 重要：这两个模型使用自定义架构 model_type='qwen3_asr'，
+#   标准 transformers 不含此类型（pip install --upgrade transformers 也无效）。
+#   必须通过以下任一方式加载：
+#
+#   方案A（推荐）：funasr 官方推理框架
+#     pip install funasr modelscope
+#
+#   方案B：从 transformers 源码安装（含最新自定义模型支持）
+#     pip install git+https://github.com/huggingface/transformers.git
+#     pip install accelerate
+#
+#   ⚠ 注意：funasr 和 whisperx 存在 huggingface-hub 版本冲突：
+#     whisperx 3.x 要求 huggingface-hub < 1.0.0
+#     funasr / 新版 transformers 要求 huggingface-hub >= 1.0.0
+#   建议为 Qwen3 后端单独建立虚拟环境，或使用 modelscope 离线下载模型后
+#   仅用 trust_remote_code=True 加载。
+#
+# funasr>=1.1.0
+# modelscope>=1.9.0
 # accelerate>=0.27.0
 
 # ---- 日语假名转换（替代对齐后端的日语 LAB 生成）----
