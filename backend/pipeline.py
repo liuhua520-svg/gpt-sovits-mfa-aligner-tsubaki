@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 完整处理流程管道（v2.1 — 多后端对齐支持）
-整合 MFA / WhisperX / Qwen3-ASR / Qwen3-ForcedAligner + 音高处理 + 工程文件生成
+整合 MFA / Qwen3-ASR / Qwen3-ForcedAligner + 音高处理 + 工程文件生成
 
 新增参数: aligner_backend
   "mfa"           — Montreal Forced Aligner（默认）
-  "whisperx"      — WhisperX (Whisper ASR + wav2vec2 强制对齐)
   "qwen3_asr"     — Qwen3-ASR-1.7B (自动语音识别，文本可选)
   "qwen3_aligner" — Qwen3-ForcedAligner-0.6B (强制对齐，需要参考文本)
 """

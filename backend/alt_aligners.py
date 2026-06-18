@@ -1,19 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 alt_aligners.py — 替代音素对齐后端
-支持 WhisperX / Qwen3-ASR-1.7B / Qwen3-ForcedAligner-0.6B 作为 MFA 的替代选项
+支持 Qwen3-ASR-1.7B / Qwen3-ForcedAligner-0.6B 作为 MFA 的替代选项
 
 模型文件路径策略（优先级）：
   1. 环境变量 TSUBAKI_MODELS_DIR
   2. <当前文件所在目录>/models/      → 即 backend/models/
-     ├── whisper/          Whisper ASR 模型 (WhisperX 使用)
-     ├── align/            wav2vec2 强制对齐模型 (WhisperX 使用)
      ├── hf_cache/         HuggingFace 统一缓存 (Qwen3-ASR / Qwen3-FA)
      │   └── hub/
      └── rmvpe/            RMVPE 模型 (已有，路径不变)
 
 标点/静音处理：
-  WhisperX / Qwen3 不在对齐输出中输出标点（标点不可发声）。
+  Qwen3 不在对齐输出中输出标点（标点不可发声）。
   本模块在生成 LAB 后自动扫描时间轴间隙，将 ≥ 50ms 的空白补全为 SP / SIL 条目。
   用户无需为标点担心，静音标记由时间间隙自动推断。
 """
@@ -50,12 +48,10 @@ def resolve_models_dir() -> Path:
 
 # ── 目录常量 ──────────────────────────────────────────────────────────────────
 _MODELS_DIR: Path = resolve_models_dir()
-_WHISPER_DIR: Path = _MODELS_DIR / "whisper"      # Whisper ASR 权重
-_ALIGN_DIR:   Path = _MODELS_DIR / "align"        # wav2vec2 对齐模型
 _HF_CACHE:    Path = _MODELS_DIR / "hf_cache"     # HuggingFace Hub 缓存
 _HF_HUB:      Path = _HF_CACHE   / "hub"          # transformers 子目录
 
-for _d in (_WHISPER_DIR, _ALIGN_DIR, _HF_CACHE, _HF_HUB):
+for _d in (_HF_CACHE, _HF_HUB):
     _d.mkdir(parents=True, exist_ok=True)
 
 # 将 HuggingFace 缓存重定向到 backend/models/hf_cache/
@@ -68,25 +64,60 @@ os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")   # 消除 Windows
 
 logger.info(
     f"[alt_aligners] 模型目录: {_MODELS_DIR}\n"
-    f"  Whisper → {_WHISPER_DIR}\n"
-    f"  Align   → {_ALIGN_DIR}\n"
     f"  HF 缓存 → {_HF_HUB}"
 )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 1b. PyTorch 2.6+ 兼容性补丁
+#     PyTorch 2.6 起 torch.load 默认 weights_only=True，可能导致部分
+#     HuggingFace 模型权重（内含自定义对象，如 omegaconf.ListConfig 等）
+#     加载失败，抛出 _pickle.UnpicklingError。
+#     这些权重来自官方 HF 仓库，可信，因此在模块加载时统一把
+#     torch.load 的默认行为改回 weights_only=False。
+# ═════════════════════════════════════════════════════════════════════════════
+try:
+    import torch as _torch
+
+    if not getattr(_torch.load, "_tsubaki_patched", False):
+        _original_torch_load = _torch.load
+
+        def _patched_torch_load(*args, **kwargs):
+            kwargs.setdefault("weights_only", False)
+            return _original_torch_load(*args, **kwargs)
+
+        _patched_torch_load._tsubaki_patched = True
+        _torch.load = _patched_torch_load
+        logger.info(
+            "[alt_aligners] 已应用 torch.load 兼容性补丁 "
+            "(weights_only 默认改为 False)"
+        )
+except ImportError:
+    pass  # torch 未安装时跳过；Qwen3 后端本身也用不了
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 2. 语言代码映射
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _to_whisperx_lang(lang: str) -> str:
-    """内部语言代码 → WhisperX / Whisper 语言代码"""
+def _to_qwen_lang_name(lang: str) -> Optional[str]:
+    """
+    内部语言代码 → 官方 qwen-asr 包 Qwen3ASRModel.transcribe() /
+    Qwen3ForcedAligner.align() 所要求的完整语言名（如 "Chinese"）。
+
+    依据官方示例 (QwenLM/Qwen3-ASR examples/example_qwen3_asr_transformers.py,
+    examples/example_qwen3_forced_aligner.py)：language 参数接受完整英文语言名
+    （"Chinese" / "English" / "Japanese" / "Korean" / "Cantonese" ...），
+    不是 ISO 短代码；返回 None 表示交给 Qwen3-ASR 自动语言检测（仅 ASR 支持，
+    ForcedAligner 必须显式指定语言）。
+    """
     return {
-        "cmn": "zh", "zh": "zh", "zh-cn": "zh",
-        "yue": "zh",   # 粤语暂无独立 WhisperX 对齐模型，用 zh 近似
-        "eng": "en", "en": "en",
-        "jpn": "ja", "ja": "ja",
-        "kor": "ko", "ko": "ko",
-    }.get(lang.lower(), lang.lower())
+        "cmn": "Chinese", "zh": "Chinese", "zh-cn": "Chinese", "mandarin": "Chinese",
+        "yue": "Cantonese", "cantonese": "Cantonese", "zh-yue": "Cantonese",
+        "eng": "English", "en": "English", "english": "English",
+        "jpn": "Japanese", "ja": "Japanese", "japanese": "Japanese",
+        "kor": "Korean", "ko": "Korean", "korean": "Korean",
+    }.get(lang.lower())
 
 
 def _normalize_lang(lang: str) -> str:
@@ -117,7 +148,7 @@ class _MI:
 
 def _is_cjk_punct(text: str) -> bool:
     """
-    判断字符串是否全为标点 / 空白 / 符号（用于过滤 WhisperX 中的标点字符）。
+    判断字符串是否全为标点 / 空白 / 符号（用于过滤 ASR 输出中的标点字符）。
 
     注：标点本身不可发音，不应出现在 LAB 的音素层。
     中文句末停顿（。！？）和停顿符（，、）对应的 LAB 条目由
@@ -140,7 +171,7 @@ def _fill_silences_lab(
     """
     扫描 LAB 时间轴，在 ≥ 50ms 的间隙自动补全 SP / SIL 条目。
 
-    背景：WhisperX / Qwen3 不输出标点字符的时间戳，但句末/句中停顿
+    背景：Qwen3 不输出标点字符的时间戳，但句末/句中停顿
     会在相邻字符之间留下时间间隙，本函数将这些间隙转换为 LAB 静音标记。
 
     Parameters
@@ -232,7 +263,7 @@ class AltAlignerBase:
         fill_silences=True 时自动在时间间隙中插入 SP / SIL。
 
         关于标点：
-          WhisperX / Qwen3 不产生标点字符的对齐时间戳（标点不可发音）。
+          Qwen3 不产生标点字符的对齐时间戳（标点不可发音）。
           _text_to_syllables() 在提取音素序列时也会忽略标点，因此参考文本中
           的标点不影响音素分布——只要参考文本的可发音字符数与 entries 数量一致即可。
           句末 / 句中的停顿由 fill_silences 根据时间间隙自动插入。
@@ -341,209 +372,7 @@ class AltAlignerBase:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 5. WhisperXAligner
-# ═════════════════════════════════════════════════════════════════════════════
-
-class WhisperXAligner(AltAlignerBase):
-    """
-    WhisperX 对齐后端（Whisper ASR + wav2vec2 字符级强制对齐）
-    https://github.com/m-bain/whisperx
-
-    模型文件存放位置：
-      ASR 模型   → backend/models/whisper/   (如 large-v2.pt, ~3GB)
-      对齐模型   → backend/models/hf_cache/  (wav2vec2，首次使用自动下载)
-
-    关于标点缺失：
-      WhisperX 的 wav2vec2 对齐模型工作在字符 / 音素层面，
-      标点符号不对应任何可发音单元，因此不会出现在对齐输出中。
-      这是预期行为，句末/句中停顿由 _fill_silences_lab() 自动补全为 SP/SIL。
-    """
-
-    def __init__(
-        self,
-        whisper_model: str = "large-v2",
-        device: str = "auto",
-        compute_type: str = "float16",
-        batch_size: int = 16,
-        hf_token: Optional[str] = None,
-    ):
-        super().__init__()
-        self.whisper_model = whisper_model
-        self._device = self._resolve_device(device)
-        self.compute_type = compute_type if self._device != "cpu" else "int8"
-        self.batch_size = batch_size
-        self.hf_token = hf_token or os.environ.get("HF_TOKEN")
-        self._asr_model = None
-        self._align_models: Dict[str, object] = {}
-
-    @staticmethod
-    def _resolve_device(device: str) -> str:
-        if device == "auto":
-            try:
-                import torch
-                return "cuda" if torch.cuda.is_available() else "cpu"
-            except ImportError:
-                return "cpu"
-        return device
-
-    @staticmethod
-    def check_available() -> Tuple[bool, str]:
-        try:
-            import whisperx  # noqa: F401
-            return True, "OK"
-        except ImportError as e:
-            return False, f"未安装: pip install whisperx ({e})"
-        except Exception as e:
-            return False, str(e)
-
-    # ── 懒加载（模型存入 backend/models/） ────────────────────────────────
-    def _load_asr(self):
-        if self._asr_model is not None:
-            return
-        import whisperx
-        logger.info(
-            f"[WhisperX] 加载 ASR 模型: {self.whisper_model} "
-            f"→ {_WHISPER_DIR}"
-        )
-        self._asr_model = whisperx.load_model(
-            self.whisper_model,
-            self._device,
-            compute_type=self.compute_type,
-            download_root=str(_WHISPER_DIR),   # ← 存入 backend/models/whisper/
-        )
-        logger.info("[WhisperX] ✓ ASR 模型已加载")
-
-    def _load_align(self, lang_code: str):
-        if lang_code in self._align_models:
-            return self._align_models[lang_code]
-        import whisperx
-        logger.info(
-            f"[WhisperX] 加载对齐模型: {lang_code} "
-            f"→ {_ALIGN_DIR}"
-        )
-        # model_dir 指定本地缓存路径；HF_HUB_CACHE 已指向 backend/models/hf_cache/hub/
-        # 首次下载自动写入缓存，之后从缓存加载
-        model_a, metadata = whisperx.load_align_model(
-            language_code=lang_code,
-            device=self._device,
-            model_dir=str(_ALIGN_DIR),         # ← 存入 backend/models/align/
-        )
-        self._align_models[lang_code] = (model_a, metadata)
-        logger.info(f"[WhisperX] ✓ 对齐模型 ({lang_code}) 已加载")
-        return self._align_models[lang_code]
-
-    # ── 核心对齐 ─────────────────────────────────────────────────────────────
-    def align(self, audio_path: str, text: Optional[str], language: str) -> Dict:
-        t0 = time.time()
-        try:
-            import whisperx
-
-            wx_lang  = _to_whisperx_lang(language)
-            int_lang = _normalize_lang(language)
-
-            audio = whisperx.load_audio(audio_path)
-
-            # ── 步骤 1：ASR 转录 ─────────────────────────────────────────
-            self._load_asr()
-            logger.info("[WhisperX] 开始 ASR 转录...")
-            asr_out = self._asr_model.transcribe(
-                audio, batch_size=self.batch_size, language=wx_lang
-            )
-            if not asr_out.get("segments"):
-                return self._err("WhisperX ASR 无输出，请检查音频质量", t0)
-
-            asr_text = " ".join(
-                s.get("text", "") for s in asr_out["segments"]
-            ).strip()
-            logger.info(f"[WhisperX] ASR 文本（已去除标点）: {asr_text[:120]}")
-            logger.info(
-                "[WhisperX] 提示：ASR 文本无标点属正常现象，"
-                "停顿处将由时间轴间隙自动识别为 SP/SIL"
-            )
-
-            # ── 步骤 2：强制对齐 ─────────────────────────────────────────
-            model_a, metadata = self._load_align(wx_lang)
-            logger.info("[WhisperX] 开始强制对齐...")
-            aligned = whisperx.align(
-                asr_out["segments"],
-                model_a, metadata,
-                audio, self._device,
-                return_char_alignments=True,   # CJK 字符级对齐
-            )
-
-            # ── 步骤 3：提取字符时间戳 ───────────────────────────────────
-            entries = self._extract_entries(aligned, int_lang)
-            if not entries:
-                return self._err("强制对齐无输出，请检查语言代码和音频质量", t0)
-
-            # ── 步骤 4：生成 LAB ─────────────────────────────────────────
-            # WhisperX 输出的字符时间戳之间的间隙已由 ASR/对齐模型处理，
-            # 不应再自动插入 SP——否则每个标点位置都会出现多余的 SP 条目。
-            final_text = text.strip() if text else asr_text
-            lab = self._word_entries_to_lab(entries, final_text, language,
-                                            fill_silences=False)
-
-            return {
-                "success":        True,
-                "lab_content":    lab,
-                "raw_text":       final_text,
-                "phoneme_text":   asr_text,
-                "audio_duration": self._get_audio_duration_100ns(audio_path),
-                "processing_time": int((time.time() - t0) * 1000),
-                "backend":        "whisperx",
-            }
-
-        except ImportError as e:
-            return self._err(
-                f"whisperx 未安装: {e}，请执行 pip install whisperx", t0
-            )
-        except Exception as e:
-            logger.error(f"[WhisperX] 对齐失败: {e}", exc_info=True)
-            return self._err(str(e), t0)
-
-    def _extract_entries(
-        self,
-        aligned: Dict,
-        int_lang: str,
-    ) -> List[Tuple[float, float, str]]:
-        """从 WhisperX 对齐结果提取 (start_sec, end_sec, char) 列表"""
-        entries: List[Tuple[float, float, str]] = []
-
-        for seg in aligned.get("segments", []):
-            chars = seg.get("chars", [])
-            words = seg.get("words", [])
-
-            # CJK：使用字符级对齐（return_char_alignments=True 才有 chars）
-            if int_lang in ("zh", "yue", "ja") and chars:
-                for ch in chars:
-                    s = ch.get("start")
-                    e = ch.get("end")
-                    t = (ch.get("char") or ch.get("text") or "").strip()
-                    # 跳过标点（不可发音），保留 CJK 字符和字母
-                    if s is not None and e is not None and t and not _is_cjk_punct(t):
-                        entries.append((float(s), float(e), t))
-            elif words:
-                for w in words:
-                    s = w.get("start")
-                    e = w.get("end")
-                    t = (w.get("word") or w.get("text") or "").strip()
-                    if s is not None and e is not None and t:
-                        entries.append((float(s), float(e), t))
-
-        entries.sort(key=lambda x: x[0])
-        return entries
-
-    @staticmethod
-    def _err(msg: str, t0: float) -> Dict:
-        return {
-            "success": False,
-            "error":   msg,
-            "processing_time": int((time.time() - t0) * 1000),
-        }
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 6. Qwen3ASRAligner
+# 5. Qwen3ASRAligner
 # ═════════════════════════════════════════════════════════════════════════════
 
 class Qwen3ASRAligner(AltAlignerBase):
@@ -579,16 +408,24 @@ class Qwen3ASRAligner(AltAlignerBase):
         try:
             import funasr  # noqa: F401
             return True, "funasr 已就绪（Qwen3-ASR 官方推理框架）"
-        except ImportError:
-            pass
+        except ImportError as e:
+            funasr_err = str(e)
+        except Exception as e:
+            # funasr 已安装，但内部 import 出错（常见原因：huggingface-hub
+            # 版本与 funasr 要求不符，例如环境内其他包把 hub 降级到 <1.0，
+            # funasr 引用的新版 hub API 不存在）
+            funasr_err = f"{type(e).__name__}: {e}"
         # 降级：检查 transformers（仅能加载缓存 config，无法真正推理）
         try:
             import transformers  # noqa: F401
             return (
                 False,
-                "需要安装 funasr：pip install funasr modelscope\n"
-                "（Qwen3-ASR 的 qwen3_asr 架构不在标准 transformers 中，"
-                "必须通过 funasr 或 modelscope 加载）",
+                f"funasr 导入失败（{funasr_err}）。\n"
+                "若已执行过 pip install funasr modelscope 但仍报此错，"
+                "大概率是 huggingface-hub 版本冲突（环境内某个包要求"
+                "huggingface-hub < 1.0，与 funasr 所需的新版冲突）。"
+                "建议为 Qwen3 后端单独建立虚拟环境，"
+                "或运行 `python -c \"import funasr\"` 查看完整 traceback 确认。",
             )
         except ImportError as e:
             return False, f"未安装: pip install funasr modelscope ({e})"
@@ -616,13 +453,17 @@ class Qwen3ASRAligner(AltAlignerBase):
             self._pipe_backend = "funasr"
             logger.info("[Qwen3-ASR] ✓ 模型已加载（funasr 后端）")
             return
-        except ImportError:
+        except ImportError as e:
             logger.warning(
-                "[Qwen3-ASR] funasr 未安装，尝试 transformers pipeline 降级路径\n"
-                "  建议：pip install funasr modelscope"
+                f"[Qwen3-ASR] funasr 导入失败: {type(e).__name__}: {e}\n"
+                "  若已安装过 funasr，这通常是 huggingface-hub 版本冲突"
+                "导致的，而非真的缺包。\n"
+                "  尝试降级 transformers pipeline 路径..."
             )
         except Exception as e:
             logger.warning(f"[Qwen3-ASR] funasr 加载失败: {e}，尝试降级")
+            import traceback
+            logger.debug(traceback.format_exc())
 
         # ── 降级路径：transformers pipeline（仅当模型已有本地权重时有效）──
         # 注意：Qwen3-ASR-1.7B 的 config.model_type = 'qwen3_asr'，
@@ -671,7 +512,9 @@ class Qwen3ASRAligner(AltAlignerBase):
         t0 = time.time()
         try:
             int_lang = _normalize_lang(language)
-            wx_lang  = _to_whisperx_lang(language)
+            # funasr 的 language 参数接受 ISO 短代码（zh/en/ja/ko）
+            asr_lang = {"zh": "zh", "yue": "zh", "en": "en",
+                        "ja": "ja", "ko": "ko"}.get(int_lang, int_lang)
 
             self._load_model()
             logger.info("[Qwen3-ASR] 开始转录...")
@@ -683,7 +526,7 @@ class Qwen3ASRAligner(AltAlignerBase):
                 # generate_kwargs：language 映射到 funasr 的 language 参数
                 raw = self._pipe.generate(
                     audio_path,
-                    language=wx_lang,
+                    language=asr_lang,
                     return_raw_text=True,
                 )
                 # raw 形如: [{"text": "你好世界", "timestamp": [[0.0, 0.2], [0.2, 0.4], ...]}]
@@ -711,7 +554,7 @@ class Qwen3ASRAligner(AltAlignerBase):
                 # transformers pipeline 输出
                 result = self._pipe(
                     audio_path,
-                    generate_kwargs={"language": wx_lang, "task": "transcribe"},
+                    generate_kwargs={"language": asr_lang, "task": "transcribe"},
                     return_timestamps="word",
                     chunk_length_s=30,
                     stride_length_s=5,
@@ -783,7 +626,7 @@ class Qwen3ASRAligner(AltAlignerBase):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 7. Qwen3ForcedAligner
+# 6. Qwen3ForcedAligner
 # ═════════════════════════════════════════════════════════════════════════════
 
 class Qwen3ForcedAligner(AltAlignerBase):
@@ -823,7 +666,14 @@ class Qwen3ForcedAligner(AltAlignerBase):
             import transformers  # noqa: F401
             return True, "transformers 已就绪（需下载 Qwen3-ForcedAligner-0.6B）"
         except ImportError as e:
-            return False, f"未安装: pip install transformers ({e})"
+            return (
+                False,
+                f"funasr 导入失败（{funasr_err}）。\n"
+                "推荐方案：\n"
+                "   pip uninstall -y transformers funasr\n"
+                "   pip install funasr modelscope\n"
+                "   pip install --upgrade git+https://github.com/huggingface/transformers.git"
+            )
 
     def _load_model(self):
         if self._model is not None:
@@ -1047,7 +897,7 @@ class Qwen3ForcedAligner(AltAlignerBase):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 8. 单例缓存与工厂函数
+# 7. 单例缓存与工厂函数
 # ═════════════════════════════════════════════════════════════════════════════
 
 _SINGLETON: Dict[str, AltAlignerBase] = {}
@@ -1056,13 +906,11 @@ _SINGLETON: Dict[str, AltAlignerBase] = {}
 def get_aligner(backend: str, device: str = "auto", **kwargs) -> AltAlignerBase:
     """
     工厂函数：按 backend 名称创建或复用对齐器单例。
-    backend: "whisperx" | "qwen3_asr" | "qwen3_aligner"
+    backend: "qwen3_asr" | "qwen3_aligner"
     """
     global _SINGLETON
     if backend not in _SINGLETON:
-        if backend == "whisperx":
-            _SINGLETON[backend] = WhisperXAligner(device=device, **kwargs)
-        elif backend == "qwen3_asr":
+        if backend == "qwen3_asr":
             _SINGLETON[backend] = Qwen3ASRAligner(device=device, **kwargs)
         elif backend == "qwen3_aligner":
             _SINGLETON[backend] = Qwen3ForcedAligner(device=device, **kwargs)
@@ -1073,22 +921,11 @@ def get_aligner(backend: str, device: str = "auto", **kwargs) -> AltAlignerBase:
 
 def get_alt_aligner_status() -> Dict:
     """检查所有替代对齐后端的可用状态（含模型文件目录信息）"""
-    wx_ok, wx_msg = WhisperXAligner.check_available()
     qa_ok, qa_msg = Qwen3ASRAligner.check_available()
     qf_ok, qf_msg = Qwen3ForcedAligner.check_available()
 
     return {
         "models_dir": str(_MODELS_DIR),        # ← 前端可展示此路径
-        "whisperx": {
-            "available":     wx_ok,
-            "message":       wx_msg,
-            "requires_text": False,
-            "description":   "WhisperX (Whisper ASR + wav2vec2 强制对齐)",
-            "model_paths": {
-                "asr":   str(_WHISPER_DIR),
-                "align": str(_ALIGN_DIR),
-            },
-        },
         "qwen3_asr": {
             "available":     qa_ok,
             "message":       qa_msg,

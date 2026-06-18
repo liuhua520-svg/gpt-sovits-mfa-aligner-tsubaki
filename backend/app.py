@@ -171,7 +171,7 @@ def pipeline_status():
 # 新增
 @app.route("/api/aligner/status", methods=["GET"])
 def aligner_status():
-    """检查所有对齐后端（MFA / WhisperX / Qwen3）的可用状态"""
+    """检查所有对齐后端（MFA / Qwen3）的可用状态"""
     try:
         mfa_ok, mfa_msg = MFAChecker.check_mfa_installed()
         alt_status = get_alt_aligner_status()
@@ -443,7 +443,7 @@ def pipeline_full_process():
         )
 
         aligner_backend = request.form.get("aligner_backend", "mfa")
-        if aligner_backend not in ("mfa", "whisperx", "qwen3_asr", "qwen3_aligner"):
+        if aligner_backend not in ("mfa", "qwen3_asr", "qwen3_aligner"):
             aligner_backend = "mfa"
 
         stem, wav_path, lab_path = build_job_paths(
@@ -576,12 +576,12 @@ def pipeline_mfa_only():
         language = request.form.get("language", "cmn")
 
         aligner_backend = request.form.get("aligner_backend", "mfa")
-        if aligner_backend not in ("mfa", "whisperx", "qwen3_asr", "qwen3_aligner"):
+        if aligner_backend not in ("mfa", "qwen3_asr", "qwen3_aligner"):
             aligner_backend = "mfa"
         f0_device = request.form.get("f0_device", "auto")
 
-        # WhisperX / Qwen3-ASR 支持纯 ASR 模式，文本可选
-        text_optional = aligner_backend in ("whisperx", "qwen3_asr")
+        # Qwen3-ASR 支持纯 ASR 模式，文本可选
+        text_optional = aligner_backend in ("qwen3_asr",)
         if not audio_file or (not text and not text_optional):
             return jsonify({"error": "输入无效（MFA / Qwen3-ForcedAligner 模式需要文本）"}), 400
 
