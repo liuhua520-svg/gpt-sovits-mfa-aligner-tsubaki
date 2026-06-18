@@ -12,7 +12,7 @@ alt_aligners.py — 替代音素对齐后端
 
 标点/静音处理：
   Qwen3 不在对齐输出中输出标点（标点不可发声）。
-  本模块在生成 LAB 后自动扫描时间轴间隙，将 ≥ 50ms 的空白补全为 SP / SIL 条目。
+  本模块在生成 LAB 后自动扫描时间轴间隙，将 ≥ 50ms 的空白补全为 SIL 条目。
   用户无需为标点担心，静音标记由时间间隙自动推断。
 """
 from __future__ import annotations
@@ -21,6 +21,7 @@ import logging
 import os
 import time
 import unicodedata
+import requests
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -166,18 +167,18 @@ def _is_cjk_punct(text: str) -> bool:
 def _fill_silences_lab(
     lab_content: str,
     min_gap_100ns: int = 500_000,       # 50ms
-    long_sil_100ns: int = 5_000_000,    # 500ms → 用 SIL 而非 SP
+    long_sil_100ns: int = 5_000_000,    # 500ms → 统一输出 SIL
 ) -> str:
     """
-    扫描 LAB 时间轴，在 ≥ 50ms 的间隙自动补全 SP / SIL 条目。
+    扫描 LAB 时间轴，在 ≥ 50ms 的间隙自动补全 SIL 条目。
 
     背景：Qwen3 不输出标点字符的时间戳，但句末/句中停顿
     会在相邻字符之间留下时间间隙，本函数将这些间隙转换为 LAB 静音标记。
 
     Parameters
     ----------
-    min_gap_100ns : 插入 SP 的最小间隙（默认 50ms）
-    long_sil_100ns : 超过此值用 SIL 代替 SP（默认 500ms）
+    min_gap_100ns : 插入静音的最小间隙（默认 50ms）
+    long_sil_100ns : 超过此值仍输出 SIL（保留参数以兼容旧调用）
     """
     if not lab_content.strip():
         return lab_content
@@ -198,7 +199,7 @@ def _fill_silences_lab(
 
     # ── 音频开头静音 ──────────────────────────────────────────────────────
     if parsed[0][0] > min_gap_100ns:
-        result.append((0, parsed[0][0], "SP"))
+        result.append((0, parsed[0][0], "SIL"))
 
     for i, (s, e, ph) in enumerate(parsed):
         result.append((s, e, ph))
@@ -207,8 +208,7 @@ def _fill_silences_lab(
             gap_e = parsed[i + 1][0]
             gap   = gap_e - gap_s
             if gap > min_gap_100ns:
-                label = "SIL" if gap >= long_sil_100ns else "SP"
-                result.append((gap_s, gap_e, label))
+                result.append((gap_s, gap_e, "SIL"))
 
     return "\n".join(f"{s} {e} {p}" for s, e, p in result)
 
@@ -250,7 +250,7 @@ class AltAlignerBase:
     def align(self, audio_path: str, text: Optional[str], language: str) -> Dict:
         raise NotImplementedError
 
-    # ── 词语时间戳 → LAB（含 SP 间隙补全）──────────────────────────────────
+    # ── 词语时间戳 → LAB（含静音间隙补全）────────────────────────────────
     def _word_entries_to_lab(
         self,
         word_entries: List[Tuple[float, float, str]],
@@ -260,13 +260,13 @@ class AltAlignerBase:
     ) -> str:
         """
         将词语 / 字符级时间戳 → LAB 格式，复用 MFAProcessor 的音素转换逻辑。
-        fill_silences=True 时自动在时间间隙中插入 SP / SIL。
+        fill_silences=True 时自动在时间间隙中插入 SIL。
 
         关于标点：
           Qwen3 不产生标点字符的对齐时间戳（标点不可发音）。
           _text_to_syllables() 在提取音素序列时也会忽略标点，因此参考文本中
           的标点不影响音素分布——只要参考文本的可发音字符数与 entries 数量一致即可。
-          句末 / 句中的停顿由 fill_silences 根据时间间隙自动插入。
+          句末 / 句中的停顿由 fill_silences 根据时间间隙自动插入 SIL。
         """
         if not word_entries:
             return ""
@@ -376,253 +376,192 @@ class AltAlignerBase:
 
 class Qwen3ASRAligner(AltAlignerBase):
     """
-    Qwen3-ASR-1.7B 对齐后端（自动语音识别 + 词语级时间戳）
-    https://huggingface.co/Qwen/Qwen3-ASR-1.7B
-
-    模型文件存放位置：
-      backend/models/hf_cache/hub/models--Qwen--Qwen3-ASR-1.7B/  (~3.5GB)
+    Qwen3-ASR 独立服务客户端
+    只通过 HTTP 调用 qwen3_server.py，不在当前进程内加载模型。
     """
 
     DEFAULT_MODEL = "Qwen/Qwen3-ASR-1.7B"
+    DEFAULT_ENDPOINT = "http://127.0.0.1:5001/asr"
 
-    def __init__(self, model_id: str = DEFAULT_MODEL, device: str = "auto"):
+    def __init__(
+        self,
+        model_id: str = DEFAULT_MODEL,
+        device: str = "auto",
+        endpoint: str = DEFAULT_ENDPOINT,
+    ):
         super().__init__()
         self.model_id = model_id
-        self._device = self._resolve_device(device)
-        self._pipe = None
-
-    @staticmethod
-    def _resolve_device(device: str) -> str:
-        if device == "auto":
-            try:
-                import torch
-                return "cuda:0" if torch.cuda.is_available() else "cpu"
-            except ImportError:
-                return "cpu"
-        return device
+        self._device = device
+        self.endpoint = endpoint.rstrip("/")
+        self._session = None
 
     @staticmethod
     def check_available() -> Tuple[bool, str]:
-        # Qwen3-ASR 使用 funasr 推理，不依赖标准 transformers AutoModel
         try:
-            import funasr  # noqa: F401
-            return True, "funasr 已就绪（Qwen3-ASR 官方推理框架）"
+            import requests  # noqa: F401
         except ImportError as e:
-            funasr_err = str(e)
+            return False, f"未安装 requests: pip install requests ({e})"
+
+        try:
+            r = requests.get("http://127.0.0.1:5001/", timeout=2)
+            return True, "Qwen3-ASR 独立服务已可访问"
         except Exception as e:
-            # funasr 已安装，但内部 import 出错（常见原因：huggingface-hub
-            # 版本与 funasr 要求不符，例如环境内其他包把 hub 降级到 <1.0，
-            # funasr 引用的新版 hub API 不存在）
-            funasr_err = f"{type(e).__name__}: {e}"
-        # 降级：检查 transformers（仅能加载缓存 config，无法真正推理）
-        try:
-            import transformers  # noqa: F401
-            return (
-                False,
-                f"funasr 导入失败（{funasr_err}）。\n"
-                "若已执行过 pip install funasr modelscope 但仍报此错，"
-                "大概率是 huggingface-hub 版本冲突（环境内某个包要求"
-                "huggingface-hub < 1.0，与 funasr 所需的新版冲突）。"
-                "建议为 Qwen3 后端单独建立虚拟环境，"
-                "或运行 `python -c \"import funasr\"` 查看完整 traceback 确认。",
-            )
-        except ImportError as e:
-            return False, f"未安装: pip install funasr modelscope ({e})"
+            return False, f"Qwen3-ASR 独立服务不可访问: {e}"
 
     def _load_model(self):
-        if self._pipe is not None:
-            return
+        """
+        独立服务模式下，不加载本地模型。
+        这里只做轻量级连接初始化。
+        """
+        if self._session is None:
+            self._session = requests.Session()
 
-        logger.info(
-            f"[Qwen3-ASR] 加载模型: {self.model_id}\n"
-            f"  缓存目录 → {_HF_HUB}"
-        )
+    def _call_qwen3_service(self, audio_path: str, language: str, context: str = "") -> Dict:
+        self._load_model()
 
-        # ── 优先路径：funasr（官方推荐，支持 qwen3_asr 架构）────────────
-        try:
-            from funasr import AutoModel as FunASRAutoModel  # type: ignore
+        payload = {
+            "audio": audio_path,
+            "language": language,
+            "context": context,
+        }
 
-            device = "cuda" if "cuda" in self._device else "cpu"
-            self._pipe = FunASRAutoModel(
-                model=self.model_id,
-                device=device,
-                hub="hf",
-                model_path=str(_HF_HUB),   # 本地缓存目录
-            )
-            self._pipe_backend = "funasr"
-            logger.info("[Qwen3-ASR] ✓ 模型已加载（funasr 后端）")
-            return
-        except ImportError as e:
-            logger.warning(
-                f"[Qwen3-ASR] funasr 导入失败: {type(e).__name__}: {e}\n"
-                "  若已安装过 funasr，这通常是 huggingface-hub 版本冲突"
-                "导致的，而非真的缺包。\n"
-                "  尝试降级 transformers pipeline 路径..."
-            )
-        except Exception as e:
-            logger.warning(f"[Qwen3-ASR] funasr 加载失败: {e}，尝试降级")
-            import traceback
-            logger.debug(traceback.format_exc())
+        resp = self._session.post(self.endpoint, json=payload, timeout=1800)
+        resp.raise_for_status()
+        data = resp.json()
 
-        # ── 降级路径：transformers pipeline（仅当模型已有本地权重时有效）──
-        # 注意：Qwen3-ASR-1.7B 的 config.model_type = 'qwen3_asr'，
-        # 标准 transformers <= 5.x 不含此类，from_pretrained 会抛 KeyError/ValueError。
-        # 如果到达此处，说明 funasr 未安装且降级也无法成功，需提示用户安装 funasr。
-        try:
-            from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
-            import torch
+        if not data.get("success", False):
+            raise RuntimeError(data.get("error", "Qwen3-ASR 服务返回失败"))
 
-            dtype = torch.float16 if "cuda" in self._device else torch.float32
-            model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                self.model_id,
-                torch_dtype=dtype,
-                low_cpu_mem_usage=True,
-                use_safetensors=True,
-                cache_dir=str(_HF_HUB),
-                trust_remote_code=True,     # ← 允许加载模型自带的 modeling_qwen3_asr.py
-            )
-            model.to(self._device)
-            processor = AutoProcessor.from_pretrained(
-                self.model_id,
-                cache_dir=str(_HF_HUB),
-                trust_remote_code=True,
-            )
-            self._pipe = pipeline(
-                "automatic-speech-recognition",
-                model=model,
-                tokenizer=processor.tokenizer,
-                feature_extractor=processor.feature_extractor,
-                torch_dtype=dtype,
-                device=self._device,
-            )
-            self._pipe_backend = "transformers"
-            logger.info("[Qwen3-ASR] ✓ 模型已加载（transformers + trust_remote_code）")
-        except Exception as e:
-            raise RuntimeError(
-                f"[Qwen3-ASR] 无法加载模型：{e}\n\n"
-                "Qwen3-ASR 使用自定义 'qwen3_asr' 架构，标准 transformers 不支持此类型。\n"
-                "请安装官方推理框架后重试：\n"
-                "  pip install funasr modelscope\n"
-                "或从源码安装最新 transformers：\n"
-                "  pip install git+https://github.com/huggingface/transformers.git"
-            ) from e
+        return data
+
+    @staticmethod
+    def _flatten_segments_to_entries(segments, int_lang: str):
+        """
+        将独立服务返回的 segments 转成:
+        [(start_sec, end_sec, text), ...]
+        """
+        entries = []
+
+        for seg in segments or []:
+            text = (seg.get("text") or "").strip()
+            time_stamps = seg.get("time_stamps") or seg.get("timestamp") or []
+
+            if not text:
+                continue
+
+            # 兼容几种返回形式：
+            # 1) [[s, e], [s, e], ...]
+            # 2) [{"start": s, "end": e, "text": "x"}, ...]
+            # 3) 单个 [s, e]
+            if isinstance(time_stamps, list) and time_stamps and isinstance(time_stamps[0], list):
+                # 多时间片
+                if int_lang in ("zh", "yue", "ja") and len(text) > 1 and len(time_stamps) == len(text):
+                    dur_each = sum((e - s) for s, e in time_stamps if s is not None and e is not None) / max(len(text), 1)
+                    for i, ch in enumerate(text):
+                        if i < len(time_stamps):
+                            s, e = time_stamps[i]
+                            if s is not None and e is not None and not _is_cjk_punct(ch):
+                                entries.append((float(s), float(e), ch))
+                else:
+                    for item in time_stamps:
+                        if isinstance(item, list) and len(item) >= 2:
+                            s, e = item[0], item[1]
+                            if s is not None and e is not None and not _is_cjk_punct(text):
+                                entries.append((float(s), float(e), text))
+            elif isinstance(time_stamps, list) and len(time_stamps) >= 2 and isinstance(time_stamps[0], (int, float)):
+                s, e = time_stamps[0], time_stamps[1]
+                if s is not None and e is not None and not _is_cjk_punct(text):
+                    entries.append((float(s), float(e), text))
+            elif isinstance(time_stamps, list) and time_stamps and isinstance(time_stamps[0], dict):
+                for item in time_stamps:
+                    s = item.get("start")
+                    e = item.get("end")
+                    t = (item.get("text") or "").strip()
+                    if s is not None and e is not None and t and not _is_cjk_punct(t):
+                        entries.append((float(s), float(e), t))
+
+        return entries
 
     def align(self, audio_path: str, text: Optional[str], language: str) -> Dict:
         t0 = time.time()
         try:
             int_lang = _normalize_lang(language)
-            # funasr 的 language 参数接受 ISO 短代码（zh/en/ja/ko）
-            asr_lang = {"zh": "zh", "yue": "zh", "en": "en",
-                        "ja": "ja", "ko": "ko"}.get(int_lang, int_lang)
+            asr_lang = {
+                "zh": "Chinese",
+                "yue": "Cantonese",
+                "en": "English",
+                "ja": "Japanese",
+                "ko": "Korean",
+            }.get(int_lang, language)
 
-            self._load_model()
-            logger.info("[Qwen3-ASR] 开始转录...")
+            logger.info(f"[Qwen3-ASR] 调用独立服务: {self.endpoint}")
+            result = self._call_qwen3_service(
+                audio_path=audio_path,
+                language=asr_lang,
+                context="",
+            )
 
-            backend = getattr(self, "_pipe_backend", "transformers")
+            transcribed = (result.get("raw_text") or "").strip()
+            segments = result.get("segments") or []
 
-            if backend == "funasr":
-                # funasr 输出：list of dict，包含 "text" 和 "timestamp"
-                # generate_kwargs：language 映射到 funasr 的 language 参数
-                raw = self._pipe.generate(
-                    audio_path,
-                    language=asr_lang,
-                    return_raw_text=True,
-                )
-                # raw 形如: [{"text": "你好世界", "timestamp": [[0.0, 0.2], [0.2, 0.4], ...]}]
-                if not raw:
-                    return {"success": False, "error": "Qwen3-ASR (funasr) 无转录结果",
-                            "processing_time": int((time.time() - t0) * 1000)}
-                transcribed = " ".join(
-                    item.get("text", "") for item in raw
-                ).strip()
-                # 将 funasr 时间戳格式统一转换为 chunks 格式
-                chunks = []
-                for item in raw:
-                    item_text = item.get("text", "")
-                    item_ts   = item.get("timestamp", [])  # [[s_ms, e_ms], ...]
-                    if item_ts and item_text:
-                        # funasr 时间戳单位：毫秒
-                        for char_text, (s_ms, e_ms) in zip(list(item_text), item_ts):
-                            chunks.append({
-                                "text": char_text,
-                                "timestamp": (s_ms / 1000.0, e_ms / 1000.0),
-                            })
-                    elif item_text:
-                        chunks.append({"text": item_text, "timestamp": (None, None)})
-            else:
-                # transformers pipeline 输出
-                result = self._pipe(
-                    audio_path,
-                    generate_kwargs={"language": asr_lang, "task": "transcribe"},
-                    return_timestamps="word",
-                    chunk_length_s=30,
-                    stride_length_s=5,
-                )
-                chunks      = result.get("chunks", [])
-                transcribed = result.get("text", "").strip()
+            entries = self._flatten_segments_to_entries(segments, int_lang)
 
             logger.info(f"[Qwen3-ASR] 转录文本: {transcribed[:120]}")
 
-            if not chunks and not transcribed:
-                return {"success": False, "error": "Qwen3-ASR 无转录结果",
-                        "processing_time": int((time.time() - t0) * 1000)}
+            if not entries and not transcribed:
+                return {
+                    "success": False,
+                    "error": "Qwen3-ASR 无转录结果",
+                    "processing_time": int((time.time() - t0) * 1000),
+                }
 
-            # 无 chunk 降级：按字符均匀分配时间
-            if not chunks and transcribed:
+            # 如果独立服务只返回文本，没有时间戳，则退化为均分
+            if not entries and transcribed:
                 total_s = self._get_audio_duration_100ns(audio_path) / 1e7
-                units = (list(transcribed) if int_lang in ("zh", "yue", "ja")
-                         else transcribed.split())
-                dur = total_s / max(len(units), 1)
-                chunks = [{"text": u, "timestamp": (i * dur, (i + 1) * dur)}
-                          for i, u in enumerate(units) if u.strip()]
-
-            entries: List[Tuple[float, float, str]] = []
-            for chunk in chunks:
-                ts       = chunk.get("timestamp") or (None, None)
-                ch_text  = (chunk.get("text") or "").strip()
-                if ts[0] is None or ts[1] is None or not ch_text:
-                    continue
-                # CJK：chunk 可能含多字，逐字均匀拆分
-                if int_lang in ("zh", "yue") and len(ch_text) > 1:
-                    dur_each = (ts[1] - ts[0]) / len(ch_text)
-                    for i, ch in enumerate(ch_text):
-                        if not _is_cjk_punct(ch):
-                            entries.append((
-                                ts[0] + i * dur_each,
-                                ts[0] + (i + 1) * dur_each,
-                                ch,
-                            ))
-                else:
-                    if not _is_cjk_punct(ch_text):
-                        entries.append((float(ts[0]), float(ts[1]), ch_text))
+                units = list(transcribed) if int_lang in ("zh", "yue", "ja") else transcribed.split()
+                units = [u for u in units if u.strip()]
+                if units:
+                    dur = total_s / max(len(units), 1)
+                    entries = [
+                        (i * dur, (i + 1) * dur, u)
+                        for i, u in enumerate(units)
+                        if not _is_cjk_punct(u)
+                    ]
 
             if not entries:
-                return {"success": False, "error": "Qwen3-ASR 无时间戳输出",
-                        "processing_time": int((time.time() - t0) * 1000)}
+                return {
+                    "success": False,
+                    "error": "Qwen3-ASR 无时间戳输出",
+                    "processing_time": int((time.time() - t0) * 1000),
+                }
 
-            final_text = text.strip() if text else transcribed
-            lab = self._word_entries_to_lab(entries, final_text, language,
-                                            fill_silences=True)
+            final_text = transcribed or (text.strip() if text else "")
+            if not transcribed and text:
+                logger.warning("[Qwen3-ASR] 未返回转录文本，回退使用外部 text 进行后处理")
+            lab = self._word_entries_to_lab(
+                entries,
+                final_text,
+                language,
+                fill_silences=True,
+            )
 
             return {
-                "success":        True,
-                "lab_content":    lab,
-                "raw_text":       final_text,
-                "phoneme_text":   transcribed,
+                "success": True,
+                "lab_content": lab,
+                "raw_text": final_text,
+                "phoneme_text": transcribed,
                 "audio_duration": self._get_audio_duration_100ns(audio_path),
                 "processing_time": int((time.time() - t0) * 1000),
-                "backend":        "qwen3_asr",
+                "backend": "qwen3_asr_http",
             }
 
-        except ImportError as e:
-            return {"success": False,
-                    "error": f"transformers 未安装: {e}",
-                    "processing_time": int((time.time() - t0) * 1000)}
         except Exception as e:
             logger.error(f"[Qwen3-ASR] 失败: {e}", exc_info=True)
-            return {"success": False, "error": str(e),
-                    "processing_time": int((time.time() - t0) * 1000)}
-
+            return {
+                "success": False,
+                "error": str(e),
+                "processing_time": int((time.time() - t0) * 1000),
+            }
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 6. Qwen3ForcedAligner
@@ -667,7 +606,7 @@ class Qwen3ForcedAligner(AltAlignerBase):
         except ImportError as e:
             return (
                 False,
-                f"funasr 导入失败（{funasr_err}）。\n"
+                f"transformers 导入失败（{e}）。\n"
                 "推荐方案：\n"
                 "   pip uninstall -y transformers funasr\n"
                 "   pip install funasr modelscope\n"
@@ -768,7 +707,7 @@ class Qwen3ForcedAligner(AltAlignerBase):
                 return {"success": False, "error": "Qwen3-ForcedAligner 无对齐输出",
                         "processing_time": int((time.time() - t0) * 1000)}
 
-            lab = self._word_entries_to_lab(entries, text, language, fill_silences=True)
+            lab = self._word_entries_to_lab(entries, text, language, fill_silences=False)
             return {
                 "success":        True,
                 "lab_content":    lab,
