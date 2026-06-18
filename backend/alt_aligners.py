@@ -370,7 +370,6 @@ class AltAlignerBase:
     def _get_audio_duration_100ns(self, audio_path: str) -> int:
         return self._mfa._get_audio_duration(audio_path)
 
-
 # ═════════════════════════════════════════════════════════════════════════════
 # 5. Qwen3ASRAligner
 # ═════════════════════════════════════════════════════════════════════════════
