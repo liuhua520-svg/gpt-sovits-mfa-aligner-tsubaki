@@ -333,7 +333,7 @@ class AltAlignerBase:
         word_entries: List[Tuple[float, float, str]],
         text: str,
         language: str,
-        fill_silences: bool = False,
+        fill_silences: bool = True,
     ) -> str:
         """
         将词语 / 字符级时间戳 → LAB 格式，复用 MFAProcessor 的音素转换逻辑。
@@ -567,14 +567,17 @@ class WhisperXAligner(AltAlignerBase):
                 return_char_alignments=True,   # CJK 关键：字符级对齐
             )
 
-            # 4. 提取词语时间戳
-            entries = self._extract_entries(aligned, int_lang)
-            if not entries:
+            # 4. 按 ASR segment 逐句提取词语时间戳（保留句间边界，不展平合并）
+            seg_entries_list = self._extract_entries_per_segment(aligned, int_lang)
+            if not seg_entries_list or not any(seg_entries_list):
                 return self._err("强制对齐无输出，请检查语言代码和音频质量", t0)
 
-            # 5. 转换为 LAB（优先使用用户提供的参考文本驱动音素转换）
+            # 5. 转换为 LAB：每个 segment 独立做音素转换，避免整段参考文本被
+            #    一次性灌入单一字符时间戳流（那样会导致长文本越往后越错位，
+            #    任何 ASR/参考文本字符数不一致都会向后传播，表现为相邻句子
+            #    被强行粘连、某个音素时长被拉伸吞掉句间停顿）。
             final_text = text.strip() if text else asr_text
-            lab = self._word_entries_to_lab(entries, final_text, language)
+            lab = self._segments_to_lab(seg_entries_list, final_text, language)
 
             return {
                 "success": True,
@@ -622,6 +625,102 @@ class WhisperXAligner(AltAlignerBase):
 
         entries.sort(key=lambda x: x[0])
         return entries
+
+    def _extract_entries_per_segment(
+        self, aligned: Dict, int_lang: str
+    ) -> List[List[Tuple[float, float, str]]]:
+        """
+        从 WhisperX 对齐结果按 segment 分别提取 (start_sec, end_sec, text) 列表。
+
+        与 _extract_entries() 的区别：返回 List[List[...]]（每个 segment 一个子列表），
+        不展平合并。这样后续音素转换可以逐句独立处理，句间的真实停顿（说话间隙）
+        会以"两个子列表时间戳之间存在间隔"的形式自然保留在最终 LAB 里，
+        而不会被强制对齐误吞并、也不需要人为插入 SP/SIL。
+        """
+        seg_entries_list: List[List[Tuple[float, float, str]]] = []
+
+        for seg in aligned.get("segments", []):
+            chars = seg.get("chars", [])
+            words = seg.get("words", [])
+            seg_entries: List[Tuple[float, float, str]] = []
+
+            if int_lang in ("zh", "yue", "ja") and chars:
+                for ch in chars:
+                    s = ch.get("start")
+                    e = ch.get("end")
+                    t = (ch.get("char") or ch.get("text") or "").strip()
+                    if s is not None and e is not None and t and not _is_cjk_punct(t):
+                        seg_entries.append((float(s), float(e), t))
+            elif words:
+                for w in words:
+                    s = w.get("start")
+                    e = w.get("end")
+                    t = (w.get("word") or w.get("text") or "").strip()
+                    if s is not None and e is not None and t:
+                        seg_entries.append((float(s), float(e), t))
+
+            seg_entries.sort(key=lambda x: x[0])
+            if seg_entries:
+                seg_entries_list.append(seg_entries)
+
+        return seg_entries_list
+
+    def _segments_to_lab(
+        self,
+        seg_entries_list: List[List[Tuple[float, float, str]]],
+        full_text: str,
+        language: str,
+    ) -> str:
+        """
+        逐 segment 独立调用 _word_entries_to_lab()，再按真实时间戳顺序拼接。
+
+        关键点：
+          - 每个 segment 只用自己对应的那一段参考文本切片去驱动音素转换，
+            不会让长文本里某一句的字符数误差污染到后面所有句子。
+          - segment 之间不插入任何 SP/SIL 占位条目（歌声合成场景不需要），
+            真实的句间停顿就体现在"前一句最后一个音素的 end" 与
+            "下一句第一个音素的 start" 之间的时间差里，下游 SVP/Tsubaki
+            导出逻辑可以按这个时间差正常处理音符间隔。
+          - 若参考文本的可发音字符总数与 entries 总数不一致，则退化为
+            把全部 entries 一次性转换（与旧行为一致），保证不会比修复前更差。
+        """
+        if not seg_entries_list:
+            return ""
+
+        lang = _normalize_lang(language)
+        total_entries = sum(len(s) for s in seg_entries_list)
+
+        # 仅对 CJK 做"按可发音字符数切片参考文本"，其余语言按词数切分较脆弱，
+        # 直接退化为整体转换（行为与旧版本一致，不会变差）。
+        if lang not in ("zh", "yue", "ja") or not full_text:
+            flat = [e for seg in seg_entries_list for e in seg]
+            return self._word_entries_to_lab(flat, full_text, language)
+
+        spoken_chars = [
+            ch for ch in full_text
+            if not unicodedata.category(ch).startswith(("P", "Z", "S"))
+        ]
+
+        if len(spoken_chars) != total_entries:
+            logger.warning(
+                f"[WhisperX] 参考文本可发音字符数 {len(spoken_chars)} ≠ "
+                f"对齐条目总数 {total_entries}，无法按句切分参考文本，"
+                f"退化为整体转换（可能仍出现轻微偏移，请核对参考文本）。"
+            )
+            flat = [e for seg in seg_entries_list for e in seg]
+            return self._word_entries_to_lab(flat, full_text, language)
+
+        lab_blocks: List[str] = []
+        cursor = 0
+        for seg_entries in seg_entries_list:
+            n = len(seg_entries)
+            seg_text = "".join(spoken_chars[cursor:cursor + n])
+            cursor += n
+            block = self._word_entries_to_lab(seg_entries, seg_text, language)
+            if block:
+                lab_blocks.append(block)
+
+        return "\n".join(lab_blocks)
 
     @staticmethod
     def _err(msg: str, t0: float) -> Dict:
