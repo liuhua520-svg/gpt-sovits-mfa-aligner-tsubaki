@@ -210,43 +210,6 @@ def normalize_text_for_whisperx(text: str, lang: str = "zh") -> str:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 2c. ASR 转录文本里的阿拉伯数字编号伪影清洗
-#
-#     背景（诊断结论）：normalize_text_for_whisperx() 清洗的是"用户提供
-#     的参考文本"，但 WhisperXAligner 的强制对齐阶段实际对齐的是
-#     Whisper 自己识别出来的转录文本（asr_out["segments"] 里的 text），
-#     参考文本只在对齐完成后用于音素映射，不会经过上面的清洗函数。
-#
-#     实测发现：当朗读内容本身包含中文序数词枚举（"一，声库。"）时，
-#     Whisper 的中文转写有时会把"一，"自动格式化成阿拉伯数字列表样式
-#     "1."。"1" 这个字符在 wav2vec2 的中文音素词表里没有对应发音，
-#     会在该处造成局部强制对齐错乱——典型表现为紧邻该位置的音素被
-#     压缩成几毫秒，或前后音素时长被异常拉伸（与 _check_alignment_quality
-#     的整体性退化插值是两种不同成因，但外观上都是"音素时长不正常"）。
-#
-#     这里只清除"单个数字 + 紧跟句点/顿号、且不是多位数字或小数"这种
-#     典型列表标记模式，避免误伤歌词里真实出现的数字（如年份 "2026"
-#     或小数 "3.14"）。
-# ═════════════════════════════════════════════════════════════════════════════
-
-_ASR_NUMERAL_ARTIFACT_RE = _re.compile(r"(?<![\d.])([1-9])[.、](?!\d)\s*")
-
-
-def strip_asr_numeral_artifacts(text: str) -> str:
-    """
-    清除 Whisper ASR 输出文本中形如 "1." "2、" 的孤立阿拉伯数字编号伪影。
-    只在 WhisperXAligner 内部对 ASR 自己的转录文本调用，不应用于
-    用户提供的参考文本（那部分由 normalize_text_for_whisperx 处理）。
-    """
-    if not text:
-        return text
-    cleaned = _ASR_NUMERAL_ARTIFACT_RE.sub("", text)
-    if cleaned != text:
-        logger.info(f"[WhisperX] 清除 ASR 编号伪影: {text!r} → {cleaned!r}")
-    return cleaned
-
-
-# ═════════════════════════════════════════════════════════════════════════════
 # 3. 工具函数
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -345,324 +308,6 @@ def _count_spoken_chars(text: str, int_lang: str) -> int:
             if ch.strip():
                 count += 1
     return count
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 3b. WhisperX 对齐前句子级预切分
-#
-#     背景（诊断结论）：
-#     wav2vec2 CTC 强制对齐在"长且内部无明显停顿"的整段音频上容易整体失败
-#     （找不到有效解码路径）。whisperx.align() 内部对失败的片段有一个静默
-#     兜底逻辑：退化为"按字符数比例均匀插值"，而不是抛出异常。
-#     这种兜底结果的典型特征是：同一段音频里几乎所有音素时长高度雷同
-#     （只有个位数的几个不同取值，标准差极小），与真实发音的自然节奏
-#     （时长应有较大方差）明显不符。
-#
-#     注意：这一步切分的是 Whisper 自己识别出来的 segment 文本
-#     （asr_out["segments"] 里的 text，是 Whisper 实际"听到"并转写出来的
-#     内容），不是用户填写的参考文本。WhisperXAligner.align() 的强制对齐
-#     阶段本来就不使用用户参考文本（只在对齐完成后，由 _word_entries_to_lab()
-#     用参考文本驱动音素/拼音转换），所以参考文本里的编号、Markdown 标题等
-#     结构化标记，并不会直接导致这里的对齐失败——除非这些标记在用户提供
-#     的参考文本和实际音频之间不一致，导致后续音素映射错位（这是另一个、
-#     独立的问题，见 _word_entries_to_lab 里的字符数校验告警）。
-# ═════════════════════════════════════════════════════════════════════════════
-
-_SENTENCE_END_RE = _re.compile(r"[。！？!?；;]")
-# 次级停顿符（逗号/顿号）：句末标点切不动、但估算时长仍超限时，
-# 优先按这里切，而不是直接按字符数硬切——这样切出来的边界更贴近
-# 真实语流停顿，能降低 wav2vec2 在"非真实语音边界"处对齐错乱的概率。
-_PAUSE_RE = _re.compile(r"[，,、]")
-
-
-def _force_char_split(p: str, est_dur: float, max_chunk_sec: float) -> List[str]:
-    """
-    按字符数把过长的子句强制切成多块。
-    仅作兜底：只有在句末标点、逗号/顿号都切不出有效边界时才会用到。
-    """
-    n_sub = max(1, int(est_dur // max_chunk_sec) + 1)
-    sub_len = max(1, -(-len(p) // n_sub))  # 向上取整
-    chars = list(p)
-    out: List[str] = []
-    for i in range(0, len(chars), sub_len):
-        sub_piece = "".join(chars[i:i + sub_len])
-        if sub_piece:
-            out.append(sub_piece)
-    return out
-
-
-def _split_segment_by_punctuation(
-    seg_start: float,
-    seg_end: float,
-    seg_text: str,
-    max_chunk_sec: float = 6.0,
-) -> List[Tuple[float, float, str]]:
-    """
-    把单个 Whisper segment 按句末标点切成更小的子段。
-
-    子段的起止时间只是按字符数比例估算出来的"粗略窗口"——真正精确的
-    逐音素时间仍然由 wav2vec2 CTC 在每个子段内部重新计算。把过长 /
-    多句合并的 segment 提前拆开，能显著降低 CTC 在长音频上整体对齐
-    失败的概率；即使个别子段仍然失败，受影响的时间范围也会小得多，
-    不会像现在这样让整段几十个字符全部退化成均匀插值。
-
-    Parameters
-    ----------
-    max_chunk_sec : 没有标点可切、但时长仍超过该值时，按字符数强制平均切分
-                    （防止单个子段仍然过长）。
-    """
-    seg_text = seg_text.strip()
-    duration = seg_end - seg_start
-    if not seg_text or duration <= 0:
-        return [(seg_start, seg_end, seg_text)]
-
-    # 按句末标点切分（标点保留在前一句末尾，便于保留语气/停顿信息）
-    parts = _SENTENCE_END_RE.split(seg_text)
-    puncts = _SENTENCE_END_RE.findall(seg_text)
-    pieces: List[str] = []
-    for i, p in enumerate(parts):
-        p = p.strip()
-        mark = puncts[i] if i < len(puncts) else ""
-        piece = (p + mark).strip()
-        if piece:
-            pieces.append(piece)
-
-    if not pieces:
-        return [(seg_start, seg_end, seg_text)]
-    if len(pieces) == 1 and duration <= max_chunk_sec:
-        # 单句、且不算长，不需要切分
-        return [(seg_start, seg_end, seg_text)]
-
-    # 第二遍：任何一个标点切出来的子句，若按字符比例估算出的时长仍然
-    # 超过 max_chunk_sec（常见于"没有任何标点的长句"，包括整句只有
-    # 一个 piece 的情况，比如 ASR 把多句话识别成一个不含句末标点的
-    # 长 segment 时），先尝试按逗号/顿号等次级停顿符切，切不出来
-    # 再按字符数强制切，避免子段仍然过长、也避免硬切在非真实语音
-    # 边界上下刀。
-    total_chars = sum(len(p) for p in pieces) or 1
-    final_pieces: List[str] = []
-    for p in pieces:
-        est_dur = duration * (len(p) / total_chars)
-        if est_dur > max_chunk_sec and len(p) > 1:
-            sub_parts = _PAUSE_RE.split(p)
-            sub_marks = _PAUSE_RE.findall(p)
-            comma_pieces: List[str] = []
-            for j, sp in enumerate(sub_parts):
-                sp = sp.strip()
-                m = sub_marks[j] if j < len(sub_marks) else ""
-                cp = (sp + m).strip()
-                if cp:
-                    comma_pieces.append(cp)
-
-            if len(comma_pieces) > 1:
-                sub_total = sum(len(cp) for cp in comma_pieces) or 1
-                for cp in comma_pieces:
-                    cp_est_dur = est_dur * (len(cp) / sub_total)
-                    if cp_est_dur > max_chunk_sec and len(cp) > 1:
-                        final_pieces.extend(
-                            _force_char_split(cp, cp_est_dur, max_chunk_sec)
-                        )
-                    else:
-                        final_pieces.append(cp)
-            else:
-                final_pieces.extend(_force_char_split(p, est_dur, max_chunk_sec))
-        else:
-            final_pieces.append(p)
-
-    if len(final_pieces) <= 1:
-        return [(seg_start, seg_end, seg_text)]
-
-    # 按各子段字符数比例分配时间边界（仅作为 CTC 对齐窗口的估计起止点）
-    weights = [max(len(p), 1) for p in final_pieces]
-    total_w = sum(weights)
-    out: List[Tuple[float, float, str]] = []
-    cursor = seg_start
-    for p, w in zip(final_pieces, weights):
-        piece_dur = duration * (w / total_w)
-        piece_end = cursor + piece_dur
-        out.append((cursor, piece_end, p))
-        cursor = piece_end
-    if out:
-        s, _, p = out[-1]
-        out[-1] = (s, seg_end, p)  # 消除浮点误差累积，确保末尾对齐到原 segment 结束时间
-    return out
-
-
-def _resegment_for_alignment(
-    segments: List[Dict],
-    max_chunk_sec: float = 6.0,
-) -> List[Dict]:
-    """
-    在调用 whisperx.align() 之前，把 Whisper 自己输出的 segments 按句末标点
-    （和必要时的强制字符数切分）拆成更小的子段，降低 wav2vec2 CTC
-    在长音频上整体对齐失败、静默退化为均匀插值的概率。
-
-    返回值仍是 whisperx.align() 所需的 dict 列表格式（至少含 start/end/text）。
-    """
-    new_segments: List[Dict] = []
-    n_split = 0
-    for seg in segments:
-        s = seg.get("start")
-        e = seg.get("end")
-        t = (seg.get("text") or "").strip()
-        if s is None or e is None or not t:
-            new_segments.append(seg)
-            continue
-
-        sub = _split_segment_by_punctuation(float(s), float(e), t, max_chunk_sec)
-        if len(sub) <= 1:
-            new_segments.append(seg)
-            continue
-
-        n_split += 1
-        for sub_s, sub_e, sub_t in sub:
-            new_seg = dict(seg)  # 保留原 segment 的其他字段
-            new_seg["start"] = sub_s
-            new_seg["end"] = sub_e
-            new_seg["text"] = sub_t
-            # word/char 级字段是上一阶段（若有）针对原 segment 计算的，
-            # 切分后已不适用，交给 align() 重新计算
-            new_seg.pop("words", None)
-            new_seg.pop("chars", None)
-            new_segments.append(new_seg)
-
-    if n_split:
-        logger.info(
-            f"[WhisperX] 句子级预切分：{n_split} 个原始 segment 被拆分为更小的对齐子段"
-        )
-    return new_segments
-
-
-def _check_alignment_quality(
-    entries: List[Tuple[float, float, str]],
-    context: str = "",
-) -> None:
-    """
-    粗略 QC 检查：若对齐结果里音素时长高度雷同（不同取值占比极低），
-    很可能是 wav2vec2 CTC 对该片段（或整段）对齐失败，触发了 whisperx
-    内部"按字符数比例均匀插值"的静默兜底，而不是真实的声学对齐结果。
-
-    只记录警告，不阻断流程；建议人工检查涉及的音频片段，或调小
-    max_align_chunk_sec 做更细粒度的预切分。
-    """
-    if len(entries) < 10:
-        return
-    durs = [round(e - s, 4) for s, e, _ in entries]
-    distinct_ratio = len(set(durs)) / len(durs)
-    if distinct_ratio < 0.35:
-        prefix = f"[{context}] " if context else ""
-        logger.warning(
-            f"[WhisperX] ⚠ {prefix}对齐结果时长高度雷同"
-            f"（{len(set(durs))}/{len(durs)} 个不同取值，占比 {distinct_ratio:.0%}），"
-            "疑似 wav2vec2 强制对齐对部分/全部音频片段失败，退化为按字符比例"
-            "均匀插值，而非真实声学对齐。建议检查该音频片段是否存在："
-            "长时间无停顿的连续朗读、ASR 识别文本与音频内容不匹配、或音频质量问题；"
-            "也可尝试调小 WhisperXAligner(max_align_chunk_sec=...) 做更细粒度预切分。"
-        )
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 3c. "边界压缩"伪影修复
-#
-#     背景（基于实际对齐结果排查）：即便整体对齐质量正常（没有触发上面
-#     的"均匀插值"退化告警），wav2vec2 CTC 强制对齐在"语音→静音"边界
-#     处仍会系统性地出现两类局部伪影：
-#
-#       A. 紧邻一段真实停顿（句末/分句间隙）之前的最后一个音素，常被
-#          压缩成几毫秒到二十毫秒——CTC 解码在语音概率骤降的位置武断
-#          截断，把本该属于该音素收尾部分的帧错误地划给了"空白"。
-#          在 piano roll / 音素编辑器里看，就是这个音素几乎"消失"或
-#          被紧紧挤扁在前一个音素旁边。
-#
-#       B. 夹在两个正常时长音素之间、左右都没有明显停顿的音素也可能
-#          被异常压缩（CTC 在相近音素之间概率分布不稳定造成的边界
-#          误判），表现为相邻音素之间没有自然过渡，"音标连在一起"。
-#
-#     这两类问题在同一份 102 条目的对齐结果里出现了 5 处，且全部精确
-#     等于地板值（约 12–20ms），与真实发音节奏的自然方差明显不符，
-#     是可以低风险、规则化修复的局部伪影，而不是需要重新对齐才能
-#     解决的整体性失败。
-# ═════════════════════════════════════════════════════════════════════════════
-
-def _smooth_short_phones(
-    entries: List[Tuple[float, float, str]],
-    total_audio_sec: Optional[float] = None,
-    min_phone_sec: float = 0.05,
-    gap_threshold_sec: float = 0.25,
-    gap_borrow_ratio: float = 0.5,
-    max_gap_borrow_sec: float = 0.08,
-    neighbor_borrow_sec: float = 0.015,
-    neighbor_min_remaining_sec: float = 0.06,
-) -> List[Tuple[float, float, str]]:
-    """
-    规则 A：当前音素时长 < min_phone_sec，且紧随其后是一段真实停顿
-    （间隙 ≥ gap_threshold_sec）→ 从这段停顿里"借"一部分时间延长
-    当前音素的收尾（不动前一个音素，也给停顿留够 0.05s 以上余量，
-    避免把停顿完全吃掉）。若是文件最后一个条目，用 total_audio_sec
-    （音频总时长）替代"下一条目的开始时间"来判断右侧是否有空白可借。
-
-    规则 B：当前音素时长 < min_phone_sec，但左右都没有明显停顿
-    （说明问题出在 CTC 内部，不是真实静音被误吞）→ 从左右邻居各借
-    一点点时间（默认每侧最多 15ms），且只在邻居自身借出后仍不低于
-    neighbor_min_remaining_sec 时才借，避免拆东墙补西墙引入新的
-    短时长。
-
-    两条规则都只调整边界、不增删条目，单次调整幅度都有上限，
-    是"修正局部伪影"而非"重新分配整体节奏"。
-    """
-    if len(entries) < 2:
-        return entries
-
-    fixed = [[s, e, ph] for s, e, ph in entries]
-    n = len(fixed)
-
-    for i in range(n):
-        s, e, ph = fixed[i]
-        dur = e - s
-        if dur >= min_phone_sec:
-            continue
-
-        # ── 规则 A：右侧是真实停顿 ──────────────────────────────────────
-        if i + 1 < n:
-            gap = fixed[i + 1][0] - e
-        elif total_audio_sec is not None:
-            gap = total_audio_sec - e
-        else:
-            gap = 0.0
-
-        if gap >= gap_threshold_sec:
-            borrow = min(gap * gap_borrow_ratio, max_gap_borrow_sec, gap - 0.05)
-            if borrow > 0:
-                fixed[i][1] = e + borrow
-                continue  # 已处理，不再叠加规则 B
-
-        # ── 规则 B：左右都没有明显停顿，各邻居借一点点 ───────────────────
-        if i - 1 >= 0 and i + 1 < n:
-            prev_s, prev_e, _ = fixed[i - 1]
-            next_s, next_e, _ = fixed[i + 1]
-            prev_gap = s - prev_e
-            next_gap = next_s - e
-            if prev_gap < gap_threshold_sec and next_gap < gap_threshold_sec:
-                prev_dur = prev_e - prev_s
-                next_dur = next_e - next_s
-                lend_left = (
-                    neighbor_borrow_sec
-                    if prev_dur - neighbor_borrow_sec >= neighbor_min_remaining_sec
-                    else 0.0
-                )
-                lend_right = (
-                    neighbor_borrow_sec
-                    if next_dur - neighbor_borrow_sec >= neighbor_min_remaining_sec
-                    else 0.0
-                )
-                if lend_left > 0:
-                    fixed[i - 1][1] -= lend_left
-                    fixed[i][0] -= lend_left
-                if lend_right > 0:
-                    fixed[i + 1][0] += lend_right
-                    fixed[i][1] += lend_right
-
-    return [(s, e, ph) for s, e, ph in fixed]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -830,9 +475,6 @@ class WhisperXAligner(AltAlignerBase):
         compute_type: str = "float16",
         batch_size: int = 16,
         hf_token: Optional[str] = None,
-        whisper_chunk_size: int = 12,
-        max_align_chunk_sec: float = 6.0,
-        min_phone_sec: float = 0.05,
     ):
         super().__init__()
         self.whisper_model = whisper_model
@@ -841,21 +483,6 @@ class WhisperXAligner(AltAlignerBase):
         self.compute_type = compute_type if self._device != "cpu" else "int8"
         self.batch_size = batch_size
         self.hf_token = hf_token or os.environ.get("HF_TOKEN")
-
-        # ── 长音频/连续朗读对齐稳定性参数 ──────────────────────────────────
-        # whisper_chunk_size: 传给 whisperx 的 transcribe(chunk_size=...)，
-        #   控制 Whisper 自身（VAD 合并后）单个 segment 的最大时长（秒）。
-        #   默认值比 whisperx 的内部默认 30s 更保守，让连续朗读（无明显
-        #   停顿）的音频也能被切成较短的 segment。
-        # max_align_chunk_sec: _resegment_for_alignment() 在调用
-        #   whisperx.align() 之前，对 Whisper 输出的 segment 做句子级
-        #   预切分时使用的目标时长上限（秒）。
-        # min_phone_sec: _smooth_short_phones() 用来判定"音素是否被
-        #   异常压缩"的下限阈值（秒）。实测正常发音的音素时长基本都在
-        #   0.06s 以上，<0.05s 几乎一定是边界压缩伪影而非真实发音。
-        self.whisper_chunk_size = whisper_chunk_size
-        self.max_align_chunk_sec = max_align_chunk_sec
-        self.min_phone_sec = min_phone_sec
 
         self._asr_model = None
         self._align_models: Dict[str, object] = {}   # {lang_code: (model_a, metadata)}
@@ -920,49 +547,23 @@ class WhisperXAligner(AltAlignerBase):
             # 2. ASR
             self._load_asr()
             logger.info("[WhisperX] 开始 ASR 转录...")
-            try:
-                # chunk_size 控制 VAD 合并后单个 segment 的最大时长（秒）。
-                # 比 whisperx 默认的 30s 更保守，避免长时间无停顿的连续
-                # 朗读被合并成一个过长的 segment（过长 segment 是后续
-                # wav2vec2 CTC 强制对齐整体失败、退化为均匀插值的主因之一）。
-                asr_out = self._asr_model.transcribe(
-                    audio, batch_size=self.batch_size, language=wx_lang,
-                    chunk_size=self.whisper_chunk_size,
-                )
-            except TypeError:
-                # 旧版 whisperx 不支持 chunk_size 参数，回退到默认行为
-                asr_out = self._asr_model.transcribe(
-                    audio, batch_size=self.batch_size, language=wx_lang
-                )
+            asr_out = self._asr_model.transcribe(
+                audio, batch_size=self.batch_size, language=wx_lang
+            )
             if not asr_out.get("segments"):
                 return self._err("WhisperX ASR 无输出，请检查音频质量", t0)
-
-            # 2.5 清除 ASR 转录里可能出现的阿拉伯数字编号伪影（例如把
-            #     朗读时说的"一，"自动格式化成"1."）。必须在这里清洗，
-            #     而不是只清洗用户参考文本——因为接下来的预切分 + 强制
-            #     对齐用的正是这里的 ASR 文本，留着"1."这种不可发音的
-            #     token 会在该处造成局部对齐错乱。
-            for _seg in asr_out["segments"]:
-                _seg["text"] = strip_asr_numeral_artifacts(_seg.get("text", ""))
 
             asr_text = " ".join(s.get("text", "") for s in asr_out["segments"]).strip()
             logger.info(f"[WhisperX] ASR 文本: {asr_text[:80]}")
 
-            # 3. 句子级预切分：把过长 / 多句合并的 segment 按标点拆成更小的
-            #    对齐子段，降低 wav2vec2 CTC 在长音频上整体对齐失败、
-            #    静默退化为"按字符比例均匀插值"的概率。
-            #    （直接使用 ASR 转录的 segments/文本，不覆盖为参考文本——
-            #    把参考文本整体注入所有 segments 会让 WhisperX 把全部字符
-            #    塞进每个 segment 的时间范围内，导致字符间静音消失、
-            #    句末音节时间被拉伸到下一句开头。）
-            segments_for_align = _resegment_for_alignment(
-                asr_out["segments"], max_chunk_sec=self.max_align_chunk_sec
-            )
-
+            # 3. 强制对齐（直接使用 ASR 转录的 segments，不覆盖各 segment 的文本）
+            #    注意：不要把参考文本整体注入所有 segments，否则 WhisperX 会把
+            #    全部字符塞进每个 segment 的时间范围内，导致字符间静音消失、
+            #    句末音节时间被拉伸到下一句开头。
             model_a, metadata = self._load_align(wx_lang)
             logger.info("[WhisperX] 开始强制对齐...")
             aligned = whisperx.align(
-                segments_for_align, model_a, metadata, audio, self._device,
+                asr_out["segments"], model_a, metadata, audio, self._device,
                 return_char_alignments=True,   # CJK 关键：字符级对齐
             )
 
@@ -970,18 +571,6 @@ class WhisperXAligner(AltAlignerBase):
             entries = self._extract_entries(aligned, int_lang)
             if not entries:
                 return self._err("强制对齐无输出，请检查语言代码和音频质量", t0)
-
-            # 4.5 修复"语音→静音"边界压缩伪影（详见 _smooth_short_phones
-            #     上方注释）：句末/分句停顿前最后一个音素被压缩成几毫秒，
-            #     或夹在两个正常音素之间被异常压缩，都在这里做小幅边界
-            #     修正，而不是留给后续的 SIL 间隙填充（那只处理"间隙"，
-            #     不处理"音素本身被压扁"）。
-            total_dur_sec = self._get_audio_duration_100ns(audio_path) / 10_000_000
-            entries = _smooth_short_phones(
-                entries, total_audio_sec=total_dur_sec, min_phone_sec=self.min_phone_sec
-            )
-
-            _check_alignment_quality(entries, context=os.path.basename(audio_path))
 
             # 5. 转换为 LAB（优先使用用户提供的参考文本驱动音素转换）
             final_text = text.strip() if text else asr_text
