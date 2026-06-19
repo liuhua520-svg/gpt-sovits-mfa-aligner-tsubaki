@@ -333,7 +333,7 @@ class AltAlignerBase:
         word_entries: List[Tuple[float, float, str]],
         text: str,
         language: str,
-        fill_silences: bool = True,
+        fill_silences: bool = False,
     ) -> str:
         """
         将词语 / 字符级时间戳 → LAB 格式，复用 MFAProcessor 的音素转换逻辑。
