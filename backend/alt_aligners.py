@@ -200,6 +200,9 @@ def normalize_text_for_whisperx(text: str, lang: str = "zh") -> str:
 # ═════════════════════════════════════════════════════════════════════════════
 # 3. 工具函数
 # ═════════════════════════════════════════════════════════════════════════════
+import re
+import unicodedata
+from typing import Dict, List, Optional, Tuple
 
 class _MI:
     """模拟 textgrid.Interval，供 MFAProcessor 内部逻辑使用（时间单位：秒）"""
@@ -214,11 +217,7 @@ class _MI:
 
 def _is_cjk_punct(text: str) -> bool:
     """
-    判断字符串是否全为标点 / 空白 / 符号（用于过滤 ASR 输出中的标点字符）。
-
-    注：标点本身不可发音，不应出现在 LAB 的音素层。
-    中文句末停顿（。！？）和停顿符（，、）对应的 LAB 条目由
-    _fill_silences_lab() 根据时间轴间隙自动插入 SP / SIL。
+    判断字符串是否全为标点 / 空白 / 符号。
     """
     if not text:
         return True
@@ -227,6 +226,45 @@ def _is_cjk_punct(text: str) -> bool:
         if not cat.startswith(("P", "Z", "S")):
             return False
     return True
+
+def _split_spoken_units(text: str, lang: str) -> List[str]:
+    """
+    将 full_text 切成可发声单位：
+    - zh/yue/ja：按字符
+    - 其他语言：按词
+    """
+    if not text:
+        return []
+
+    lang = _normalize_lang(lang)
+
+    if lang in ("zh", "yue", "ja"):
+        units = []
+        for ch in text:
+            cat = unicodedata.category(ch)
+            if cat.startswith(("P", "Z", "S")):
+                continue
+            units.append(ch)
+        return units
+
+    units = []
+    for tok in re.split(r"\s+", text):
+        tok = tok.strip()
+        if not tok:
+            continue
+        tok = tok.strip("，。！？；、…・｜─—,.;:!?\"'()[]{}<>《》「」『』“”‘’")
+        if tok:
+            units.append(tok)
+    return units
+
+def _split_ref_sentences(text: str) -> List[str]:
+    """
+    只按强句号断句，尽量保留原句结构。
+    """
+    if not text:
+        return []
+    parts = re.split(r"[。！？；\n…!?]+", text)
+    return [p.strip() for p in parts if p and p.strip()]
 
 
 def _fill_silences_lab(
@@ -309,68 +347,28 @@ def _bind_ref_text_by_asr_count(
     int_lang: str,
 ) -> bool:
     """
-    按"每段 ASR 自己识别出的可发音字符数"作为配额，把完整参考文本
-    （保留原始标点）按顺序切给对应的段，而不是直接放弃参考文本退回
-    ASR 识别结果。
-
-    关键点（区别于按时长比例分配的早期方案）：
-    分配用的配额是每段 ASR 文本自身的字符数，而不是音频时长。
-    这保证替换后 seg_text 的可发音字符数与该段稍后实际送入
-    wav2vec2 做强制对齐的字符数完全一致——避免"参考文本字数与该段
-    音频实际内容字数不匹配 → 强制对齐被迫拉伸/压缩 → 时间戳错位"
-    的问题。按时长比例分配做不到这一点：时长占比只是粗略估算，
-    跟该段 ASR 真实识别出的字符数可能完全不是一回事。
-
-    会原地修改 raw_segments 中每个元素的 "text" 字段。
-    返回 True 表示已替换；False 表示因总字数差异过大放弃替换（保留 ASR 文本）。
+    稳定版参考文本绑定：
+    - 只在“句数完全一致”时绑定
+    - 不再按 ASR 字数强行切分参考文本
+    - 返回 True 表示完成绑定
     """
-    def _is_spoken(ch: str) -> bool:
-        if int_lang in ("zh", "yue"):
-            return '\u4e00' <= ch <= '\u9fff' or '\u3400' <= ch <= '\u4dbf'
-        if int_lang == "ja":
-            return '\u3040' <= ch <= '\u30ff' or '\u4e00' <= ch <= '\u9fff'
-        return ch.strip() != "" and not _is_cjk_punct(ch)
-
-    # 每段 ASR 自己的可发音字符数 = 该段稍后会送入 wav2vec2 对齐的字符数
-    quotas = [
-        sum(1 for ch in (seg.get("text", "") or "") if _is_spoken(ch))
-        for seg in raw_segments
-    ]
-    total_quota = sum(quotas)
-    ref_spoken_total = sum(1 for ch in cleaned_ref if _is_spoken(ch))
-
-    if total_quota == 0 or ref_spoken_total == 0:
+    if not cleaned_ref or not raw_segments:
         return False
 
-    # 总字数差异过大（比如参考文本其实跟这段音频不对应），
-    # 替换风险大于收益，放弃替换，保留 ASR 自己的识别文本
-    diff_ratio = abs(total_quota - ref_spoken_total) / max(ref_spoken_total, 1)
-    if diff_ratio > 0.15:
+    ref_sentences = _split_ref_sentences(cleaned_ref)
+
+    if len(ref_sentences) != len(raw_segments):
         logger.warning(
-            f"[alt_aligners] ASR 总字数({total_quota}) 与参考文本总字数"
-            f"({ref_spoken_total}) 差异达 {diff_ratio:.0%}，放弃按参考文本替换，"
-            "保留 ASR 识别文本逐句对齐"
+            f"[WhisperX] 参考文本句数 {len(ref_sentences)} != ASR 段数 {len(raw_segments)}，"
+            "跳过参考文本硬绑定，保留 ASR 识别文本"
         )
         return False
 
-    cum_quota: List[int] = []
-    acc = 0
-    for q in quotas:
-        acc += q
-        cum_quota.append(acc)
+    for i, seg in enumerate(raw_segments):
+        sentence = ref_sentences[i].strip()
+        if sentence:
+            seg["text"] = sentence
 
-    chunks = ["" for _ in raw_segments]
-    spoken_seen = 0
-    seg_idx = 0
-    for ch in cleaned_ref:
-        if _is_spoken(ch):
-            spoken_seen += 1
-            while seg_idx < len(cum_quota) - 1 and spoken_seen > cum_quota[seg_idx]:
-                seg_idx += 1
-        chunks[seg_idx] += ch
-
-    for seg, chunk in zip(raw_segments, chunks):
-        seg["text"] = chunk.strip()
     return True
 
 
@@ -448,57 +446,73 @@ class AltAlignerBase:
     # ── 词语时间戳 → LAB（含静音间隙补全）────────────────────────────────
     def _word_entries_to_lab(
         self,
-        word_entries: List[Tuple[float, float, str]],
-        text: str,
+        entries: List[Tuple[float, float, str]],
+        full_text: str,
         language: str,
         fill_silences: bool = False,
     ) -> str:
         """
-        将词语 / 字符级时间戳 → LAB 格式，复用 MFAProcessor 的音素转换逻辑。
-        fill_silences=True 时自动在时间间隙中插入 SIL。
-
-        关于标点：
-          Qwen3 不产生标点字符的对齐时间戳（标点不可发音）。
-          _text_to_syllables() 在提取音素序列时也会忽略标点，因此参考文本中
-          的标点不影响音素分布——只要参考文本的可发音字符数与 entries 数量一致即可。
-          句末 / 句中的停顿由 fill_silences 根据时间间隙自动插入 SIL。
+        稳定版 LAB 输出：
+        - 严格保持时间单调
+        - 不制造新音素、不重排字符
+        - 仅在“文本单位数 == 条目数”时，用 full_text 覆盖标签
+        - fill_silences=False 时，不插入 SIL/SP
         """
-        if not word_entries:
+        if not entries:
             return ""
 
         lang = _normalize_lang(language)
 
-        # 字符数不匹配时提前警告（便于调试）
-        if text and lang in ("zh", "yue", "ja"):
-            spoken_n = _count_spoken_chars(text, lang)
-            entries_n = len(word_entries)
-            if spoken_n != entries_n:
-                logger.warning(
-                    f"[alt_aligners] 参考文本可发音字符数 {spoken_n} ≠ "
-                    f"对齐条目数 {entries_n}。如出现音素偏移，请检查参考文本是否与音频一致。"
-                )
+        cleaned: List[Tuple[float, float, str]] = []
+        last_end = 0.0
+        for item in sorted(entries, key=lambda x: (float(x[0]), float(x[1]))):
+            if len(item) < 3:
+                continue
 
-        # 日语 / 韩语需要特殊处理
-        if lang == "ja":
-            lab = self._ja_entries_to_lab(word_entries, text)
-            return _fill_silences_lab(lab) if fill_silences else lab
-        if lang == "ko":
-            lab = self._ko_entries_to_lab(word_entries, text)
-            return _fill_silences_lab(lab) if fill_silences else lab
+            s, e, t = item
+            if s is None or e is None:
+                continue
 
-        word_tier = [_MI(s, e, w) for s, e, w in word_entries]
-        phone_items: List[Tuple[int, int, str]] = []
+            s = float(s)
+            e = float(e)
+            t = (t or "").strip()
 
-        if lang in ("zh", "cmn"):
-            lines = self._mfa._process_zh_words(word_tier, phone_items, text)
-        elif lang == "yue":
-            lines = self._mfa._process_yue_words(word_tier, phone_items, text)
-        else:
-            lines = self._mfa._process_en_words(word_tier, phone_items, text)
+            if not t or _is_cjk_punct(t):
+                continue
 
-        lines = self._mfa._apply_lab_postprocess(lines, lang)
-        lab = "\n".join(lines)
-        return _fill_silences_lab(lab) if fill_silences else lab
+            if s < last_end:
+                s = last_end
+            if e < s:
+                e = s + 1e-4
+
+            cleaned.append((s, e, t))
+            last_end = e
+
+        if not cleaned:
+            return ""
+
+        spoken_units = _split_spoken_units(full_text or "", lang)
+        use_full_text_units = len(spoken_units) == len(cleaned) and len(spoken_units) > 0
+
+        lines: List[str] = []
+        last_end = None
+
+        for idx, (s, e, t) in enumerate(cleaned):
+            label = spoken_units[idx] if use_full_text_units else t
+            label = (label or "").strip()
+
+            if not label or _is_cjk_punct(label):
+                continue
+
+            if fill_silences and last_end is not None:
+                gap = s - last_end
+                if gap >= 0.05:
+                    lines.append(f"{last_end:.6f} {s:.6f} SIL")
+
+            lines.append(f"{s:.6f} {e:.6f} {label}")
+            last_end = e
+
+        return "\n".join(lines)
 
     def _ja_entries_to_lab(
         self,
@@ -655,53 +669,48 @@ class WhisperXAligner(AltAlignerBase):
     # ── 核心对齐（句子隔离版）────────────────────────────────────────────────
     def align(self, audio_path: str, text: Optional[str], language: str) -> Dict:
         """
-        句子隔离强制对齐（Sentence-Isolated Alignment）。
+        句子隔离强制对齐（稳定修复版）
 
-        改进点（对比旧版）：
-          1. 逐句裁剪音频 → 在极短时序空间内单独对齐，消除长文本累计漂移。
-          2. 参考文本与 ASR 句数匹配时，将参考文本绑定到对应句子（修正繁简/识别错误）。
-          3. 每句独立完成 LAB 转换，避免字符数不一致导致的全局偏移。
-          4. 音素时长守护（PDG）消除极短音标（< 25ms）。
-          5. 全程 fill_silences=False，输出零 SP/SIL 的纯净连续音标序列。
+        核心原则：
+          1. 句数一致才绑定参考文本
+          2. 句数不一致时，保留 ASR 文本，不做危险硬切分
+          3. 对齐输入里标点改空格，不直接删除成一坨
+          4. 用真实裁剪时长做 local alignment
+          5. 对齐失败时整句回填，保证时间轴不断裂
         """
         t0 = time.time()
         try:
             import whisperx
 
-            wx_lang  = _to_whisperx_lang(language)
-            int_lang = _normalize_lang(language)
-            _SR      = 16_000   # WhisperX load_audio 固定输出 16kHz
+            wx_lang = self._to_whisperx_lang(language)
+            int_lang = self._normalize_lang(language)
+            _SR = 16_000
 
-            # ── 1. 加载音频 ──────────────────────────────────────────────────
-            # whisperx.load_audio() 依赖 ffmpeg 子进程；若环境中 ffmpeg 不可用
-            # 则回退到 soundfile（直接读 WAV/FLAC）+ librosa 重采样，避免崩溃。
+            # 1) 加载音频
             try:
                 import warnings
                 with warnings.catch_warnings():
-                    warnings.filterwarnings(
-                        "ignore",
-                        message=".*torchcodec.*",   # 屏蔽 pyannote torchcodec 警告
-                    )
-                    audio = whisperx.load_audio(audio_path)   # float32 numpy, 16kHz
+                    warnings.filterwarnings("ignore", message=".*torchcodec.*")
+                    audio = whisperx.load_audio(audio_path)
             except Exception as _ffmpeg_err:
                 logger.warning(
-                    f"[WhisperX] whisperx.load_audio 失败（{_ffmpeg_err}），"
-                    "尝试用 soundfile + librosa 回退加载…"
+                    f"[WhisperX] whisperx.load_audio 失败（{_ffmpeg_err}），尝试用 soundfile + librosa 回退加载…"
                 )
                 try:
                     import soundfile as _sf
                     import numpy as _np
+
                     _data, _orig_sr = _sf.read(audio_path, always_2d=False)
                     if _data.ndim > 1:
-                        _data = _data.mean(axis=1)   # 混音为单声道
+                        _data = _data.mean(axis=1)
                     _data = _data.astype(_np.float32)
                     if _orig_sr != _SR:
                         import librosa as _librosa
                         _data = _librosa.resample(_data, orig_sr=_orig_sr, target_sr=_SR)
+
                     audio = _data
                     logger.info(
-                        f"[WhisperX] soundfile 回退加载成功: "
-                        f"{len(audio)/float(_SR):.2f}s @ {_SR}Hz"
+                        f"[WhisperX] soundfile 回退加载成功: {len(audio)/float(_SR):.2f}s @ {_SR}Hz"
                     )
                 except Exception as _sf_err:
                     return self._err(
@@ -710,12 +719,10 @@ class WhisperXAligner(AltAlignerBase):
                         t0,
                     )
 
-            # ── 2. ASR 转录（仅用于获取句子级时序边界）──────────────────────
+            # 2) ASR 转录
             self._load_asr()
             logger.info("[WhisperX] 开始 ASR 转录...")
-            asr_out      = self._asr_model.transcribe(
-                audio, batch_size=self.batch_size, language=wx_lang
-            )
+            asr_out = self._asr_model.transcribe(audio, batch_size=self.batch_size, language=wx_lang)
             raw_segments = asr_out.get("segments", [])
             if not raw_segments:
                 return self._err("WhisperX ASR 无输出，请检查音频质量", t0)
@@ -724,119 +731,107 @@ class WhisperXAligner(AltAlignerBase):
             logger.info(f"[WhisperX] ASR 文本: {asr_text_full[:120]}")
             logger.info(f"[WhisperX] ASR 共检出 {len(raw_segments)} 句")
 
-            # ── 3. 参考文本预处理：断句并与 ASR 句段绑定 ────────────────────
-            #    句数完全一致时，按句直接绑定；
-            #    句数不一致（绝大多数情况）时，按"每段 ASR 自己的识别字数"
-            #    为配额，把参考文本（保留标点）顺序切给各段——配额用 ASR
-            #    字数而不是音频时长，是为了保证替换后送进 wav2vec2 对齐的
-            #    字符数不变，不会导致强制对齐被迫拉伸/压缩造成时间戳错位。
+            # 3) 参考文本预处理：只在句数一致时绑定
             if text:
-                cleaned_ref  = normalize_text_for_whisperx(text, lang=int_lang)
-                ref_sentences: List[str] = [
-                    s.strip()
-                    for s in _re.split(r'[。！？；\n…!?]+', cleaned_ref)
-                    if s.strip()
-                ]
-                if len(ref_sentences) == len(raw_segments):
+                cleaned_ref = normalize_text_for_whisperx(text, lang=int_lang)
+                ref_sentences: List[str] = _split_ref_sentences(cleaned_ref)
+
+                if len(ref_sentences) == len(raw_segments) and len(ref_sentences) > 0:
                     logger.info(
-                        f"[WhisperX] 参考文本句数 {len(ref_sentences)} == ASR 句段数，"
-                        "绑定参考文本 → 每句使用参考文本对齐"
+                        f"[WhisperX] 参考文本句数 {len(ref_sentences)} == ASR 句段数 {len(raw_segments)}，逐句绑定参考文本"
                     )
                     for i, seg in enumerate(raw_segments):
                         seg["text"] = ref_sentences[i]
                 else:
-                    bound = _bind_ref_text_by_asr_count(cleaned_ref, raw_segments, int_lang)
-                    if bound:
-                        logger.warning(
-                            f"[WhisperX] 参考文本切出 {len(ref_sentences)} 句 ≠ "
-                            f"ASR 段数 {len(raw_segments)}，按各段 ASR 识别字数为配额"
-                            "分配参考文本（保留标点，字数严格对应，不退回 ASR 文本）"
-                        )
-                    else:
-                        logger.warning(
-                            f"[WhisperX] 参考文本切出 {len(ref_sentences)} 句 ≠ "
-                            f"ASR 段数 {len(raw_segments)}，保留 ASR 识别文本逐句对齐"
-                        )
+                    logger.warning(
+                        f"[WhisperX] 参考文本句数 {len(ref_sentences)} != ASR 句段数 {len(raw_segments)}，"
+                        "保留 ASR 识别文本逐句对齐（更稳定）"
+                    )
 
-            # ── 4. 加载对齐模型 ──────────────────────────────────────────────
+            # 4) 加载对齐模型
             model_a, metadata = self._load_align(wx_lang)
             logger.info(f"[WhisperX] 开始逐句隔离强制对齐（共 {len(raw_segments)} 句）...")
 
-            # ── 5. 句子隔离强制对齐核心循环 ──────────────────────────────────
-            #    对每句：① 物理裁剪音频 → ② 在局部短时序空间内对齐
-            #          → ③ 局部时间戳 + 句子偏移 = 全局绝对时间戳
-            #    完全消除跨句累计漂移和 CTC 路径崩溃导致的音标粘连。
-            # seg_pair_list: [(entries_for_this_seg, text_for_this_seg), ...]
+            # 5) 逐句对齐
             seg_pair_list: List[Tuple[List[Tuple[float, float, str]], str]] = []
 
             for idx, seg in enumerate(raw_segments):
                 start_sec = float(seg.get("start", 0.0))
-                end_sec   = float(seg.get("end",   0.0))
-                seg_text  = seg.get("text", "").strip()
+                end_sec = float(seg.get("end", 0.0))
+                seg_text = (seg.get("text", "") or "").strip()
 
                 if not seg_text or end_sec <= start_sec:
                     continue
 
-                # 物理裁剪：提取该句的音频片段
                 st_samp = max(0, int(start_sec * _SR))
-                en_samp = min(len(audio), int(end_sec   * _SR))
+                en_samp = min(len(audio), int(end_sec * _SR))
                 cropped = audio[st_samp:en_samp]
 
-                if len(cropped) < 160:      # < 10ms，跳过
+                if len(cropped) < 160:
                     logger.warning(
-                        f"[WhisperX] 第 {idx+1} 句裁剪后过短（{len(cropped)} samples），跳过"
+                        f"[WhisperX] 第 {idx + 1} 句裁剪后过短（{len(cropped)} samples），跳过"
                     )
                     continue
 
-                # 对齐模型接受的文本：剥离 CJK 标点/空白，只保留可发音字符
-                # （，。！？等传入会导致 wav2vec2 词表缺失而跳过整句）
-                seg_text_for_align = _re.sub(
-                    r'[，。！？；、…・｜─—]+', ' ', seg_text
-                )
-                seg_text_for_align = _re.sub(r'\s+', ' ', seg_text_for_align).strip()
+                real_dur = len(cropped) / float(_SR)
 
+                # 关键修复：标点改空格，不要删除
+                seg_text_for_align = _segment_text_for_align(seg_text)
                 if not seg_text_for_align:
+                    seg_pair_list.append(([(start_sec, end_sec, seg_text)], seg_text))
                     continue
 
-                # 单句任务：局部时间从 0 开始
-                local_seg_list = [{"text": seg_text_for_align, "start": 0.0, "end": end_sec - start_sec}]
+                local_seg_list = [{
+                    "text": seg_text_for_align,
+                    "start": 0.0,
+                    "end": real_dur,
+                }]
 
                 seg_entries: List[Tuple[float, float, str]] = []
                 try:
                     local_aligned = whisperx.align(
-                        local_seg_list, model_a, metadata, cropped, self._device,
-                        return_char_alignments=True,   # CJK 字符级对齐
+                        local_seg_list,
+                        model_a,
+                        metadata,
+                        cropped,
+                        self._device,
+                        return_char_alignments=True,
                     )
 
                     for a_seg in local_aligned.get("segments", []):
                         if int_lang in ("zh", "yue", "ja"):
-                            units    = a_seg.get("chars", [])
+                            units = a_seg.get("chars", []) or []
                             text_key = "char"
                         else:
-                            units    = a_seg.get("words", [])
+                            units = a_seg.get("words", []) or []
+                            text_key = "word"
+
+                        if not units:
+                            units = a_seg.get("words", []) or a_seg.get("chars", []) or []
                             text_key = "word"
 
                         for unit in units:
                             s = unit.get("start")
                             e = unit.get("end")
                             t = (unit.get(text_key) or unit.get("text") or "").strip()
+
                             if s is None or e is None or not t or _is_cjk_punct(t):
                                 continue
-                            # 局部时间 → 全局绝对时间
-                            seg_entries.append(
-                                (float(s) + start_sec, float(e) + start_sec, t)
-                            )
+
+                            seg_entries.append((float(s) + start_sec, float(e) + start_sec, t))
 
                 except Exception as exc:
                     logger.error(
-                        f"[WhisperX] 第 {idx+1} 句对齐异常（'{seg_text[:30]}'）: {exc}"
+                        f"[WhisperX] 第 {idx + 1} 句对齐异常（'{seg_text[:30]}'）: {exc}"
                     )
-                    # 降级：整句作为单一条目，保持时间轴不断裂
+
+                if not seg_entries:
                     seg_entries = [(start_sec, end_sec, seg_text)]
 
-                # 句内标点停顿注入：只挪动既有字符的结束时间，不改变字符
-                # 数量/顺序，因此不会引入新的错位。
-                seg_entries = _inject_sentence_pauses(seg_entries, seg_text)
+                seg_entries = self._apply_duration_guard(
+                    seg_entries,
+                    getattr(self, "min_phoneme_dur", 0.025),
+                )
 
                 if seg_entries:
                     seg_pair_list.append((seg_entries, seg_text))
@@ -844,33 +839,27 @@ class WhisperXAligner(AltAlignerBase):
             if not seg_pair_list:
                 return self._err("所有句子对齐均失败，请检查音频质量和语言设置", t0)
 
-            # ── 6. 音素时长守护（PDG）──────────────────────────────────────
-            #    每句内部独立运行，将 < min_phoneme_dur 的极短音标扩展到安全时长。
-            #    句间间隙（说话停顿）不受影响，总时长严格守恒。
-            guarded_pair_list: List[Tuple[List[Tuple[float, float, str]], str]] = []
-            for seg_entries, seg_text in seg_pair_list:
-                guarded = self._apply_duration_guard(seg_entries, self.min_phoneme_dur)
-                guarded_pair_list.append((guarded, seg_text))
-
-            # ── 7. 逐句转换为 LAB（零 SP/SIL）────────────────────────────────
-            #    每句独立调用 _word_entries_to_lab，用当句文本驱动音素转换，
-            #    彻底杜绝字符数不一致跨句传播的偏移错误。
+            # 6) 转 LAB
             lab_blocks: List[str] = []
-            for seg_entries, seg_text in guarded_pair_list:
+            for seg_entries, seg_text in seg_pair_list:
                 if not seg_entries:
                     continue
-                block = self._word_entries_to_lab(
-                    seg_entries, seg_text, language, fill_silences=False
-                )
-                if block.strip():
-                    lab_blocks.append(block)
 
-            lab = "\n".join(lab_blocks)
+                block = self._word_entries_to_lab(
+                    seg_entries,
+                    seg_text,
+                    language,
+                    fill_silences=False,
+                )
+                if block and block.strip():
+                    lab_blocks.append(block.strip())
+
+            lab = "\n".join(lab_blocks).strip()
 
             return {
                 "success": True,
                 "lab_content": lab,
-                "raw_text":     text.strip() if text else asr_text_full,
+                "raw_text": text.strip() if text else asr_text_full,
                 "phoneme_text": asr_text_full,
                 "audio_duration": self._get_audio_duration_100ns(audio_path),
                 "processing_time": int((time.time() - t0) * 1000),
