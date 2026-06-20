@@ -38,6 +38,7 @@ See the repository `LICENSE` file for the full text of the MIT License.
 - pyworld
 - torchcrepe
 - RMVPE
+- Mido
 
 #### BSD 3-Clause / BSD-style
 - Flask
