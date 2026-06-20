@@ -7,7 +7,7 @@ Project source code:
 - Upstream project license: MIT
 - Keep the project `LICENSE` file in the distribution.
 
-The dependency list below is based on the direct dependencies declared in:
+This notice covers the direct dependencies declared in:
 - `backend/requirements.txt`
 - `frontend/package.json`
 
@@ -33,52 +33,40 @@ See the repository `LICENSE` file for the full text of the MIT License.
 - flask-cors
 - montreal-forced-aligner
 - pypinyin
-- textgrid
-- pycantonese
-- pyworld
 - torchcrepe
-- RMVPE
-- Mido
+- mido
+- textgrid
 
 #### BSD 3-Clause / BSD-style
 - Flask
 - soundfile
 - numpy
 - torch
-- WhisperX
+- torchaudio
 
 #### Apache License 2.0
 - sudachipy
 - sudachidict-core
 - jamo
-- Qwen3-ASR
+- funasr
+- modelscope
+- accelerate
 
 #### ISC License
 - librosa
 
 #### Notes
-- `pycantonese` includes separately licensed corpus/data resources. Those data resources are not all under the same license as the Python package itself.
 - `sudachidict-core` provides dictionary data; keep the upstream dictionary notices together with any redistributed package data.
-- `torch` and `librosa` are listed as backend dependencies and may pull in additional transitive dependencies in your environment.
+- `torch`, `torchaudio`, `librosa`, `funasr`, `modelscope`, and `accelerate` may pull in additional transitive dependencies in your environment.
+- `textgrid` should be verified against the exact package and version you ship.
 
 ---
 
 ### 2.2 Frontend dependencies
 
-#### MIT License
-- vue
-- element-plus
-- @element-plus/icons-vue
-- axios
-- @vitejs/plugin-vue
-- @vue/tsconfig
-- vite
-- vue-tsc
-- terser
+Include the license notices emitted by your frontend build toolchain for the packages bundled into the production output.
 
-#### Other notes
-- `typescript` is included as a frontend development dependency and should be treated according to the license stated by its upstream package metadata in the version you ship.
-- If you redistribute a production bundle generated from the frontend, keep the license notices for all bundled dependencies that your build toolchain emits.
+If you distribute a production bundle generated from the frontend, keep the license notices for all bundled dependencies that your build process emits.
 
 ---
 
