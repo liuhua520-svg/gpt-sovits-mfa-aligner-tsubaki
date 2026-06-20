@@ -791,8 +791,10 @@ class WhisperXAligner(AltAlignerBase):
                 # 对齐模型接受的文本：剥离 CJK 标点/空白，只保留可发音字符
                 # （，。！？等传入会导致 wav2vec2 词表缺失而跳过整句）
                 seg_text_for_align = _re.sub(
-                    r'[，。！？；、…・｜─—\s]+', '', seg_text
-                ).strip()
+                    r'[，。！？；、…・｜─—]+', ' ', seg_text
+                )
+                seg_text_for_align = _re.sub(r'\s+', ' ', seg_text_for_align).strip()
+
                 if not seg_text_for_align:
                     continue
 
