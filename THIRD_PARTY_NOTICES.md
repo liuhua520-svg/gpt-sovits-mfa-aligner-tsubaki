@@ -44,11 +44,13 @@ See the repository `LICENSE` file for the full text of the MIT License.
 - soundfile
 - numpy
 - torch
+- WhisperX
 
 #### Apache License 2.0
 - sudachipy
 - sudachidict-core
 - jamo
+- Qwen3-ASR
 
 #### ISC License
 - librosa
