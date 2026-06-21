@@ -1,4 +1,14 @@
 # -*- coding: utf-8 -*-
+# ── 警告过滤：必须在所有其他 import 之前执行 ─────────────────────────────────────
+# pyannote.audio.core.io 在 torchcodec DLL 缺失时用 warnings.warn() 发出 UserWarning。
+# 该警告消息以 "\n" 开头，因此 re.match(r".*torchcodec", msg) 匹配失败。
+# 正确做法：按 module 名过滤，完全绕开消息内容匹配。
+import warnings
+warnings.filterwarnings("ignore", module=r"pyannote\.audio\.core\.io")
+warnings.filterwarnings("ignore", module=r"pyannote\.audio")
+warnings.filterwarnings("ignore", module=r"speechbrain\.utils\.torch_audio_backend")
+warnings.filterwarnings("ignore", module=r"speechbrain\.utils\.quirks")
+# ─────────────────────────────────────────────────────────────────────────────
 import os
 import re
 import sys

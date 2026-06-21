@@ -43,6 +43,53 @@ warnings.filterwarnings(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# 0. CUDA 可用性探针
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _torch_cuda_usable() -> bool:
+    """
+    判断当前 PyTorch 是否真正可以使用 CUDA。
+
+    torch.cuda.is_available() 在 NVIDIA 驱动存在时可能返回 True，
+    即便 PyTorch 本身是 CPU-only 版本（未编译 CUDA 支持）。
+    真正分配一个 CUDA tensor 才能暴露这一差异。
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return False
+        # 实际触发 CUDA 初始化，CPU-only 版本在此抛 AssertionError
+        torch.zeros(1, device="cuda")
+        return True
+    except Exception:
+        return False
+
+
+def _safe_device(requested: str) -> str:
+    """
+    将 'auto' / 'cuda' 解析为真正可用的设备字符串。
+
+    - 'auto'  → 先做 smoke-test，能用 CUDA 就 'cuda'，否则 'cpu'
+    - 'cuda'  → smoke-test 失败则自动降级为 'cpu' 并打印警告
+    - 'cpu'   → 直接返回
+    """
+    if requested == "cpu":
+        return "cpu"
+    if requested == "auto":
+        return "cuda" if _torch_cuda_usable() else "cpu"
+    if requested.startswith("cuda"):
+        if _torch_cuda_usable():
+            return requested
+        logger.warning(
+            f"[device] 请求 '{requested}' 但 PyTorch 未编译 CUDA 支持，"
+            "自动回退到 CPU。若需 GPU 加速，请在 .mfa_env 中安装 CUDA 版 PyTorch："
+            " pip install torch --index-url https://download.pytorch.org/whl/cu121"
+        )
+        return "cpu"
+    return requested
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # 1. 模型文件路径管理（模块加载时立即执行，确保在任何 HF 导入之前完成）
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -352,8 +399,7 @@ _LIGHT_END_PUNCT = "、，；,;"
 _SIL_MARK = "sil"
 
 # ─────────────────────────────────────────────────────────────────────────
-# SudachiPy 惰性单例（替代 pykakasi，避免 GPL-3.0 许可传染；
-# SudachiPy 为 Apache-2.0 许可）。
+# SudachiPy 惰性单例；
 # 词典加载较慢，进程内只创建一次。
 # ─────────────────────────────────────────────────────────────────────────
 _sudachi_tokenizer_obj = None
@@ -881,57 +927,6 @@ class AltAlignerBase:
         word_entries: List[Tuple[float, float, str]],
         text: str,
     ) -> str:
-        """
-        【修复说明】word_entries 现在可能混入 _inject_sentence_pauses() 插入的
-        静音条目（mark == _SIL_MARK == "sil"）。这些条目必须在送入
-        假名转换之前被摘出来，否则会被当作日文文本误转换；
-        更重要的是，build_ja_hiragana_lab() 的元音/辅音状态机会把任何
-        非元音、非鼻音的输入当作"待合并的辅音声母"（pending）。
-
-        修复方式：先把静音条目摘出来单独保存，只把真正的发音字符喂给
-        SudachiPy；状态机跑完之后，再按时间顺序把静音条目插回，最后统一
-        交给 merge_lab_silence()——它对字面量 "sil" 有专门的"不可修改/
-        不可删除"保护（见模块顶部 _SIL_MARK 的注释）。
-
-        【假名转换说明】原实现使用 pykakasi 逐字符调用 convert()。
-        pykakasi 是 GPL-3.0 许可，会对本项目产生许可传染，故替换为
-        Apache-2.0 许可的 SudachiPy（本项目其他模块已依赖该库）。
-        SudachiPy 是分词器，逐字符调用会丢失上下文，导致多音字读音
-        变差（例如「今」单独转换得到「いま」，但在「今日」中应为
-        「きょう」的「きょ」部分）。因此这里改为对整句拼接文本做一次
-        tokenize，按各 morpheme 的 surface 字符数把读音重新切回到
-        每个原始字符的时间戳上，多音字消歧效果优于逐字符调用。
-
-        【本次修复 - 关键 bug】此前的实现在拿到 Sudachi 的 morpheme 读音
-        （已经是最终假名，如 "きもち"/"さんぷる"）之后，又把这些 LAB 行
-        送进了 phoneme_converter.build_ja_hiragana_lab()。但那个函数的
-        状态机只认识"单个罗马字音素"（MFA japanese_mfa 输出的 a/i/u/e/o
-        或 ky/ny 等单字母/双字母音素），任何不是元音、不是鼻音的输入都会
-        被当成"待合并的辅音声母"塞进 pending，等下一条目到来时被 flush
-        成字面量 "-"。结果是：除最后一条之外的*每一条*假名读音都被强制
-        改写成 "-"，循环结束后最后一条也在收尾 flush 中变成 "-"。
-        merge_lab_silence() 随后处理这些 "-"：规则是"前面没有可吸收的
-        真实音节（非 -/非 sil）就直接删除"——因为这时全部都是 "-"，没有
-        任何条目能当吸收对象，于是全部被删除，只剩 _inject_sentence_pauses()
-        写入的字面量 "sil"。这正是"WhisperX/Qwen3 对齐日语文本后只剩
-        sil、没有任何音标"的根因（已用合成时间戳复现并验证修复有效）。
-
-        修复：Sudachi 给出的读音已经是最终假名形式，不需要也不能再走一遍
-        "罗马音素→假名"的状态机，直接跳过 build_ja_hiragana_lab()。
-
-        【顺带增强，后续修复见 _distribute_mora_across_chars】多字符
-        morpheme 原本把整段读音揉成一条跨越全词时间区间的 LAB 行（如
-        「気持ち」→ 一条 "きもち"），丢弃了 wav2vec2 本来给出的逐字符
-        时间戳。当 morpheme 的表层字数与读音 mora 数（经 _split_ja_mora
-        拆分）恰好相等时，把读音逐字拆回各自原始时间戳，恢复逐字精度
-        （典型如纯假名 ASR 文本、大多数简单汉字词）；数量不一致时
-        （典型如「大変」2 字对应 たいへん 4 mora、「僕」1 字对应 ぼく
-        2 mora）不再退回整词合并区块——那正是用户反馈"音标连在一起，
-        不是一个假名一个音标"的根因。现在由 _distribute_mora_across_chars()
-        把 mora 尽量均匀分配给各个原始字符、再在每个字符自身时间戳内部
-        按 mora 数等分，逐 mora 输出，仅在分配粒度上做近似，不再合并
-        成一条目（详见该函数顶部说明）。
-        """
         sil_entries: List[Tuple[int, int, str]] = []
         spoken_entries: List[Tuple[float, float, str]] = []
         for s, e, ch in word_entries:
@@ -1120,8 +1115,8 @@ class WhisperXAligner(AltAlignerBase):
         super().__init__()
         self.whisper_model = whisper_model
         self._device = self._resolve_device(device)
-        # CPU 不支持 float16
-        self.compute_type = compute_type if self._device != "cpu" else "int8"
+        # CPU 不支持 float16；GPU 还需检查实际硬件能力
+        self.compute_type = self._resolve_compute_type(compute_type, self._device)
         self.batch_size = batch_size
         self.hf_token = hf_token or os.environ.get("HF_TOKEN")
         self.min_phoneme_dur = min_phoneme_dur
@@ -1132,13 +1127,46 @@ class WhisperXAligner(AltAlignerBase):
     # ── 类方法 ──────────────────────────────────────────────────────────────
     @staticmethod
     def _resolve_device(device: str) -> str:
-        if device == "auto":
-            try:
-                import torch
-                return "cuda" if torch.cuda.is_available() else "cpu"
-            except ImportError:
-                return "cpu"
-        return device
+        # _safe_device() 包含 smoke-test，避免 CPU-only torch 误选 CUDA
+        # （torch.cuda.is_available() 在驱动存在时可能返回 True，但实际无法使用）
+        return _safe_device(device)
+
+    @staticmethod
+    def _resolve_compute_type(compute_type: str, device: str) -> str:
+        """
+        根据设备和 GPU 能力自动选择最优 compute_type，避免运行时 ValueError。
+
+        优先级（CUDA）：用户指定 → GPU 能力检测 → int8 保底
+        - float16 需要 Tensor Core（NVIDIA compute capability ≥ 7.0，即 Turing+）
+        - 旧卡（Pascal / Maxwell 等）只能用 int8 或 float32
+        """
+        if device == "cpu":
+            # CPU 后端：int8 最快，float32 最兼容
+            return "int8" if compute_type in ("float16", "int8_float16") else compute_type
+
+        if compute_type not in ("float16", "int8_float16"):
+            # 用户显式指定了 int8 / float32 等，直接信任
+            return compute_type
+
+        # 尝试通过 ctranslate2（faster-whisper 依赖）查询 GPU 支持的精度列表
+        try:
+            import ctranslate2
+            supported = ctranslate2.get_supported_compute_types("cuda")
+            if compute_type not in supported:
+                fallback = "int8" if "int8" in supported else "float32"
+                logger.warning(
+                    f"[WhisperX] 当前 GPU 不支持 {compute_type} "
+                    f"(支持: {supported})，自动切换为 {fallback}"
+                )
+                return fallback
+            return compute_type
+        except Exception:
+            # ctranslate2 未安装或查询失败 → 保守回退到 int8
+            logger.warning(
+                f"[WhisperX] 无法查询 GPU compute_type 支持情况，"
+                f"保守切换: {compute_type} → int8"
+            )
+            return "int8"
 
     @staticmethod
     def check_available() -> Tuple[bool, str]:
@@ -1152,16 +1180,51 @@ class WhisperXAligner(AltAlignerBase):
 
     # ── 懒加载 ──────────────────────────────────────────────────────────────
     def _load_asr(self):
-        if self._asr_model is None:
-            import whisperx
-            logger.info(f"[WhisperX] 加载 ASR 模型: {self.whisper_model} ({self._device})")
-            self._asr_model = whisperx.load_model(
-                self.whisper_model,
-                self._device,
-                compute_type=self.compute_type,
-                download_root=str(_WHISPER_CACHE),
-            )
-            logger.info("[WhisperX] ✓ ASR 模型已加载")
+        if self._asr_model is not None:
+            return
+
+        import whisperx
+
+        # 按优先级构建 compute_type 尝试链：
+        #   float16 → int8 → float32（越来越保守，最后一个必定成功）
+        _FALLBACK: Dict[str, list] = {
+            "float16":       ["int8", "float32"],
+            "int8_float16":  ["int8", "float32"],
+            "int8":          ["float32"],
+        }
+        candidates = [self.compute_type] + _FALLBACK.get(self.compute_type, [])
+
+        last_exc: Optional[Exception] = None
+        for ct in candidates:
+            try:
+                logger.info(
+                    f"[WhisperX] 加载 ASR 模型: {self.whisper_model} "
+                    f"({self._device}, compute_type={ct})"
+                )
+                self._asr_model = whisperx.load_model(
+                    self.whisper_model,
+                    self._device,
+                    compute_type=ct,
+                    download_root=str(_WHISPER_CACHE),
+                )
+                if ct != self.compute_type:
+                    logger.warning(
+                        f"[WhisperX] compute_type 自动降级: "
+                        f"{self.compute_type} → {ct}（GPU 不支持高精度浮点）"
+                    )
+                    self.compute_type = ct
+                logger.info(f"[WhisperX] ✓ ASR 模型已加载 (compute_type={ct})")
+                return
+            except ValueError as e:
+                err_lower = str(e).lower()
+                if "compute type" in err_lower or "float16" in err_lower:
+                    logger.warning(f"[WhisperX] compute_type={ct} 失败: {e}，尝试下一档...")
+                    last_exc = e
+                else:
+                    raise  # 非精度相关错误，直接抛出
+
+        # 所有候选均失败
+        raise last_exc or RuntimeError("[WhisperX] 所有 compute_type 均失败，请检查 GPU 驱动")
 
     def _load_align(self, lang_code: str):
         if lang_code not in self._align_models:
@@ -1927,17 +1990,17 @@ class Qwen3ForcedAligner(AltAlignerBase):
         import torch
         from qwen_asr import Qwen3ForcedAligner as Qwen3FA
 
-        device = getattr(self, "_device", "cpu")
-        dtype = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
+        # _safe_device() 做 smoke-test，防止 CPU-only PyTorch 传入 'cuda'/'auto'
+        # 时由 transformers device_map 自动选 CUDA 而触发 AssertionError
+        device = _safe_device(getattr(self, "_device", "cpu"))
+        dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
 
+        logger.info(f"[Qwen3-FA] 加载模型 device={device} dtype={dtype}")
         self._model = Qwen3FA.from_pretrained(
             self.model_id,
             dtype=dtype,
             device_map=device,
         )
-        # qwen_asr.Qwen3ForcedAligner 是一个普通包装类（非 nn.Module），
-        # 没有 .eval() 方法；真正的底层模型在 self._model.model 上，
-        # 且 align() 内部已用 @torch.inference_mode() 包裹，因此无需也不能调用 .eval()
 
     def align(self, audio_path: str, text: Optional[str], language: str) -> Dict:
         t0 = time.time()

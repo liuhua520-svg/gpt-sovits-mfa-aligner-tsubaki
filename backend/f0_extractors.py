@@ -56,9 +56,20 @@ def torchcrepe_available() -> bool:
 
 
 def cuda_available() -> bool:
+    """
+    真正可用性检测：先查 is_available()，再做一次 smoke-test tensor 分配。
+    某些 PyTorch 安装虽未编译 CUDA 支持，但 is_available() 因驱动存在仍会
+    返回 True；实际使用时才在 _lazy_init 抛出 AssertionError。
+    这里提前捕获，保证 _select_device() 不会错误地返回 "cuda"。
+    """
     try:
         import torch
-        return bool(torch.cuda.is_available())
+        if not torch.cuda.is_available():
+            return False
+        # Smoke-test: 实际分配一个 CUDA tensor，触发 _lazy_init
+        # 若 torch 未编译 CUDA 支持，这里会抛出 AssertionError
+        torch.zeros(1, device="cuda")
+        return True
     except Exception:
         return False
 
@@ -543,7 +554,19 @@ def _get_rmvpe_extractor(model_path: str, device: str) -> RMVPEF0Extractor:
     extractor = _RMVPE_CACHE.get(key)
     if extractor is None:
         logger.info(f"加载 RMVPE 模型: {model_path} (device={device})")
-        extractor = RMVPEF0Extractor(model_path, device=device)
+        try:
+            extractor = RMVPEF0Extractor(model_path, device=device)
+        except (AssertionError, RuntimeError) as e:
+            # Torch 未编译 CUDA 支持 / 显卡初始化失败 → 自动回退到 CPU
+            if device != "cpu" and ("CUDA" in str(e) or "cuda" in str(e)):
+                logger.warning(
+                    f"RMVPE CUDA 初始化失败，自动回退到 CPU: {e}"
+                )
+                extractor = RMVPEF0Extractor(model_path, device="cpu")
+                # 同时缓存 cpu key，避免下次再次尝试 CUDA
+                _RMVPE_CACHE[(model_path, "cpu")] = extractor
+            else:
+                raise
         _RMVPE_CACHE[key] = extractor
     return extractor
 
