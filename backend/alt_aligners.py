@@ -66,6 +66,8 @@ _MODELS_DIR:    Path = resolve_models_dir()
 _HF_CACHE:      Path = _MODELS_DIR / "hf_cache"   # HuggingFace Hub 缓存
 _HF_HUB:        Path = _HF_CACHE   / "hub"        # transformers 子目录
 _WHISPER_CACHE: Path = _MODELS_DIR / "whisper"    # OpenAI Whisper 模型缓存
+_TORCH_CACHE: Path = _MODELS_DIR / "torch_cache"
+_TORCH_CACHE.mkdir(parents=True, exist_ok=True)
 
 for _d in (_HF_CACHE, _HF_HUB, _WHISPER_CACHE):
     _d.mkdir(parents=True, exist_ok=True)
@@ -77,6 +79,7 @@ os.environ.setdefault("HF_HUB_CACHE",                  str(_HF_HUB))
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE",         str(_HF_HUB))
 os.environ.setdefault("TRANSFORMERS_CACHE",            str(_HF_HUB))
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")   # 消除 Windows 警告
+os.environ["TORCH_HOME"] = str(_TORCH_CACHE)
 
 logger.info(
     f"[alt_aligners] 模型目录: {_MODELS_DIR}\n"
@@ -200,9 +203,6 @@ def normalize_text_for_whisperx(text: str, lang: str = "zh") -> str:
 # ═════════════════════════════════════════════════════════════════════════════
 # 3. 工具函数
 # ═════════════════════════════════════════════════════════════════════════════
-import re
-import unicodedata
-from typing import Dict, List, Optional, Tuple
 
 class _MI:
     """模拟 textgrid.Interval，供 MFAProcessor 内部逻辑使用（时间单位：秒）"""
@@ -217,7 +217,11 @@ class _MI:
 
 def _is_cjk_punct(text: str) -> bool:
     """
-    判断字符串是否全为标点 / 空白 / 符号。
+    判断字符串是否全为标点 / 空白 / 符号（用于过滤 ASR 输出中的标点字符）。
+
+    注：标点本身不可发音，不应出现在 LAB 的音素层。
+    中文句末停顿（。！？）和停顿符（，、）对应的 LAB 条目由
+    _fill_silences_lab() 根据时间轴间隙自动插入 SP / SIL。
     """
     if not text:
         return True
@@ -227,44 +231,41 @@ def _is_cjk_punct(text: str) -> bool:
             return False
     return True
 
-def _split_spoken_units(text: str, lang: str) -> List[str]:
+
+def _clean_align_text(text: str) -> str:
     """
-    将 full_text 切成可发声单位：
-    - zh/yue/ja：按字符
-    - 其他语言：按词
+    清洗送入强制对齐模型（wav2vec2 / whisperx.align）的文本：剥离标点
+    符号，但保留空白（词边界）和单词内部撇号（英语缩略形式如
+    "what's"）。
+
+    【关键 bug 修复】此前直接复用 _is_cjk_punct() 逐字符过滤这段文本：
+    该函数把空白字符（Unicode 类别 Z*，包括普通空格）也判定为"标点"
+    一并清除，导致任何依赖空格分词的语言（英语、韩语等）在送进
+    whisperx.align() 之前所有空格被吃掉、整句被拼接成一个不可分割
+    的"伪单词"（如 "Hello world, What's Up" → "HelloworldWhatsUp"）。
+    wav2vec2 按空白切词得到的 words 列表因此永远只有 1 个跨越全句的
+    条目，下游既无法按英语单词切分做逐词 G2P，也无法在 ASR 词典/
+    g2p_en 中查到这个被拼接出来的生造词，只能整句原样兜底输出。
+    中文/日语本身走字符级（chars）通道、不依赖空格分词，这个 bug
+    此前被掩盖，只在英语/韩语（走 words 通道）上暴露。
+
+    撇号特殊保留：去掉撇号会让 "what's" 在发音词典里查不到对应词条
+    （词典存的是 "what's" 而非 "whats"），被迫退化为整词输出。
     """
     if not text:
-        return []
-
-    lang = _normalize_lang(lang)
-
-    if lang in ("zh", "yue", "ja"):
-        units = []
-        for ch in text:
-            cat = unicodedata.category(ch)
-            if cat.startswith(("P", "Z", "S")):
-                continue
-            units.append(ch)
-        return units
-
-    units = []
-    for tok in re.split(r"\s+", text):
-        tok = tok.strip()
-        if not tok:
+        return text
+    out_chars: List[str] = []
+    for ch in text:
+        if ch.isspace():
+            out_chars.append(" ")
             continue
-        tok = tok.strip("，。！？；、…・｜─—,.;:!?\"'()[]{}<>《》「」『』“”‘’")
-        if tok:
-            units.append(tok)
-    return units
-
-def _split_ref_sentences(text: str) -> List[str]:
-    """
-    只按强句号断句，尽量保留原句结构。
-    """
-    if not text:
-        return []
-    parts = re.split(r"[。！？；\n…!?]+", text)
-    return [p.strip() for p in parts if p and p.strip()]
+        if ch in ("'", "\u2019"):   # ASCII 撇号 / 右单引号（缩略形式）
+            out_chars.append(ch)
+            continue
+        if _is_cjk_punct(ch):
+            continue
+        out_chars.append(ch)
+    return _re.sub(r"\s+", " ", "".join(out_chars)).strip()
 
 
 def _fill_silences_lab(
@@ -340,6 +341,153 @@ def _count_spoken_chars(text: str, int_lang: str) -> int:
 _HEAVY_END_PUNCT = "。！？…!?"
 _LIGHT_END_PUNCT = "、，；,;"
 
+# 内部静音占位符。必须为小写 "sil"，原因：
+#   1. MFAProcessor.SIL_PHONES（mfa_processor.py）以小写匹配 "sil"/"sp"/"spn" 等，
+#      _process_zh_words / _process_en_words / _process_yue_words 命中后一律
+#      原样转换为 LAB 中的字面量 "sil"，且不消耗参考文本的拼音/音节配额。
+#   2. phoneme_converter.merge_lab_silence() 把字面量 "sil" 当作"不可修改/
+#      不可删除"的边界标记（用于正确处理相邻 "-" 辅音声母标记的吸收/丢弃逻辑），
+#      而 "sp" 等其他变体不享有这条特殊保护——日语路径（_ja_entries_to_lab）
+#      会用到这条规则，因此这里统一用 "sil" 而不是 "sp"。
+_SIL_MARK = "sil"
+
+# ─────────────────────────────────────────────────────────────────────────
+# SudachiPy 惰性单例（替代 pykakasi，避免 GPL-3.0 许可传染；
+# SudachiPy 为 Apache-2.0 许可）。
+# 词典加载较慢，进程内只创建一次。
+# ─────────────────────────────────────────────────────────────────────────
+_sudachi_tokenizer_obj = None
+_sudachi_split_mode_obj = None
+
+
+def _get_sudachi_tokenizer():
+    """返回 (tokenizer_obj, split_mode) 单例，首次调用时加载词典。"""
+    global _sudachi_tokenizer_obj, _sudachi_split_mode_obj
+    if _sudachi_tokenizer_obj is None:
+        from sudachipy import dictionary, tokenizer as sudachi_tokenizer
+        _sudachi_tokenizer_obj = dictionary.Dictionary().create()
+        # SplitMode.C：最长单位切分（更接近自然分词，多音字读音更准确）
+        _sudachi_split_mode_obj = sudachi_tokenizer.Tokenizer.SplitMode.C
+    return _sudachi_tokenizer_obj, _sudachi_split_mode_obj
+
+
+def _kata_to_hira(text: str) -> str:
+    """片假名 → 平假名（纯 Unicode 码位偏移，无第三方依赖）。
+
+    片假名 U+30A1-U+30F6 与平假名 U+3041-U+3096 之间存在固定偏移 0x60；
+    非片假名字符（如长音符 'ー'、促音、汉字、标点）原样保留。
+    """
+    out = []
+    for ch in text:
+        code = ord(ch)
+        if 0x30A1 <= code <= 0x30F6:
+            out.append(chr(code - 0x60))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+# 拗音 / 外来语小假名：与前一个假名合并为同一个 mora（如 'きゃ' 算 1 个
+# mora，而不是 2 个）。促音「っ」和拨音「ん」不在此列，它们各自单独成 mora。
+_JA_SMALL_KANA = frozenset("ゃゅょぁぃぅぇぉ")
+
+
+def _split_ja_mora(text: str) -> List[str]:
+    """
+    把 Sudachi reading_form() 给出的假名读音字符串拆分为 mora 列表。
+
+    用途：_ja_entries_to_lab() 中，多字符 morpheme（如「気持ち」→ きもち）
+    原本会把整段读音揉成一条跨越全词时间区间的 LAB 行，丢弃了 wav2vec2
+    本来给出的逐字符时间戳。当 morpheme 的表层字数与读音 mora 数恰好相等
+    时（纯假名词、大多数简单汉字词都满足），可以把读音逐字拆回各自原始
+    时间戳，恢复逐字精度；字数与 mora 数不一致时（典型如「大変」2 字
+    对应 たいへん 4 mora、「僕」1 字对应 ぼく 2 mora），由
+    _distribute_mora_across_chars() 把 mora 尽量均匀地分配给各个原始
+    字符、再在每个字符自身时间戳内部按 mora 数等分，不再退回整词合并。
+    """
+    morae: List[str] = []
+    for ch in text:
+        if ch in _JA_SMALL_KANA and morae:
+            morae[-1] += ch
+        else:
+            morae.append(ch)
+    return morae
+
+
+def _distribute_mora_across_chars(
+    piece: List[Tuple[float, float, str]],
+    mora_list: List[str],
+) -> List[str]:
+    """
+    把一个 morpheme 的 mora 序列分配给该 morpheme 对应的原始字符时间戳
+    （piece），用于字符数与 mora 数不一致的情况（如「僕」1 字对应
+    ぼく 2 mora、「大変」2 字对应 たいへん 4 mora）。
+
+    【这是本次修复的核心】此前遇到这种不一致就直接放弃逐字精度，把
+    整段读音揉成一条跨越整个 morpheme 时间区间的 LAB 行（见
+    _split_ja_mora 旧版文档字符串），这正是用户反馈"音标连在一起，
+    不是一个假名一个音标"的根因——「僕」「本」「大変」等词被输出成
+    单条 LAB 行，内部塞进了 2~4 个假名。
+
+    分配规则：
+      1. mora 总数（通常 ≥ 字符数，因为一个汉字常对应 1~2 个 mora）
+         按字符顺序尽量平均分组（divmod 取整，余数分给靠前的字符），
+         每个字符至少分到 1 个 mora。
+      2. 罕见的反向情况（字符数多于 mora 数）：分不到 mora 的字符并入
+         前一个字符的分组，与其共享同一组 mora 的时间戳，避免产生
+         空区间。
+      3. 每个字符（或合并后的字符组）分到的 mora 子序列，在该字符
+         自身已有的 [start, end] 时间戳内部按数量等分——只细分已知
+         的字符级时间戳，不触碰字符之间的边界，不会引入新的跨字符
+         错位。这是在"没有逐 mora 强制对齐证据"前提下合理的最佳近似，
+         且明显优于把整个词压成一条目。
+    """
+    n_chars = len(piece)
+    n_mora = len(mora_list)
+    if n_chars == 0 or n_mora == 0:
+        return []
+
+    if n_mora >= n_chars:
+        base, rem = divmod(n_mora, n_chars)
+        counts = [base + (1 if i < rem else 0) for i in range(n_chars)]
+    else:
+        # 字符数多于 mora 数：前 n_mora 个字符各分 1 个，其余分 0，
+        # 稍后并入前一组。
+        counts = [1] * n_mora + [0] * (n_chars - n_mora)
+
+    merged_piece: List[Tuple[float, float]] = []
+    merged_counts: List[int] = []
+    for (ps, pe, _ch), c in zip(piece, counts):
+        if c == 0 and merged_piece:
+            prev_s, _prev_e = merged_piece[-1]
+            merged_piece[-1] = (prev_s, pe)
+        else:
+            merged_piece.append((ps, pe))
+            merged_counts.append(c)
+    if merged_counts and merged_counts[0] == 0:
+        # 防御性兜底：理论上不会出现（n_mora>=1 时第一个字符必分到
+        # 至少 1 个 mora），仅避免万一发生时丢失这组 mora。
+        merged_counts[0] = 1
+
+    lines: List[str] = []
+    mora_idx = 0
+    for (ps, pe), c in zip(merged_piece, merged_counts):
+        group = mora_list[mora_idx: mora_idx + c]
+        mora_idx += c
+        if not group:
+            continue
+        if len(group) == 1:
+            lines.append(f"{int(ps*10_000_000)} {int(pe*10_000_000)} {group[0]}")
+            continue
+        dur = pe - ps
+        step = dur / len(group)
+        for j, mora in enumerate(group):
+            sub_s = ps + step * j
+            sub_e = pe if j == len(group) - 1 else ps + step * (j + 1)
+            lines.append(f"{int(sub_s*10_000_000)} {int(sub_e*10_000_000)} {mora}")
+
+    return lines
+
 
 def _bind_ref_text_by_asr_count(
     cleaned_ref: str,
@@ -347,28 +495,88 @@ def _bind_ref_text_by_asr_count(
     int_lang: str,
 ) -> bool:
     """
-    稳定版参考文本绑定：
-    - 只在“句数完全一致”时绑定
-    - 不再按 ASR 字数强行切分参考文本
-    - 返回 True 表示完成绑定
+    按"每段 ASR 自己识别出的可发音字符数"作为配额，把完整参考文本
+    （保留原始标点）按顺序切给对应的段，而不是直接放弃参考文本退回
+    ASR 识别结果。
+
+    关键点（区别于按时长比例分配的早期方案）：
+    分配用的配额是每段 ASR 文本自身的字符数，而不是音频时长。
+    这保证替换后 seg_text 的可发音字符数与该段稍后实际送入
+    wav2vec2 做强制对齐的字符数完全一致——避免"参考文本字数与该段
+    音频实际内容字数不匹配 → 强制对齐被迫拉伸/压缩 → 时间戳错位"
+    的问题。按时长比例分配做不到这一点：时长占比只是粗略估算，
+    跟该段 ASR 真实识别出的字符数可能完全不是一回事。
+
+    全局总字数（ASR 总识别字数 vs 参考文本总字数）几乎总会有一定差异
+    ——音频越长，ASR 漏听/多听的绝对字数也越容易变多，这是正常现象，
+    不代表参考文本就跟音频对不上。早期版本一旦差异超过阈值就整体放弃
+    替换，导致长文本几乎必然退回 ASR 的（几乎不带标点的）识别文本，
+    这正是"长文本反而又粘连"的根因。
+
+    现在改为：按比例把每段配额整体缩放，使配额总和精确等于参考文本
+    总字数（用最大余数法取整），把全局差异均摊到每一段上，而不是
+    集中甩给某一段或整体放弃——每段拿到的字符数仍然是一个跟它自身
+    原始 ASR 字数接近的整数，强制对齐不会被某一段突然暴增/清零的
+    字数带偏。
+
+    会原地修改 raw_segments 中每个元素的 "text" 字段。
+    返回 True 表示已替换；False 仅在彻底无法估算配额时返回（如总字数为 0）。
     """
-    if not cleaned_ref or not raw_segments:
+    def _is_spoken(ch: str) -> bool:
+        if int_lang in ("zh", "yue"):
+            return '\u4e00' <= ch <= '\u9fff' or '\u3400' <= ch <= '\u4dbf'
+        if int_lang == "ja":
+            return '\u3040' <= ch <= '\u30ff' or '\u4e00' <= ch <= '\u9fff'
+        return ch.strip() != "" and not _is_cjk_punct(ch)
+
+    # 每段 ASR 自己的可发音字符数 = 该段稍后会送入 wav2vec2 对齐的字符数
+    quotas = [
+        sum(1 for ch in (seg.get("text", "") or "") if _is_spoken(ch))
+        for seg in raw_segments
+    ]
+    total_quota = sum(quotas)
+    ref_spoken_total = sum(1 for ch in cleaned_ref if _is_spoken(ch))
+
+    if total_quota == 0 or ref_spoken_total == 0:
         return False
 
-    ref_sentences = _split_ref_sentences(cleaned_ref)
+    diff_ratio = abs(total_quota - ref_spoken_total) / max(ref_spoken_total, 1)
+    logger.info(
+        f"[alt_aligners] ASR 总识别字数={total_quota}，参考文本总字数="
+        f"{ref_spoken_total}，差异 {diff_ratio:.1%}（按比例缩放各段配额，"
+        "均摊差异，不整体放弃参考文本）"
+    )
 
-    if len(ref_sentences) != len(raw_segments):
-        logger.warning(
-            f"[WhisperX] 参考文本句数 {len(ref_sentences)} != ASR 段数 {len(raw_segments)}，"
-            "跳过参考文本硬绑定，保留 ASR 识别文本"
+    # 按比例缩放配额，使其总和精确等于参考文本总字数（最大余数法取整）
+    scale = ref_spoken_total / total_quota
+    scaled = [q * scale for q in quotas]
+    int_quotas = [int(x) for x in scaled]
+    remainder = ref_spoken_total - sum(int_quotas)
+    if remainder > 0:
+        order = sorted(
+            range(len(scaled)), key=lambda i: scaled[i] - int_quotas[i], reverse=True
         )
-        return False
+        for i in order[:remainder]:
+            int_quotas[i] += 1
 
-    for i, seg in enumerate(raw_segments):
-        sentence = ref_sentences[i].strip()
-        if sentence:
-            seg["text"] = sentence
+    cum_quota: List[int] = []
+    acc = 0
+    for q in int_quotas:
+        acc += q
+        cum_quota.append(acc)
 
+    chunks = ["" for _ in raw_segments]
+    spoken_seen = 0
+    seg_idx = 0
+    for ch in cleaned_ref:
+        if _is_spoken(ch):
+            spoken_seen += 1
+            while seg_idx < len(cum_quota) - 1 and spoken_seen > cum_quota[seg_idx]:
+                seg_idx += 1
+        chunks[seg_idx] += ch
+
+    for seg, chunk in zip(raw_segments, chunks):
+        seg["text"] = chunk.strip()
     return True
 
 
@@ -377,14 +585,44 @@ def _inject_sentence_pauses(
     seg_text: str,
     heavy_gap_sec: float = 0.08,
     light_gap_sec: float = 0.04,
+    sil_mark: str = _SIL_MARK,
 ) -> List[Tuple[float, float, str]]:
     """
-    在 seg_text 中句末/句内标点出现的位置，从前一个已发音字符的结尾处
-    "偷"出一小段时长，人为制造一个停顿——不依赖音频里是否真的有静音，
-    也不改变字符总数/顺序（不会引入错位）。
+    在 seg_text 中句末/句内标点出现的位置，插入真正的静音条目
+    （mark=sil_mark），而不只是挪动相邻字符的时间戳。
+
+    【修复说明】旧版本只挪动了前一个字符的结束时间，在数值上腾出了
+    一段空隙，但没有写入任何 SIL/SP 标记。下游 _word_entries_to_lab()
+    会原样把这段"空隙"写进 LAB——但 LAB 里相邻两行时间戳之间的数值
+    间隔，并不会被 SVP 工程生成阶段（tsubaki_processor._is_true_silence()
+    / 步骤①"如果是 lab 里的显式静音标签 sil/pau/sp，直接跳过不生成音符"）
+    识别为停顿，因为那一步只检查"这一行的 label 是不是静音词"，根本
+    不会去看前后两行时间戳之间是否存在数值间隙。所以旧版本制造出的
+    停顿在 LAB 里确实存在（时间戳对得上），但在 SVP 里完全不可见，
+    音符还是会首尾相连——这正是"gan、ge、shu、ling 等句末音标连在
+    一起"的根因。
+
+    现在改为：
+      1. 若该字符与下一个字符之间天然就有 ≥ target_gap 的时间间隙
+         （wav2vec2 偶尔会留下这种间隙），直接把整个天然间隙转换成
+         一条 sil 条目。
+      2. 若天然间隙不够，从当前字符尾部"偷"出最多 target_gap 的时长
+         （且最多偷取该字符自身时长的一半，避免压出负数/异常短音），
+         在腾出来的空隙里插入 sil 条目。
+      3. 不改变原有字符的相对顺序、不跨字符插队，因此不会引入新的
+         拼音/音节错位；插入的 sil 条目会被 MFAProcessor 的
+         _process_*_words() 识别（mark in SIL_PHONES）并原样转换为
+         LAB 中的字面量 "sil"，不消耗参考文本的拼音配额（syl_index
+         不会因为这条 sil 而前进）。
 
     heavy_gap_sec : 句末强标点（。！？…）对应的停顿时长
     light_gap_sec : 句内轻标点（、，；）对应的停顿时长
+    sil_mark      : 插入的静音占位符文本（须为小写，与 SIL_PHONES 命名一致）
+
+    注：对英文等以单词为单位对齐的语言，本函数仍按"参考文本里的单个
+    字符"逐一计算停顿位置，与 entries（单词级）并非严格一一对应——
+    这是沿用自旧版本的已知局限，不在本次修复范围内（本次修复的对象
+    是中／日逐字对齐路径，这里维持原有行为不做改动）。
     """
     if not seg_entries or not seg_text:
         return seg_entries
@@ -410,19 +648,154 @@ def _inject_sentence_pauses(
         i += 1
 
     m = min(len(seg_entries), len(gap_after))
+    result: List[Tuple[float, float, str]] = []
+    for k in range(len(seg_entries)):
+        s, e, t = seg_entries[k]
+
+        if k < m - 1:
+            target_gap = gap_after[k]
+            if target_gap > 0:
+                next_s = seg_entries[k + 1][0]
+                avail = next_s - e
+                if avail < target_gap:
+                    shrink = min(target_gap - avail, max(0.0, (e - s) * 0.5))
+                    if shrink > 0:
+                        e = e - shrink
+                result.append((s, e, t))
+                # 腾出的空隙（天然间隙 + 借用时长）写成一条真正的 sil 条目，
+                # 而不是仅仅留下一个数值上的空隙。
+                if next_s > e:
+                    result.append((e, next_s, sil_mark))
+                continue
+
+        result.append((s, e, t))
+
+    return result
+
+
+def _refine_sil_boundaries_by_energy(
+    seg_entries: List[Tuple[float, float, str]],
+    cropped_audio,
+    sr: int,
+    seg_start_sec: float,
+    sil_mark: str = _SIL_MARK,
+    frame_sec: float = 0.01,
+    hop_sec: float = 0.005,
+    rel_threshold: float = 0.06,
+    abs_floor: float = 0.0008,
+    abs_ceiling: float = 0.003,
+    max_extra_claim_sec: float = 0.4,
+    min_keep_sec: float = 0.06,
+) -> List[Tuple[float, float, str]]:
+    """
+    用该句真实音频的短时能量，把 _inject_sentence_pauses() 插入的固定
+    时长（40ms/80ms）sil 条目向左右两侧扩展到真正安静的区域边界。
+
+    【背景】_inject_sentence_pauses() 给出的 40/80ms 只是"标点处至少要
+    有多长停顿"的下限，不代表音频里真实停顿就是这么短。wav2vec2 字符级
+    强制对齐没有静音词表，经常会把真正的换气/停顿时间错误地"焊"进
+    紧邻标点前最后一个字的时长里——例如"令"字符的对齐区间可能一路
+    延伸到下一句开始前，把演唱者实际换气的两三百毫秒真静音都算成
+    "令"的发音时长，而 _inject_sentence_pauses() 只能在这段被吃掉的
+    时长里再"借"出 40/80ms，借不出真正的停顿长度。
+
+    【做法】对该句裁剪出的真实音频（cropped_audio）做短时 RMS 能量
+    扫描，对每条 sil 条目：
+      - 从 sil 起点向左探测：能量持续低于阈值就持续把 sil 起点往左推
+        （即从前一个字符"偷"时长），直到能量回升到阈值以上（说明已
+        经进入前一个字符真正的发声区）、或达到 max_extra_claim_sec
+        上限、或前一个字符被压到 min_keep_sec 下限为止。
+      - 从 sil 终点向右探测同理，找到下一个字符真正的发声起点。
+      - 若标点处其实是连唱、从一开始能量就已经偏高（没有真实停顿），
+        探测会在第一步就停下，不做任何扩展——保留
+        _inject_sentence_pauses() 给出的最小停顿即可，不会把正常的
+        延音误判为停顿来源。
+
+    阈值 = clip(rel_threshold × 该句 70 分位能量, abs_floor, abs_ceiling)，
+    既能随录音整体响度自适应，又不会因为某一句特别响/特别轻而跑到
+    不合理的区间——这三个常量都是用本项目实际样例反复试出来的安全区间，
+    不是理论推导值，如果某些素材效果不理想，优先调整 rel_threshold。
+
+    注：本函数只移动已存在的 sil / 相邻字符边界，不会增删条目，因此
+    不会打乱 _process_*_words() 的拼音/音节配额对应关系。
+    """
+    if not seg_entries or cropped_audio is None:
+        return seg_entries
+    try:
+        import numpy as _np
+    except ImportError:
+        return seg_entries
+
+    n_samples = len(cropped_audio)
+    if n_samples == 0:
+        return seg_entries
+
+    frame_n = max(1, int(frame_sec * sr))
+    hop_n = max(1, int(hop_sec * sr))
+    n_frames = max(0, (n_samples - frame_n) // hop_n + 1)
+    if n_frames < 2:
+        return seg_entries
+
+    audio64 = _np.asarray(cropped_audio, dtype=_np.float64)
+    rms = _np.empty(n_frames, dtype=_np.float64)
+    for fi in range(n_frames):
+        st = fi * hop_n
+        chunk = audio64[st: st + frame_n]
+        rms[fi] = float(_np.sqrt(_np.mean(chunk * chunk))) if len(chunk) else 0.0
+
+    voiced_level = float(_np.percentile(rms, 70))
+    threshold = max(abs_floor, min(rel_threshold * voiced_level, abs_ceiling))
+
+    def _rms_at(local_t: float) -> float:
+        idx = int(round(local_t * sr / hop_n))
+        idx = max(0, min(n_frames - 1, idx))
+        return rms[idx]
+
+    seg_len_sec = n_samples / float(sr)
     result = list(seg_entries)
-    for k in range(m - 1):
-        target_gap = gap_after[k]
-        if target_gap <= 0:
-            continue
+    n = len(result)
+    for k in range(1, n - 1):
         s, e, t = result[k]
-        next_s = result[k + 1][0]
-        avail = next_s - e
-        if avail >= target_gap:
+        if t != sil_mark:
             continue
-        shrink = min(target_gap - avail, max(0.0, (e - s) * 0.5))
-        if shrink > 0:
-            result[k] = (s, e - shrink, t)
+        prev_s, prev_e, prev_t = result[k - 1]
+        next_s, next_e, next_t = result[k + 1]
+        if prev_t == sil_mark or next_t == sil_mark:
+            continue   # 理论上不会相邻出现两条 sil，安全起见跳过
+
+        sil_s_local = s - seg_start_sec
+        sil_e_local = e - seg_start_sec
+
+        left_limit = max(
+            0.0,
+            (prev_s - seg_start_sec) + min_keep_sec,
+            sil_s_local - max_extra_claim_sec,
+        )
+        probe = sil_s_local
+        while probe - hop_sec >= left_limit and _rms_at(probe - hop_sec) < threshold:
+            probe -= hop_sec
+        new_sil_s_local = probe
+
+        right_limit = min(
+            seg_len_sec,
+            (next_e - seg_start_sec) - min_keep_sec,
+            sil_e_local + max_extra_claim_sec,
+        )
+        probe = sil_e_local
+        while probe + hop_sec <= right_limit and _rms_at(probe + hop_sec) < threshold:
+            probe += hop_sec
+        new_sil_e_local = probe
+
+        if new_sil_e_local <= new_sil_s_local:
+            continue   # 探测结果异常（区间反转）则保持原状，不做改动
+
+        new_sil_s = new_sil_s_local + seg_start_sec
+        new_sil_e = new_sil_e_local + seg_start_sec
+
+        result[k - 1] = (prev_s, new_sil_s, prev_t)
+        result[k]     = (new_sil_s, new_sil_e, sil_mark)
+        result[k + 1] = (new_sil_e, next_e, next_t)
+
     return result
 
 
@@ -446,103 +819,224 @@ class AltAlignerBase:
     # ── 词语时间戳 → LAB（含静音间隙补全）────────────────────────────────
     def _word_entries_to_lab(
         self,
-        entries: List[Tuple[float, float, str]],
-        full_text: str,
+        word_entries: List[Tuple[float, float, str]],
+        text: str,
         language: str,
         fill_silences: bool = False,
     ) -> str:
         """
-        稳定版 LAB 输出：
-        - 严格保持时间单调
-        - 不制造新音素、不重排字符
-        - 仅在“文本单位数 == 条目数”时，用 full_text 覆盖标签
-        - fill_silences=False 时，不插入 SIL/SP
+        将词语 / 字符级时间戳 → LAB 格式，复用 MFAProcessor 的音素转换逻辑。
+        fill_silences=True 时自动在时间间隙中插入 SIL。
+
+        关于标点：
+          Qwen3 不产生标点字符的对齐时间戳（标点不可发音）。
+          _text_to_syllables() 在提取音素序列时也会忽略标点，因此参考文本中
+          的标点不影响音素分布——只要参考文本的可发音字符数与 entries 数量一致即可。
+          句末 / 句中的停顿由 fill_silences 根据时间间隙自动插入 SIL。
         """
-        if not entries:
+        if not word_entries:
             return ""
 
         lang = _normalize_lang(language)
 
-        cleaned: List[Tuple[float, float, str]] = []
-        last_end = 0.0
-        for item in sorted(entries, key=lambda x: (float(x[0]), float(x[1]))):
-            if len(item) < 3:
-                continue
+        # 字符数不匹配时提前警告（便于调试）
+        # 注：entries_n 要排除我们自己插入的静音条目（_inject_sentence_pauses
+        # 写入的 sil 标记），否则每次插入停顿都会触发一次误报式警告。
+        if text and lang in ("zh", "yue", "ja", "ko"):
+            spoken_n = _count_spoken_chars(text, lang)
+            entries_n = sum(
+                1 for _, _, w in word_entries
+                if (w or "").strip().lower() not in self._mfa.SIL_PHONES
+            )
+            if spoken_n != entries_n:
+                logger.warning(
+                    f"[alt_aligners] 参考文本可发音字符数 {spoken_n} ≠ "
+                    f"对齐条目数 {entries_n}。如出现音素偏移，请检查参考文本是否与音频一致。"
+                )
 
-            s, e, t = item
-            if s is None or e is None:
-                continue
+        # 日语 / 韩语需要特殊处理
+        if lang == "ja":
+            lab = self._ja_entries_to_lab(word_entries, text)
+            return _fill_silences_lab(lab) if fill_silences else lab
+        if lang == "ko":
+            lab = self._ko_entries_to_lab(word_entries, text)
+            return _fill_silences_lab(lab) if fill_silences else lab
 
-            s = float(s)
-            e = float(e)
-            t = (t or "").strip()
+        word_tier = [_MI(s, e, w) for s, e, w in word_entries]
+        phone_items: List[Tuple[int, int, str]] = []
 
-            if not t or _is_cjk_punct(t):
-                continue
+        if lang in ("zh", "cmn"):
+            lines = self._mfa._process_zh_words(word_tier, phone_items, text)
+        elif lang == "yue":
+            lines = self._mfa._process_yue_words(word_tier, phone_items, text)
+        else:
+            lines = self._mfa._process_en_words(word_tier, phone_items, text)
 
-            if s < last_end:
-                s = last_end
-            if e < s:
-                e = s + 1e-4
-
-            cleaned.append((s, e, t))
-            last_end = e
-
-        if not cleaned:
-            return ""
-
-        spoken_units = _split_spoken_units(full_text or "", lang)
-        use_full_text_units = len(spoken_units) == len(cleaned) and len(spoken_units) > 0
-
-        lines: List[str] = []
-        last_end = None
-
-        for idx, (s, e, t) in enumerate(cleaned):
-            label = spoken_units[idx] if use_full_text_units else t
-            label = (label or "").strip()
-
-            if not label or _is_cjk_punct(label):
-                continue
-
-            if fill_silences and last_end is not None:
-                gap = s - last_end
-                if gap >= 0.05:
-                    lines.append(f"{last_end:.6f} {s:.6f} SIL")
-
-            lines.append(f"{s:.6f} {e:.6f} {label}")
-            last_end = e
-
-        return "\n".join(lines)
+        lines = self._mfa._apply_lab_postprocess(lines, lang)
+        lab = "\n".join(lines)
+        return _fill_silences_lab(lab) if fill_silences else lab
 
     def _ja_entries_to_lab(
         self,
         word_entries: List[Tuple[float, float, str]],
         text: str,
     ) -> str:
-        try:
-            import pykakasi
-            kks = pykakasi.kakasi()
-        except ImportError:
-            lines = []
-            for s, e, ch in word_entries:
-                if ch.strip() and not _is_cjk_punct(ch):
-                    lines.append(f"{int(s*10_000_000)} {int(e*10_000_000)} {ch}")
-            return "\n".join(lines)
+        """
+        【修复说明】word_entries 现在可能混入 _inject_sentence_pauses() 插入的
+        静音条目（mark == _SIL_MARK == "sil"）。这些条目必须在送入
+        假名转换之前被摘出来，否则会被当作日文文本误转换；
+        更重要的是，build_ja_hiragana_lab() 的元音/辅音状态机会把任何
+        非元音、非鼻音的输入当作"待合并的辅音声母"（pending）。
 
-        lines: List[str] = []
+        修复方式：先把静音条目摘出来单独保存，只把真正的发音字符喂给
+        SudachiPy；状态机跑完之后，再按时间顺序把静音条目插回，最后统一
+        交给 merge_lab_silence()——它对字面量 "sil" 有专门的"不可修改/
+        不可删除"保护（见模块顶部 _SIL_MARK 的注释）。
+
+        【假名转换说明】原实现使用 pykakasi 逐字符调用 convert()。
+        pykakasi 是 GPL-3.0 许可，会对本项目产生许可传染，故替换为
+        Apache-2.0 许可的 SudachiPy（本项目其他模块已依赖该库）。
+        SudachiPy 是分词器，逐字符调用会丢失上下文，导致多音字读音
+        变差（例如「今」单独转换得到「いま」，但在「今日」中应为
+        「きょう」的「きょ」部分）。因此这里改为对整句拼接文本做一次
+        tokenize，按各 morpheme 的 surface 字符数把读音重新切回到
+        每个原始字符的时间戳上，多音字消歧效果优于逐字符调用。
+
+        【本次修复 - 关键 bug】此前的实现在拿到 Sudachi 的 morpheme 读音
+        （已经是最终假名，如 "きもち"/"さんぷる"）之后，又把这些 LAB 行
+        送进了 phoneme_converter.build_ja_hiragana_lab()。但那个函数的
+        状态机只认识"单个罗马字音素"（MFA japanese_mfa 输出的 a/i/u/e/o
+        或 ky/ny 等单字母/双字母音素），任何不是元音、不是鼻音的输入都会
+        被当成"待合并的辅音声母"塞进 pending，等下一条目到来时被 flush
+        成字面量 "-"。结果是：除最后一条之外的*每一条*假名读音都被强制
+        改写成 "-"，循环结束后最后一条也在收尾 flush 中变成 "-"。
+        merge_lab_silence() 随后处理这些 "-"：规则是"前面没有可吸收的
+        真实音节（非 -/非 sil）就直接删除"——因为这时全部都是 "-"，没有
+        任何条目能当吸收对象，于是全部被删除，只剩 _inject_sentence_pauses()
+        写入的字面量 "sil"。这正是"WhisperX/Qwen3 对齐日语文本后只剩
+        sil、没有任何音标"的根因（已用合成时间戳复现并验证修复有效）。
+
+        修复：Sudachi 给出的读音已经是最终假名形式，不需要也不能再走一遍
+        "罗马音素→假名"的状态机，直接跳过 build_ja_hiragana_lab()。
+
+        【顺带增强，后续修复见 _distribute_mora_across_chars】多字符
+        morpheme 原本把整段读音揉成一条跨越全词时间区间的 LAB 行（如
+        「気持ち」→ 一条 "きもち"），丢弃了 wav2vec2 本来给出的逐字符
+        时间戳。当 morpheme 的表层字数与读音 mora 数（经 _split_ja_mora
+        拆分）恰好相等时，把读音逐字拆回各自原始时间戳，恢复逐字精度
+        （典型如纯假名 ASR 文本、大多数简单汉字词）；数量不一致时
+        （典型如「大変」2 字对应 たいへん 4 mora、「僕」1 字对应 ぼく
+        2 mora）不再退回整词合并区块——那正是用户反馈"音标连在一起，
+        不是一个假名一个音标"的根因。现在由 _distribute_mora_across_chars()
+        把 mora 尽量均匀分配给各个原始字符、再在每个字符自身时间戳内部
+        按 mora 数等分，逐 mora 输出，仅在分配粒度上做近似，不再合并
+        成一条目（详见该函数顶部说明）。
+        """
+        sil_entries: List[Tuple[int, int, str]] = []
+        spoken_entries: List[Tuple[float, float, str]] = []
         for s, e, ch in word_entries:
-            ch = ch.strip()
-            if not ch or _is_cjk_punct(ch):
-                continue
-            result = kks.convert(ch)
-            hira = "".join(r.get("hira", r.get("orig", "")) for r in result).strip()
-            lines.append(f"{int(s*10_000_000)} {int(e*10_000_000)} {hira or ch}")
+            ch = (ch or "").strip()
+            if ch.lower() in self._mfa.SIL_PHONES:
+                sil_entries.append((int(s * 10_000_000), int(e * 10_000_000), _SIL_MARK))
+            else:
+                spoken_entries.append((s, e, ch))
+
+        # 过滤标点，得到真正参与假名转换的字符序列（保留原时间戳）
+        char_entries = [
+            (s, e, ch) for s, e, ch in spoken_entries
+            if ch and not _is_cjk_punct(ch)
+        ]
+
+        try:
+            from sudachipy import dictionary as _sudachi_dictionary  # noqa: F401
+        except ImportError:
+            lines = [
+                f"{int(s*10_000_000)} {int(e*10_000_000)} {ch}"
+                for s, e, ch in char_entries
+            ]
+        else:
+            joined_text = "".join(ch for _, _, ch in char_entries)
+            lines = []
+            if joined_text:
+                tok, mode = _get_sudachi_tokenizer()
+                morphemes = tok.tokenize(joined_text, mode)
+
+                # 把逐字符时间戳和 morpheme 切分对齐：按每个 morpheme 的
+                # surface 长度，依次"消费"对应数量的原始字符时间戳。
+                idx = 0  # char_entries 游标
+                for m in morphemes:
+                    surface = m.surface()
+                    n = len(surface)
+                    if n <= 0:
+                        continue
+                    piece = char_entries[idx: idx + n]
+                    idx += n
+                    if not piece:
+                        continue
+                    reading_kata = m.reading_form() or surface
+                    reading_hira = _kata_to_hira(reading_kata)
+
+                    if n == 1:
+                        # 单字符词：该字符自身只有一个时间戳，但读音可能不止
+                        # 1 个 mora（如「僕」→ ぼく、「本」→ ほん，1 字 2
+                        # mora）。统一交给 mora_list 分支判断，不再无条件
+                        # 把整段读音直接塞进这一个时间戳——这正是此前「僕」
+                        # 「本」等词被输出成单条 LAB 行（而非逐 mora）的根因。
+                        mora_list = _split_ja_mora(reading_hira) if reading_hira else []
+                        if not mora_list:
+                            s, e, _ch = piece[0]
+                            lines.append(
+                                f"{int(s*10_000_000)} {int(e*10_000_000)} "
+                                f"{reading_hira or surface}"
+                            )
+                        elif len(mora_list) == 1:
+                            s, e, _ch = piece[0]
+                            lines.append(
+                                f"{int(s*10_000_000)} {int(e*10_000_000)} {mora_list[0]}"
+                            )
+                        else:
+                            lines.extend(_distribute_mora_across_chars(piece, mora_list))
+                    else:
+                        # 多字符词（如「今日」「大変」）：字数与 mora 数恰好
+                        # 相等时逐字直接对应（最常见、最精确）；不相等时
+                        # （典型如「大変」2 字对应 たいへん 4 mora）由
+                        # _distribute_mora_across_chars() 把 mora 尽量均匀
+                        # 分配给各字符、再在每个字符自身时间戳内部按 mora
+                        # 数等分，不再退回"整词合并成一条"的旧兜底。
+                        mora_list = _split_ja_mora(reading_hira) if reading_hira else []
+                        if not mora_list:
+                            s = piece[0][0]
+                            e = piece[-1][1]
+                            lines.append(
+                                f"{int(s*10_000_000)} {int(e*10_000_000)} "
+                                f"{reading_hira or surface}"
+                            )
+                        elif len(piece) == len(mora_list):
+                            for (ps, pe, _pch), mora in zip(piece, mora_list):
+                                lines.append(
+                                    f"{int(ps*10_000_000)} {int(pe*10_000_000)} {mora}"
+                                )
+                        else:
+                            lines.extend(_distribute_mora_across_chars(piece, mora_list))
+
+                # 极端情况下 tokenize 输出的字符总数与输入不符（理论上
+                # 不应发生，但做个兜底，避免静默丢字）。
+                if idx < len(char_entries):
+                    for s, e, ch in char_entries[idx:]:
+                        lines.append(f"{int(s*10_000_000)} {int(e*10_000_000)} {ch}")
 
         from mfa_processor import MFAProcessor
         entries_p = MFAProcessor._parse_lab_lines(lines)
-        from phoneme_converter import build_ja_hiragana_lab, merge_lab_silence
-        entries_p = build_ja_hiragana_lab(entries_p)
-        merged = merge_lab_silence(entries_p)
+        from phoneme_converter import merge_lab_silence
+        # 注意：此处不再调用 build_ja_hiragana_lab()——sudachi 已经直接给出
+        # 最终假名读音，不是需要状态机合并的单个罗马音素。二次转换会把每条
+        # 假名读音误判为"待合并辅音声母"全部拆成 '-'，再被 merge_lab_silence()
+        # 当作孤立辅音声母删除，导致最终 LAB 只剩 sil（见上方修复说明）。
+
+        # 把摘出去的静音条目按时间顺序插回——状态机全程没见过它们，
+        # 不会把它们的区间错误地并入相邻假名音节。
+        combined = sorted(entries_p + sil_entries, key=lambda x: x[0])
+        merged = merge_lab_silence(combined)
         return "\n".join(f"{s} {e} {p}" for s, e, p in merged)
 
     def _ko_entries_to_lab(
@@ -669,48 +1163,65 @@ class WhisperXAligner(AltAlignerBase):
     # ── 核心对齐（句子隔离版）────────────────────────────────────────────────
     def align(self, audio_path: str, text: Optional[str], language: str) -> Dict:
         """
-        句子隔离强制对齐（稳定修复版）
+        句子隔离强制对齐（Sentence-Isolated Alignment）。
 
-        核心原则：
-          1. 句数一致才绑定参考文本
-          2. 句数不一致时，保留 ASR 文本，不做危险硬切分
-          3. 对齐输入里标点改空格，不直接删除成一坨
-          4. 用真实裁剪时长做 local alignment
-          5. 对齐失败时整句回填，保证时间轴不断裂
+        改进点（对比旧版）：
+          1. 逐句裁剪音频 → 在极短时序空间内单独对齐，消除长文本累计漂移。
+          2. 参考文本与 ASR 句数匹配时，将参考文本绑定到对应句子（修正繁简/识别错误）。
+          3. 每句独立完成 LAB 转换，避免字符数不一致导致的全局偏移。
+          4. 音素时长守护（PDG）消除极短音标（< 25ms）。
+          5. 【已修复】不再是"全程 fill_silences=False，输出零 SP/SIL 的纯净
+             连续音标序列"——wav2vec2 在句子内部几乎不会留出时间间隙，旧版
+             仅靠 fill_silences 做不到任何停顿。现在改为 _inject_sentence_pauses()
+             在标点位置主动插入真正的 sil 条目（见该函数顶部说明），fill_silences
+             本身仍为 False（句内不需要按"时间间隙"再做一遍全局扫描，标点
+             位置已经显式处理）。
+          6. 【已修复】上一步插入的 sil 只有固定的 40/80ms，远短于实际录音
+             里的换气/停顿（wav2vec2 经常把真实静音错误地算进标点前最后
+             一个字的时长里，实测可达 200~400ms+）。现在加一步
+             _refine_sil_boundaries_by_energy()，用该句真实裁剪音频的短时
+             能量扫描，把 sil 边界扩展到真正安静的区域，让停顿长度跟随
+             这一句实际演唱内容，而不是停在一个固定值上（详见该函数顶部
+             说明）。
         """
         t0 = time.time()
         try:
             import whisperx
 
-            wx_lang = self._to_whisperx_lang(language)
-            int_lang = self._normalize_lang(language)
-            _SR = 16_000
+            wx_lang  = _to_whisperx_lang(language)
+            int_lang = _normalize_lang(language)
+            _SR      = 16_000   # WhisperX load_audio 固定输出 16kHz
 
-            # 1) 加载音频
+            # ── 1. 加载音频 ──────────────────────────────────────────────────
+            # whisperx.load_audio() 依赖 ffmpeg 子进程；若环境中 ffmpeg 不可用
+            # 则回退到 soundfile（直接读 WAV/FLAC）+ librosa 重采样，避免崩溃。
             try:
                 import warnings
                 with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", message=".*torchcodec.*")
-                    audio = whisperx.load_audio(audio_path)
+                    warnings.filterwarnings(
+                        "ignore",
+                        message=".*torchcodec.*",   # 屏蔽 pyannote torchcodec 警告
+                    )
+                    audio = whisperx.load_audio(audio_path)   # float32 numpy, 16kHz
             except Exception as _ffmpeg_err:
                 logger.warning(
-                    f"[WhisperX] whisperx.load_audio 失败（{_ffmpeg_err}），尝试用 soundfile + librosa 回退加载…"
+                    f"[WhisperX] whisperx.load_audio 失败（{_ffmpeg_err}），"
+                    "尝试用 soundfile + librosa 回退加载…"
                 )
                 try:
                     import soundfile as _sf
                     import numpy as _np
-
                     _data, _orig_sr = _sf.read(audio_path, always_2d=False)
                     if _data.ndim > 1:
-                        _data = _data.mean(axis=1)
+                        _data = _data.mean(axis=1)   # 混音为单声道
                     _data = _data.astype(_np.float32)
                     if _orig_sr != _SR:
                         import librosa as _librosa
                         _data = _librosa.resample(_data, orig_sr=_orig_sr, target_sr=_SR)
-
                     audio = _data
                     logger.info(
-                        f"[WhisperX] soundfile 回退加载成功: {len(audio)/float(_SR):.2f}s @ {_SR}Hz"
+                        f"[WhisperX] soundfile 回退加载成功: "
+                        f"{len(audio)/float(_SR):.2f}s @ {_SR}Hz"
                     )
                 except Exception as _sf_err:
                     return self._err(
@@ -719,10 +1230,12 @@ class WhisperXAligner(AltAlignerBase):
                         t0,
                     )
 
-            # 2) ASR 转录
+            # ── 2. ASR 转录（仅用于获取句子级时序边界）──────────────────────
             self._load_asr()
             logger.info("[WhisperX] 开始 ASR 转录...")
-            asr_out = self._asr_model.transcribe(audio, batch_size=self.batch_size, language=wx_lang)
+            asr_out      = self._asr_model.transcribe(
+                audio, batch_size=self.batch_size, language=wx_lang
+            )
             raw_segments = asr_out.get("segments", [])
             if not raw_segments:
                 return self._err("WhisperX ASR 无输出，请检查音频质量", t0)
@@ -731,106 +1244,141 @@ class WhisperXAligner(AltAlignerBase):
             logger.info(f"[WhisperX] ASR 文本: {asr_text_full[:120]}")
             logger.info(f"[WhisperX] ASR 共检出 {len(raw_segments)} 句")
 
-            # 3) 参考文本预处理：只在句数一致时绑定
+            # ── 3. 参考文本预处理：断句并与 ASR 句段绑定 ────────────────────
+            #    句数完全一致时，按句直接绑定；
+            #    句数不一致（绝大多数情况）时，按"每段 ASR 自己的识别字数"
+            #    为配额，把参考文本（保留标点）顺序切给各段——配额用 ASR
+            #    字数而不是音频时长，是为了保证替换后送进 wav2vec2 对齐的
+            #    字符数不变，不会导致强制对齐被迫拉伸/压缩造成时间戳错位。
             if text:
-                cleaned_ref = normalize_text_for_whisperx(text, lang=int_lang)
-                ref_sentences: List[str] = _split_ref_sentences(cleaned_ref)
-
-                if len(ref_sentences) == len(raw_segments) and len(ref_sentences) > 0:
+                cleaned_ref  = normalize_text_for_whisperx(text, lang=int_lang)
+                ref_sentences: List[str] = [
+                    s.strip()
+                    for s in _re.split(r'[。！？；\n…!?]+', cleaned_ref)
+                    if s.strip()
+                ]
+                if len(ref_sentences) == len(raw_segments):
                     logger.info(
-                        f"[WhisperX] 参考文本句数 {len(ref_sentences)} == ASR 句段数 {len(raw_segments)}，逐句绑定参考文本"
+                        f"[WhisperX] 参考文本句数 {len(ref_sentences)} == ASR 句段数，"
+                        "绑定参考文本 → 每句使用参考文本对齐"
                     )
                     for i, seg in enumerate(raw_segments):
                         seg["text"] = ref_sentences[i]
                 else:
-                    logger.warning(
-                        f"[WhisperX] 参考文本句数 {len(ref_sentences)} != ASR 句段数 {len(raw_segments)}，"
-                        "保留 ASR 识别文本逐句对齐（更稳定）"
-                    )
+                    bound = _bind_ref_text_by_asr_count(cleaned_ref, raw_segments, int_lang)
+                    if bound:
+                        logger.warning(
+                            f"[WhisperX] 参考文本切出 {len(ref_sentences)} 句 ≠ "
+                            f"ASR 段数 {len(raw_segments)}，按各段 ASR 识别字数为配额"
+                            "分配参考文本（保留标点，字数严格对应，不退回 ASR 文本）"
+                        )
+                    else:
+                        logger.warning(
+                            f"[WhisperX] 参考文本切出 {len(ref_sentences)} 句 ≠ "
+                            f"ASR 段数 {len(raw_segments)}，保留 ASR 识别文本逐句对齐"
+                        )
 
-            # 4) 加载对齐模型
+            # ── 4. 加载对齐模型 ──────────────────────────────────────────────
             model_a, metadata = self._load_align(wx_lang)
             logger.info(f"[WhisperX] 开始逐句隔离强制对齐（共 {len(raw_segments)} 句）...")
 
-            # 5) 逐句对齐
+            # ── 5. 句子隔离强制对齐核心循环 ──────────────────────────────────
+            #    对每句：① 物理裁剪音频 → ② 在局部短时序空间内对齐
+            #          → ③ 局部时间戳 + 句子偏移 = 全局绝对时间戳
+            #    完全消除跨句累计漂移和 CTC 路径崩溃导致的音标粘连。
+            # seg_pair_list: [(entries_for_this_seg, text_for_this_seg), ...]
             seg_pair_list: List[Tuple[List[Tuple[float, float, str]], str]] = []
 
             for idx, seg in enumerate(raw_segments):
                 start_sec = float(seg.get("start", 0.0))
-                end_sec = float(seg.get("end", 0.0))
-                seg_text = (seg.get("text", "") or "").strip()
+                end_sec   = float(seg.get("end",   0.0))
+                seg_text  = seg.get("text", "").strip()
 
                 if not seg_text or end_sec <= start_sec:
                     continue
 
+                # 物理裁剪：提取该句的音频片段
                 st_samp = max(0, int(start_sec * _SR))
-                en_samp = min(len(audio), int(end_sec * _SR))
+                en_samp = min(len(audio), int(end_sec   * _SR))
                 cropped = audio[st_samp:en_samp]
 
-                if len(cropped) < 160:
+                if len(cropped) < 160:      # < 10ms，跳过
                     logger.warning(
-                        f"[WhisperX] 第 {idx + 1} 句裁剪后过短（{len(cropped)} samples），跳过"
+                        f"[WhisperX] 第 {idx+1} 句裁剪后过短（{len(cropped)} samples），跳过"
                     )
                     continue
 
-                real_dur = len(cropped) / float(_SR)
-
-                # 关键修复：标点改空格，不要删除
-                seg_text_for_align = _segment_text_for_align(seg_text)
+                # 对齐模型接受的文本：剥离标点符号（，。！？：等传入会
+                # 导致 wav2vec2 词表缺失而跳过整句），但保留空白和单词
+                # 内部撇号——前者是英语/韩语等多词语言的词边界，被误删
+                # 会导致整句被拼接成一个伪单词，wav2vec2 只能返回 1 个
+                # 跨越全句的 word 条目（详见 _clean_align_text() 顶部的
+                # bug 说明）。改用 _clean_align_text()，不再用
+                # _is_cjk_punct() 逐字符过滤（该函数把空白也判定为
+                # "标点"一并清除）。
+                seg_text_for_align = _clean_align_text(seg_text)
                 if not seg_text_for_align:
-                    seg_pair_list.append(([(start_sec, end_sec, seg_text)], seg_text))
                     continue
 
-                local_seg_list = [{
-                    "text": seg_text_for_align,
-                    "start": 0.0,
-                    "end": real_dur,
-                }]
+                # 单句任务：局部时间从 0 开始
+                local_seg_list = [{"text": seg_text_for_align, "start": 0.0, "end": end_sec - start_sec}]
 
                 seg_entries: List[Tuple[float, float, str]] = []
                 try:
                     local_aligned = whisperx.align(
-                        local_seg_list,
-                        model_a,
-                        metadata,
-                        cropped,
-                        self._device,
-                        return_char_alignments=True,
+                        local_seg_list, model_a, metadata, cropped, self._device,
+                        return_char_alignments=True,   # CJK 字符级对齐
                     )
 
                     for a_seg in local_aligned.get("segments", []):
-                        if int_lang in ("zh", "yue", "ja"):
-                            units = a_seg.get("chars", []) or []
+                        # 中/粤/日/韩都按字符级（chars）切分：中日粤本身
+                        # 不用空格分词；韩语虽然书写时用空格分隔"词"
+                        # （어절），但歌唱场景下需要的是逐音节字符级时间戳
+                        # （和中文逐字一致），不是整个词组一条目——
+                        # _ko_entries_to_lab() 早就实现了逐字符的韩语
+                        # 处理（含初声"-"占位拆分），此前却一直走 else
+                        # 分支取 words（词组级），导致该函数从未真正吃到
+                        # 单字符输入，对齐结果停留在"整句/整词组一条目"。
+                        if int_lang in ("zh", "yue", "ja", "ko"):
+                            units    = a_seg.get("chars", [])
                             text_key = "char"
                         else:
-                            units = a_seg.get("words", []) or []
-                            text_key = "word"
-
-                        if not units:
-                            units = a_seg.get("words", []) or a_seg.get("chars", []) or []
+                            units    = a_seg.get("words", [])
                             text_key = "word"
 
                         for unit in units:
                             s = unit.get("start")
                             e = unit.get("end")
                             t = (unit.get(text_key) or unit.get("text") or "").strip()
-
                             if s is None or e is None or not t or _is_cjk_punct(t):
                                 continue
-
-                            seg_entries.append((float(s) + start_sec, float(e) + start_sec, t))
+                            # 局部时间 → 全局绝对时间
+                            seg_entries.append(
+                                (float(s) + start_sec, float(e) + start_sec, t)
+                            )
 
                 except Exception as exc:
                     logger.error(
-                        f"[WhisperX] 第 {idx + 1} 句对齐异常（'{seg_text[:30]}'）: {exc}"
+                        f"[WhisperX] 第 {idx+1} 句对齐异常（'{seg_text[:30]}'）: {exc}"
                     )
-
-                if not seg_entries:
+                    # 降级：整句作为单一条目，保持时间轴不断裂
                     seg_entries = [(start_sec, end_sec, seg_text)]
 
-                seg_entries = self._apply_duration_guard(
-                    seg_entries,
-                    getattr(self, "min_phoneme_dur", 0.025),
+                # 句内标点停顿注入：在标点对应位置插入真正的 sil 条目
+                # （详见 _inject_sentence_pauses 顶部说明），条目数量会
+                # 因此增多，但不改变原有发音字符的相对顺序，不会引入
+                # 新的拼音/音节错位。
+                seg_entries = _inject_sentence_pauses(seg_entries, seg_text)
+
+                # 上一步给的 40/80ms 只是"至少要有多长停顿"的下限，
+                # 不代表音频里真实的换气/停顿就这么短——wav2vec2 经常
+                # 把真正的静音错误地算进标点前最后一个字的时长里。这里
+                # 用该句裁剪出来的真实音频（cropped，16kHz）做短时能量
+                # 扫描，把 sil 边界扩展到真正安静的区域（详见函数顶部
+                # 说明），让 SVP 里的停顿长度跟到这一句实际演唱的换气
+                # 时长，而不是一个跟内容无关的固定值。
+                seg_entries = _refine_sil_boundaries_by_energy(
+                    seg_entries, cropped, _SR, start_sec
                 )
 
                 if seg_entries:
@@ -839,27 +1387,35 @@ class WhisperXAligner(AltAlignerBase):
             if not seg_pair_list:
                 return self._err("所有句子对齐均失败，请检查音频质量和语言设置", t0)
 
-            # 6) 转 LAB
-            lab_blocks: List[str] = []
+            # ── 6. 音素时长守护（PDG）──────────────────────────────────────
+            #    每句内部独立运行，将 < min_phoneme_dur 的极短音标扩展到安全时长。
+            #    句间间隙（说话停顿）不受影响，总时长严格守恒。
+            guarded_pair_list: List[Tuple[List[Tuple[float, float, str]], str]] = []
             for seg_entries, seg_text in seg_pair_list:
+                guarded = self._apply_duration_guard(seg_entries, self.min_phoneme_dur)
+                guarded_pair_list.append((guarded, seg_text))
+
+            # ── 7. 逐句转换为 LAB（标点处含真实 sil 条目）──────────────────────
+            #    每句独立调用 _word_entries_to_lab，用当句文本驱动音素转换，
+            #    彻底杜绝字符数不一致跨句传播的偏移错误。fill_silences=False
+            #    是因为句内停顿已经由上面第 5 步的 _inject_sentence_pauses()
+            #    显式写入了 sil 条目，不需要再做一次基于时间间隙的全局扫描。
+            lab_blocks: List[str] = []
+            for seg_entries, seg_text in guarded_pair_list:
                 if not seg_entries:
                     continue
-
                 block = self._word_entries_to_lab(
-                    seg_entries,
-                    seg_text,
-                    language,
-                    fill_silences=False,
+                    seg_entries, seg_text, language, fill_silences=False
                 )
-                if block and block.strip():
-                    lab_blocks.append(block.strip())
+                if block.strip():
+                    lab_blocks.append(block)
 
-            lab = "\n".join(lab_blocks).strip()
+            lab = "\n".join(lab_blocks)
 
             return {
                 "success": True,
                 "lab_content": lab,
-                "raw_text": text.strip() if text else asr_text_full,
+                "raw_text":     text.strip() if text else asr_text_full,
                 "phoneme_text": asr_text_full,
                 "audio_duration": self._get_audio_duration_100ns(audio_path),
                 "processing_time": int((time.time() - t0) * 1000),
@@ -1214,11 +1770,17 @@ class Qwen3ASRAligner(AltAlignerBase):
             final_text = transcribed or (text.strip() if text else "")
             if not transcribed and text:
                 logger.warning("[Qwen3-ASR] 未返回转录文本，回退使用外部 text 进行后处理")
+            # 【修复说明】Qwen3-ASR 不为标点输出时间戳，句末/句中停顿只能
+            # 体现为相邻字符之间天然的时间间隙。之前这里传 fill_silences=False，
+            # 导致这些天然间隙跟 WhisperX 旧版本一样只是数值上的空隙，没有
+            # 写入 SIL 标记，SVP 工程生成阶段识别不到，音符仍然连在一起。
+            # 改为 True 后交给 _fill_silences_lab() 按 ≥50ms 间隙自动补 SIL，
+            # 这也是本模块文档注释里一直描述的预期行为。
             lab = self._word_entries_to_lab(
                 entries,
                 final_text,
                 language,
-                fill_silences=False,
+                fill_silences=True,
             )
 
             return {
@@ -1325,8 +1887,11 @@ class Qwen3ForcedAligner(AltAlignerBase):
                     "processing_time": int((time.time() - t0) * 1000),
                 }
 
+            # 同上：Qwen3-ForcedAligner 同样不输出标点的时间戳，停顿只能
+            # 体现为真实词与词之间的时间间隙，需要 fill_silences=True
+            # 才能把这些间隙转换成 SVP 能识别的 SIL 标记。
             lab = self._word_entries_to_lab(
-                word_entries, text, language, fill_silences=False
+                word_entries, text, language, fill_silences=True
             )
 
             return {

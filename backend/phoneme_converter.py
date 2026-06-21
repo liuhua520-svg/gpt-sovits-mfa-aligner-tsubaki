@@ -19,6 +19,8 @@ New in v2.0:
 from __future__ import annotations
 import unicodedata
 import logging
+import re
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -409,6 +411,294 @@ def debug_unknown_phonemes(phonemes: list[str], language: str) -> list[str]:
     else:
         return []
     return [ph for ph in phonemes if ph not in SILENCE_TOKENS and ph not in table]
+
+
+# ══════════════════════════════════════════════════════════════
+# English Grapheme-to-Phoneme (G2P)
+#
+#   背景：EN_IPA_TO_ARPABET 只是"音素 → 音素"的重标注表，前提是已经
+#   有一份真实的逐音素时间戳（来自 MFA 对 TextGrid 的强制对齐）。
+#   WhisperX / Qwen3 等替代对齐后端只能给出词级（英语）或字符级
+#   （中日韩）时间戳，没有这份音素层，因此英语词永远无法从这张表
+#   受益——这正是 WhisperXAligner 英语输出始终停留在"整词一条 LAB
+#   行"、从未到达音素级的根本原因。
+#
+#   本节补上"词 → ARPABET 音素序列"这一步（真正的 G2P），两级查询：
+#     1. 本地已下载的 MFA english_us_mfa 发音词典——与项目其余部分
+#        共用同一套发音资源，查到的音素记号再丢进上面的
+#        EN_IPA_TO_ARPABET 转换，结果与真实 MFA TextGrid 路径完全
+#        一致，不会出现两条流水线音素风格不一致的问题。
+#     2. g2p_en（CMUdict + 训练好的 OOV 兜底模型）——词典查不到生词、
+#        俚语、ASR 误识别拼写时的兜底；其输出本身已经是标准 ARPABET
+#        （带重音数字，如 "AH0"），去重音数字、转小写后即可直接使用。
+#   两级都失败时返回 None，调用方应保留旧的整词兜底行为，不崩溃。
+# ══════════════════════════════════════════════════════════════
+
+_EN_DICT_CACHE: Optional[dict[str, list[str]]] = None
+_G2P_EN_INSTANCE = None
+_G2P_EN_LOAD_ATTEMPTED = False
+
+_PROB_TOKEN_RE = re.compile(r"^\d+(\.\d+)?$")
+_WORD_EDGE_STRIP_RE = re.compile(r"^[^a-z']+|[^a-z']+$")
+_TRAILING_STRESS_RE = re.compile(r"\d+$")
+_ORDINAL_RE = re.compile(r"^(\d[\d,]*)(st|nd|rd|th)$", re.IGNORECASE)
+
+
+def _candidate_mfa_dict_paths() -> list[Path]:
+    """本地常见的 MFA english_us_mfa 发音词典存放位置（按优先级）。"""
+    home = Path.home() / "Documents" / "MFA"
+    names = ["english_us_mfa", "english_mfa"]
+    paths: list[Path] = []
+    for name in names:
+        paths.append(home / "pretrained_models" / "dictionary" / f"{name}.dict")
+        paths.append(home / "models" / "dictionary" / f"{name}.dict")
+    return paths
+
+
+def _load_en_mfa_dictionary() -> dict[str, list[str]]:
+    """
+    惰性加载本地已下载的 MFA english_us_mfa 发音词典为
+    {word: [phone, phone, ...]} 查找表；找不到文件时返回空字典
+    （调用方回退到 g2p_en，不报错）。
+
+    词典文件格式兼容两种常见变体（不同 MFA 版本/不同词典略有差异）：
+      简单格式:       WORD PHONE1 PHONE2 ...
+      含概率格式:     WORD PROB SIL_BEFORE_PROB [SIL_AFTER_PROB] PHONE1 PHONE2 ...
+    判别方式：从第 2 列起，只要 token 能解析为纯数字（含小数）就视为
+    概率列跳过，第一个解析失败的 token 即为音素序列起点——音素记号
+    （如 "t"、"ʃ"、"aɪ"）不会是纯数字字符串，这个判别足够稳健，
+    不需要预先知道具体是哪一种格式。
+    """
+    global _EN_DICT_CACHE
+    if _EN_DICT_CACHE is not None:
+        return _EN_DICT_CACHE
+
+    table: dict[str, list[str]] = {}
+    dict_path = next((p for p in _candidate_mfa_dict_paths() if p.exists()), None)
+
+    if dict_path is None:
+        logger.info(
+            "[G2P] 未找到本地 MFA english_us_mfa.dict 词典文件"
+            "（可执行 mfa model download dictionary english_us_mfa 获取），"
+            "英语单词将仅通过 g2p_en 兜底（若已安装）"
+        )
+        _EN_DICT_CACHE = table
+        return table
+
+    try:
+        with open(dict_path, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 2:
+                    continue
+                word = parts[0].lower()
+                rest = parts[1:]
+                phone_start = 0
+                for idx, tok in enumerate(rest):
+                    if _PROB_TOKEN_RE.match(tok):
+                        phone_start = idx + 1
+                    else:
+                        break
+                phones = rest[phone_start:]
+                if phones and word not in table:   # 多发音变体只取第一条，保持确定性
+                    table[word] = phones
+        logger.info(f"[G2P] 已加载 MFA 英语词典: {dict_path} ({len(table)} 词)")
+    except Exception as exc:
+        logger.warning(f"[G2P] 读取 MFA 英语词典失败 ({dict_path}): {exc}")
+        table = {}
+
+    _EN_DICT_CACHE = table
+    return table
+
+
+def _get_g2p_en():
+    """惰性加载 g2p_en.G2p() 单例（OOV 兜底）。
+
+    首次调用会触发 g2p_en 内部的 NLTK 数据检查/下载（cmudict、
+    averaged_perceptron_tagger），需要网络访问；之后会被 NLTK 缓存。
+    """
+    global _G2P_EN_INSTANCE, _G2P_EN_LOAD_ATTEMPTED
+    if _G2P_EN_INSTANCE is not None or _G2P_EN_LOAD_ATTEMPTED:
+        return _G2P_EN_INSTANCE
+    _G2P_EN_LOAD_ATTEMPTED = True
+    try:
+        from g2p_en import G2p
+        _G2P_EN_INSTANCE = G2p()
+        logger.info("[G2P] g2p_en 已加载")
+    except ImportError:
+        logger.warning(
+            "[G2P] 未安装 g2p_en，词典外的英语单词将无法转换为音素级 "
+            "ARPABET。请执行: pip install g2p_en"
+        )
+    except Exception as exc:
+        logger.warning(f"[G2P] g2p_en 加载失败: {exc}")
+    return _G2P_EN_INSTANCE
+
+
+def word_to_arpabet(word: str) -> Optional[list[str]]:
+    """
+    英语单词（或含数字的 token，如 "2024"、"21st"）→ ARPABET 音素
+    序列（小写、无重音数字）。
+
+    Returns
+    -------
+    list[str]   成功转换的音素序列（长度 ≥ 1）
+    None        词典 / g2p_en / 数字展开均失败（如均未安装），调用方
+                应保留旧的整词单条目兜底，不崩溃。
+    """
+    raw = (word or "").strip()
+    clean = _WORD_EDGE_STRIP_RE.sub("", raw.lower())
+
+    if not clean:
+        # 整个 token 不含任何字母（典型如纯数字 "2024"）：展开为英文
+        # 单词后再走一次完整 G2P，而不是直接放弃——确保数字永远不会
+        # 以字面字符形式出现在最终 ARPABET/LAB 输出里，只会出现它
+        # 展开后的真实发音音素。
+        return _expand_digits_to_phones(raw)
+
+    table = _load_en_mfa_dictionary()
+    if clean in table:
+        converted = [convert_phoneme(p, "en") for p in table[clean]]
+        converted = [c for c in converted if c]
+        if converted:
+            return converted
+
+    g2p = _get_g2p_en()
+    if g2p is not None:
+        try:
+            raw_phones = g2p(clean)
+        except Exception as exc:
+            logger.warning(f"[G2P] g2p_en 转换失败 '{clean}': {exc}")
+            raw_phones = []
+        phones: list[str] = []
+        for p in raw_phones:
+            p = (p or "").strip()
+            if not p or p == " ":
+                continue
+            # g2p_en 输出标准 ARPABET，重音标在末尾数字（如 "AH0"）
+            p_clean = _TRAILING_STRESS_RE.sub("", p).lower()
+            if p_clean.isalpha():
+                phones.append(p_clean)
+        if phones:
+            return phones
+
+    # 词典和 g2p_en 都没找到，但原始 token 里仍混有数字（如 "2nd"、
+    # "k9"）：展开数字部分再试一次，好过直接放弃整个词。
+    if any(ch.isdigit() for ch in raw):
+        return _expand_digits_to_phones(raw)
+
+    return None
+
+
+def _expand_digits_to_phones(raw: str) -> Optional[list[str]]:
+    """把含数字的 token（"2024" / "21st" / "3.5"）展开为英文拼写单词，
+    对每个展开出的单词分别递归调用 word_to_arpabet()，再拼接为一个
+    完整音素序列。找不到 num2words 或展开失败时返回 None。
+    """
+    if not any(ch.isdigit() for ch in raw):
+        return None
+    try:
+        from num2words import num2words
+    except ImportError:
+        logger.warning(
+            "[G2P] 未安装 num2words，无法把数字展开为单词；"
+            "请执行: pip install num2words"
+        )
+        return None
+
+    m = _ORDINAL_RE.match(raw.strip())
+    try:
+        if m:
+            words_str = num2words(int(m.group(1).replace(",", "")), to="ordinal")
+        else:
+            digits_only = re.sub(r"[^\d.]", "", raw)
+            if not digits_only:
+                return None
+            value = float(digits_only) if "." in digits_only else int(digits_only)
+            words_str = num2words(value)
+    except Exception as exc:
+        logger.warning(f"[G2P] 数字展开失败 '{raw}': {exc}")
+        return None
+
+    all_phones: list[str] = []
+    for w in re.split(r"[\s\-]+", words_str):
+        w = w.strip()
+        if not w:
+            continue
+        sub = word_to_arpabet(w)   # 递归：展开后的单词（如 "twenty"）走正常 G2P 流程
+        if sub:
+            all_phones.extend(sub)
+    return all_phones or None
+
+
+# ── 音素时长权重（用于把一个词的时间跨度按音素类型比例分配）─────────
+# 依据：元音/双元音在自然发音中明显长于塞音（塞音有闭塞+爆破，天然
+# 短促）；摩擦音/鼻音/流音/半元音介于两者之间。权重为相对值，分配时
+# 会按总和归一化，不要求绝对数值精确，只要求相对大小关系合理。
+_EN_PHONE_WEIGHT: dict[str, float] = {
+    # 双元音 — 最长
+    "aw": 1.5, "ay": 1.5, "ey": 1.5, "ow": 1.5, "oy": 1.5,
+    # 元音
+    "aa": 1.3, "ae": 1.3, "ah": 1.3, "ao": 1.3, "eh": 1.3,
+    "er": 1.3, "iy": 1.3, "uw": 1.3, "ih": 1.2, "uh": 1.2, "ax": 1.1,
+    # 摩擦音
+    "dh": 1.0, "f": 1.0, "s": 1.0, "sh": 1.0, "th": 1.0,
+    "v": 1.0, "z": 1.0, "zh": 1.0,
+    # 送气音
+    "hh": 0.9,
+    # 鼻音
+    "m": 0.9, "n": 0.9, "ng": 0.9,
+    # 流音 / 半元音
+    "l": 0.95, "r": 0.95, "w": 0.95, "y": 0.95,
+    # 塞擦音
+    "ch": 0.85, "dr": 0.85, "jh": 0.85, "tr": 0.85,
+    # 塞音 — 最短
+    "b": 0.6, "d": 0.6, "dx": 0.5, "g": 0.6, "k": 0.6, "p": 0.6, "t": 0.6,
+}
+_EN_PHONE_DEFAULT_WEIGHT = 1.0
+_EN_PHONE_MIN_DUR_100NS = 60_000   # 6ms 地板，避免出现零长/负长条目
+
+
+def distribute_arpabet_phones(
+    word_start: int,
+    word_end: int,
+    phones: list[str],
+) -> list[tuple[int, int, str]]:
+    """
+    把一个词的时间跨度（100ns 整数刻度，与本项目 LAB 时间单位一致）
+    按音素类型权重比例分配给该词的 ARPABET 音素序列。
+
+    用途：WhisperX 等替代对齐后端只能给出词级时间戳，没有真实的逐
+    音素强制对齐结果；用这个比例分配近似出音素级时间戳，比把整个
+    词压缩成单条目（旧行为）更贴近真实发音节奏，是该场景下合理的
+    最佳近似（与 MFAProcessor._distribute_syllables_by_weight() 处理
+    中文拼音音节时间分配的思路一致）。
+    """
+    if not phones:
+        return []
+    if len(phones) == 1:
+        return [(word_start, word_end, phones[0])]
+
+    weights = [_EN_PHONE_WEIGHT.get(p, _EN_PHONE_DEFAULT_WEIGHT) for p in phones]
+    total_weight = sum(weights) or float(len(phones))
+    duration = word_end - word_start
+
+    result: list[tuple[int, int, str]] = []
+    cursor = word_start
+    for i, (p, w) in enumerate(zip(phones, weights)):
+        if i == len(phones) - 1:
+            seg_end = word_end
+        else:
+            seg_dur = int(round(duration * (w / total_weight)))
+            seg_end = cursor + seg_dur
+        if seg_end - cursor < _EN_PHONE_MIN_DUR_100NS:
+            seg_end = cursor + _EN_PHONE_MIN_DUR_100NS
+        if i < len(phones) - 1 and seg_end > word_end:
+            seg_end = word_end
+        result.append((cursor, seg_end, p))
+        cursor = seg_end
+
+    return result
 
 
 # ══════════════════════════════════════════════════════════════

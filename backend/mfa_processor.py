@@ -16,7 +16,13 @@ from typing import Dict, List, Tuple, Optional, Set
 
 from pypinyin import lazy_pinyin, Style
 from mfa_utils import MFAChecker
-from phoneme_converter import convert_phoneme, build_ja_hiragana_lab, merge_lab_silence
+from phoneme_converter import (
+    convert_phoneme,
+    build_ja_hiragana_lab,
+    merge_lab_silence,
+    word_to_arpabet,
+    distribute_arpabet_phones,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -753,8 +759,32 @@ class MFAProcessor:
             if entries:
                 for s, e, p in entries:
                     lines.append(f"{s} {e} {p}")
-            else:
-                lines.append(f"{start} {end} {mark.lower()}")
+                continue
+
+            # phone_items 里没有这个词的真实 MFA 音素（最常见原因：调用方
+            # 是 WhisperX/Qwen3 等替代对齐后端，根本没有逐音素 TextGrid，
+            # AltAlignerBase._word_entries_to_lab() 永远传入空的
+            # phone_items 列表）。改用 G2P 把这个词转换为 ARPABET 音素
+            # 序列，再按音素类型权重把该词已有的时间跨度比例分配给各
+            # 个音素——而不是像旧版本那样把整个单词原样当成一个"音素"
+            # 塞进 LAB（这正是 WhisperXAligner 英语输出始终停留在词级、
+            # 从未真正到达音素级的根本原因）。
+            g2p_phones = word_to_arpabet(mark)
+            if g2p_phones:
+                for s, e, p in distribute_arpabet_phones(start, end, g2p_phones):
+                    lines.append(f"{s} {e} {p}")
+                continue
+
+            # G2P 也失败（词典和 g2p_en 都未命中，或均未安装）：保留旧
+            # 行为作为最终兜底，至少不丢时间轴；同时给出明确告警，
+            # 不会静默退化成"看起来正常但其实是整词"的输出。
+            logger.warning(
+                f"[MFA] 英语词 '{mark}' 无法获取音素（MFA Phone Tier 为空，"
+                "G2P 词典 / g2p_en 均未命中），按整词输出。如需音素级 "
+                "ARPABET，请确认已下载 MFA english_us_mfa 词典，或执行 "
+                "pip install g2p_en"
+            )
+            lines.append(f"{start} {end} {mark.lower()}")
 
         return lines
 
