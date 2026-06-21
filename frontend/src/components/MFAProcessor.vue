@@ -172,7 +172,7 @@
           />
           <div class="help-text">
             <span v-if="isTextOptional" style="color:#67c23a">
-              ✓ Qwen3-ASR 支持纯 ASR 模式，文本留空也可处理
+              ✓ 支持纯 ASR 模式，文本留空也可处理 当前字符数：{{ formData.text.length }}
             </span>
             <span v-else>当前字符数：{{ formData.text.length }}</span>
           </div>
@@ -697,7 +697,9 @@ import { ref, computed, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { UploadFilled, InfoFilled } from '@element-plus/icons-vue'
 
-const emit = defineEmits(['status-changed'])
+const emit = defineEmits<{
+  (e: 'status-changed', status: SystemStatus): void
+}>()
 
 type ProcessingMode = 'mfa-only' | 'full' | 'project-only'
 
@@ -1063,7 +1065,11 @@ const checkSystemStatus = async () => {
       const { mfa: _mfa, ...altBacks } = alignerData.backends
       alignerStatus.value = altBacks
     }
-    emit('status-changed')
+    // 【修复】把已经拿到的 systemStatus 直接通过事件传给父组件，
+    // 而不是只发一个空事件让父组件自己再 fetch 一次 /api/pipeline/status。
+    // 否则父组件（右上角"系统就绪"标签）和这里（底部"系统状态"面板）
+    // 永远是两次独立的网络请求结果，天然就会有先后顺序差 + 偶尔不一致。
+    emit('status-changed', systemStatus.value)
   } catch (e) {
     console.warn('无法检查系统状态:', e)
     ElMessage.warning('无法连接到后端')
@@ -1391,14 +1397,34 @@ if (processingMode.value === 'project-only') {
 }
 
 const downloadLab = () => {
-  if (!result.value?.labContent) return
+  if (!result.value?.labContent) {
+    ElMessage.warning('没有 LAB 内容可下载')
+    return
+  }
+
+  // 智能获取与工程文件一致的 stem（包含随机后缀）
+  let stem = 'alignment'
+
+  if (result.value.projectPath) {
+    const projName = getFileName(result.value.projectPath)
+    stem = projName.replace(/\.(svp|ustx|sv)$/, '')   // 去掉扩展名
+  } else if (result.value.labPath) {
+    const labName = getFileName(result.value.labPath)
+    stem = labName.replace(/\.lab$/, '')
+  } else if (formData.value.audioFile) {
+    stem = formData.value.audioFile.name.replace(/\.\w+$/, '')
+  }
+
+  const filename = `${stem}.lab`
+
   const element = document.createElement('a')
   element.setAttribute('href', 'data:text/plain;charset=utf-8,' + encodeURIComponent(result.value.labContent))
-  element.setAttribute('download', `alignment_${Date.now()}.lab`)
+  element.setAttribute('download', filename)
   document.body.appendChild(element)
   element.click()
   document.body.removeChild(element)
-  ElMessage.success('LAB 文件已下载')
+
+  ElMessage.success(`✅ LAB 文件已下载: ${filename}`)
 }
 
 const downloadProject = async () => {

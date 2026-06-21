@@ -18,13 +18,13 @@
 
     <!-- 主体 -->
     <el-main class="app-main">
-      <AudioProcessor @status-changed="checkSystemStatus" />
+      <AudioProcessor @status-changed="onSystemStatusChanged" />
     </el-main>
 
     <!-- 页脚 -->
     <el-footer class="app-footer">
       <div class="footer-content">
-        <p>Audio Processing Aligner v2.0.0 • Built with PyWORLD + MFA + Vue3</p>
+        <p>SVS Lab Aligner • Built with PyWORLD + MFA + Vue3</p>
         <p>
           <a href="https://github.com/liuhua520-svg/SVS-Lab-Aligner" target="_blank">
             📚 GitHub
@@ -40,27 +40,21 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref } from 'vue'
 import AudioProcessor from './components/MFAProcessor.vue'
 
 const systemReady = ref(false)
 
-onMounted(() => {
-  checkSystemStatus()
-})
-
-const checkSystemStatus = async () => {
-  try {
-    const res = await fetch('/api/pipeline/status')
-    const data = await res.json()
-    
-    if (data.success) {
-      systemReady.value = data.status.mfa?.installed ?? false
-    }
-  } catch (e) {
-    console.warn('无法检查系统状态')
-    systemReady.value = false
-  }
+// 【修复】右上角"系统就绪"标签不再自己单独 fetch 一次 /api/pipeline/status。
+// 子组件 MFAProcessor 在 onMounted 时已经会做一次完整的状态检查
+// （/api/pipeline/status + /api/aligner/status），检查完之后会把结果通过
+// status-changed 事件直接带上来。这里只负责消费这份数据，原因：
+//   1. 避免页面一打开父子组件各自发一次几乎一样的状态请求（多余的网络/子进程开销）；
+//   2. 避免"先看到底部面板更新，过一会儿右上角才更新"的不同步现象——
+//      两边现在用的是同一份响应，而不是分别独立 fetch 的两份，
+//      也就不会出现两边状态对不上的情况。
+const onSystemStatusChanged = (status?: { mfa?: { installed?: boolean } }) => {
+  systemReady.value = status?.mfa?.installed ?? false
 }
 </script>
 
