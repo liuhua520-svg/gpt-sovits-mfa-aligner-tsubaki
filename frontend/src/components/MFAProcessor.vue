@@ -113,6 +113,33 @@
           </el-alert>
         </el-form-item>
 
+        <!-- 对齐工具运行设备（仅非 MFA 后端显示） -->
+        <el-form-item
+          v-if="processingMode !== 'project-only' && alignerBackend !== 'mfa'"
+          label="对齐运行设备"
+        >
+          <el-radio-group v-model="advancedConfig.aligner_device">
+            <el-radio label="auto">自动 (优先 GPU)</el-radio>
+            <el-radio label="cpu">CPU</el-radio>
+            <el-radio label="cuda">CUDA (GPU)</el-radio>
+          </el-radio-group>
+          <div class="help-text" style="margin-top:6px">
+            <small v-if="advancedConfig.aligner_device === 'cuda' && alignerBackend === 'whisperx'">
+              💡 <strong>WhisperX (GPU)：</strong>精度根据 GPU 能力自动调整：
+              Turing/RTX 20xx+ → float16，Pascal/旧卡 → int8（已内置自动降级，无需手动配置）。
+            </small>
+            <small v-else-if="advancedConfig.aligner_device === 'cuda' && alignerBackend.startsWith('qwen3')">
+              💡 <strong>Qwen3 (GPU)：</strong>Ampere/RTX 30xx+ 使用 bfloat16；Pascal/Volta/Turing 使用 float16；CPU 使用 float32。
+            </small>
+            <small v-else-if="advancedConfig.aligner_device === 'cpu'">
+              ⚠️ CPU 模式下速度较慢，建议仅在无 GPU 或显存不足时选择。
+            </small>
+            <small v-else>
+              自动检测：有 CUDA 设备则优先使用 GPU，精度根据显卡架构自动选择。
+            </small>
+          </div>
+        </el-form-item>
+
 		<!-- LAB / MIDI 单文件上传（仅 project-only 模式） -->
 		<el-form-item v-if="processingMode === 'project-only'" label="LAB / MIDI 文件">
 		  <el-upload
@@ -525,6 +552,7 @@
                     <li>F0 方法: {{ result.config.f0_method?.toUpperCase?.() || result.config.f0_method }}</li>
                     <li v-if="result.config.f0_method === 'crepe'">CREPE 模型: {{ result.config.crepe_model }}</li>
                     <li v-if="result.config.f0_method === 'crepe' || result.config.f0_method === 'rmvpe'">运行设备: {{ result.config.f0_device }}</li>
+                    <li v-if="result.config.aligner_device !== undefined">对齐设备: {{ result.config.aligner_device }}</li>
                     <li>精度: {{ result.config.use_double_precision ? '双精度 (Float64)' : '单精度 (Float32)' }}</li>
                   </ul>
                 </el-col>
@@ -721,6 +749,7 @@ interface AdvancedConfig {
   export_pitch_line: boolean
   f0_method: 'dio' | 'harvest' | 'crepe' | 'rmvpe'
   f0_device: 'auto' | 'cpu' | 'cuda'
+  aligner_device: 'auto' | 'cpu' | 'cuda'  // WhisperX / Qwen3 对齐工具运行设备
   crepe_model: 'full' | 'tiny'
   precision: 'single' | 'double'
   f0_smooth: boolean
@@ -784,6 +813,7 @@ const advancedConfig = ref<AdvancedConfig>({
   export_pitch_line: true,
   f0_method: 'dio',
   f0_device: 'auto',
+  aligner_device: 'auto',
   crepe_model: 'full',
   precision: 'double',
   f0_smooth: true,
@@ -1004,6 +1034,7 @@ const normalizeResult = (payload: any) => {
       export_pitch_line: advancedConfig.value.export_pitch_line,
       f0_method: advancedConfig.value.f0_method,
       f0_device: advancedConfig.value.f0_device,
+      aligner_device: advancedConfig.value.aligner_device,
       crepe_model: advancedConfig.value.crepe_model,
       use_double_precision: advancedConfig.value.precision === 'double'
     }
@@ -1294,6 +1325,7 @@ if (processingMode.value === 'project-only') {
     formDataObj.append('text', formData.value.text)
     formDataObj.append('language', formData.value.language)
     formDataObj.append('aligner_backend', alignerBackend.value)
+    formDataObj.append('aligner_device', advancedConfig.value.aligner_device)
 
     if (processingMode.value === 'full') {
       formDataObj.append('format', formData.value.outputFormat)
