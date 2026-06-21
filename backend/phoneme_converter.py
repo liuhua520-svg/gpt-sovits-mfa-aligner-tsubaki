@@ -235,6 +235,18 @@ EN_IPA_TO_ARPABET: dict[str, str] = {
     "ɹ":  "r",   "r":  "r",
     "w":  "w",   "j":  "y",
     "ʔ":  "",
+    
+    # ── English IPA variants / common MFA outputs ─────────────────
+    "ɫ": "l",    # dark l / syllabic l 的常见输出，统一到 ARPAbet l
+    "ɐ": "ax",   # 你这条里出现的弱化元音，优先归一到 ax
+    "ə": "ax",   # 已有则保留
+    "ɚ": "er",
+    "ɝ": "er",
+    "ʌ": "ah",
+    "ɾ": "dx",   # flap / tapped r, 如果你的 MFA 里有这个符号会更稳
+    "ɻ": "r",    # 卷舌近音，常见于部分变体输出
+    "ɬ": "l",    # 若偶发出现侧擦音变体，先保底到 l
+    "ɮ": "l",    # 同上，保底处理
 
     # ── 辅音 ARPAbet pass-through ────────────────────────────────
     "ch": "ch", "dh": "dh", "dx": "dx",

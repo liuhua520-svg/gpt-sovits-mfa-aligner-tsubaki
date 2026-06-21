@@ -1051,16 +1051,30 @@ class AltAlignerBase:
                 continue
             s100 = int(s * 10_000_000)
             e100 = int(e * 10_000_000)
-            dur  = e100 - s100
-            if self._mfa._is_korean_text(ch) and len(ch) == 1:
-                has_init = self._mfa._get_korean_initial_consonant(ch) == "has_initial"
-                if has_init:
-                    dash_dur = max(dur // 3, 60_000)
-                    dash_end = min(s100 + dash_dur, e100 - 60_000)
-                    lines.append(f"{s100} {dash_end} -")
-                    lines.append(f"{dash_end} {e100} {ch}")
-                else:
-                    lines.append(f"{s100} {e100} {ch}")
+
+            if self._mfa._is_korean_text(ch):
+                # 【修复说明】旧版对 len(ch) == 1 才走逐字分解路径，多字情况
+                # （整词 / 整句落在一个 entry 里，如 WhisperX wav2vec2-ko
+                # 只能输出 eojeol 级时间戳、或对齐异常降级为全句单条目时）
+                # 直接落入 else 分支，整个字符串写成一行 LAB，后续 SVP 无法
+                # 按音节切分，表现为"整句粘连为单一时间区间"。
+                #
+                # 修复：无论单字还是多字（甚至整句），统一调用 MFA 的韩语逐字
+                # 分解逻辑 _decompose_korean_syllable_with_onset：
+                #   - phone_items=None → 走等比例时长兜底路径，按 jamo 数
+                #     给每个音节块分配时间，再按有无初声 (- + char / char) 输出。
+                #   - 单字情况行为与旧版完全一致（向后兼容）。
+                #
+                # 同时过滤掉混入 ch 的标点 / 空格（降级回退时 seg_text 可能
+                # 含逗号、问号等），保留纯韩文字符交给分解函数。
+                ko_only = "".join(c for c in ch if self._mfa._is_korean_text(c))
+                if not ko_only:
+                    continue
+                syllable_entries = self._mfa._decompose_korean_syllable_with_onset(
+                    s100, e100, ko_only, phone_items=None
+                )
+                for se, ee, pe in syllable_entries:
+                    lines.append(f"{se} {ee} {pe}")
             else:
                 lines.append(f"{s100} {e100} {ch}")
 
@@ -1687,7 +1701,9 @@ class Qwen3ASRAligner(AltAlignerBase):
             # 3) 单个 [s, e]
             if isinstance(time_stamps, list) and time_stamps and isinstance(time_stamps[0], list):
                 # 多时间片
-                if int_lang in ("zh", "yue", "ja") and len(text) > 1 and len(time_stamps) == len(text):
+                # 【修复】原来只有 "zh"/"yue"/"ja"，韩语 "ko" 被遗漏，
+                # 导致 Qwen3-ASR 逐字符时间戳无法分配到每个音节块。
+                if int_lang in ("zh", "yue", "ja", "ko") and len(text) > 1 and len(time_stamps) == len(text):
                     dur_each = sum((e - s) for s, e in time_stamps if s is not None and e is not None) / max(len(text), 1)
                     for i, ch in enumerate(text):
                         if i < len(time_stamps):
@@ -1750,7 +1766,10 @@ class Qwen3ASRAligner(AltAlignerBase):
             # 如果独立服务只返回文本，没有时间戳，则退化为均分
             if not entries and transcribed:
                 total_s = self._get_audio_duration_100ns(audio_path) / 1e7
-                units = list(transcribed) if int_lang in ("zh", "yue", "ja") else transcribed.split()
+                # 【修复】原来只有 "zh"/"yue"/"ja" 走逐字符均分，"ko" 走
+                # split()（按空格切词组），导致均分的每一格是整个 eojeol
+                # 而非单个音节块。
+                units = list(transcribed) if int_lang in ("zh", "yue", "ja", "ko") else transcribed.split()
                 units = [u for u in units if u.strip()]
                 if units:
                     dur = total_s / max(len(units), 1)
@@ -2011,7 +2030,8 @@ class Qwen3ForcedAligner(AltAlignerBase):
         # ── 降级：均匀分配 ────────────────────────────────────────────────
         if not entries:
             logger.warning("[Qwen3-FA] 无法提取时间戳，改用均匀分配（精度较低）")
-            units = list(text) if int_lang in ("zh", "yue", "ja") else text.split()
+            # 【修复】同 Qwen3ASRAligner：补上 "ko"，韩语走逐字符均分而非按空格切词组
+            units = list(text) if int_lang in ("zh", "yue", "ja", "ko") else text.split()
             units = [u for u in units if u.strip() and not _is_cjk_punct(u)]
             if units:
                 dur = total_sec / len(units)
