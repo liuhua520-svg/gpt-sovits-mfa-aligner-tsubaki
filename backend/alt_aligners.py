@@ -1821,6 +1821,82 @@ class Qwen3ASRAligner(AltAlignerBase):
             }
 
 # ═════════════════════════════════════════════════════════════════════════════
+# 6b. Qwen3-ForcedAligner 全局事后偏移校正
+#
+#     背景：实测 Qwen3-ForcedAligner 给出的音节起始时间系统性早于
+#     WhisperX（同一段音频、118 个音节逐一比对，中位数偏移约 -61ms，
+#     标准差 34ms），而音节时长本身基本一致（中位数偏移 ≈ 0），说明
+#     这是模型对齐时把音节边界整体判定得偏早，不是速度/时长上的差异。
+#
+#     这里做的是「全局」校正：把每个音节的起始时间统一向后推
+#     QWEN3_FA_ONSET_DELAY_SEC 秒，时长不变（即结束时间也同步向后推，
+#     保持原有 duration）。效果上等价于把上一段的可用时长还给上一段，
+#     当前段整体右移。
+#
+#     安全约束：
+#       1) 不会把当前段的起点推到超过自己的终点（避免零长度/负长度段）。
+#       2) 不会把当前段的起点推到与上一段终点重叠（避免吞掉上一段）。
+#       3) 第一个音节起点不会被推到负数。
+# ═════════════════════════════════════════════════════════════════════════════
+
+# 全局偏移量（秒）。基于实测中位数 -0.061s 取整，便于后续按实际素材微调。
+QWEN3_FA_ONSET_DELAY_SEC: float = 0.06
+
+# 校正后允许的最短音节时长（秒），避免极端情况下时长被压成 0 或负数。
+_QWEN3_FA_MIN_SYL_DUR_SEC: float = 0.02
+
+
+def _apply_qwen3_fa_onset_delay(
+    word_entries: List[Tuple[float, float, str]],
+    delay_sec: float = QWEN3_FA_ONSET_DELAY_SEC,
+) -> List[Tuple[float, float, str]]:
+    """
+    对 Qwen3-ForcedAligner 的 word_entries 做全局事后偏移校正：
+    把每个条目的起始时间整体向后推 delay_sec 秒，时长保持不变。
+
+    Parameters
+    ----------
+    word_entries : [(start_sec, end_sec, token), ...]
+        必须已按时间升序排列（Qwen3-FA 原始输出本身是按顺序给出的）。
+    delay_sec : 向后推的秒数。正值 = 起始时间变晚（修正"偏早"问题）。
+
+    Returns
+    -------
+    校正后的 word_entries，结构不变，可直接传给 _word_entries_to_lab()。
+    """
+    if not word_entries or delay_sec == 0:
+        return word_entries
+
+    corrected: List[Tuple[float, float, str]] = []
+    prev_end = 0.0
+
+    for i, (s, e, tok) in enumerate(word_entries):
+        dur = max(0.0, float(e) - float(s))
+        new_start = float(s) + delay_sec
+        new_end = new_start + dur
+
+        # 约束 1：不能早于上一段（校正后的）终点，避免吞掉上一段
+        if new_start < prev_end:
+            new_start = prev_end
+            new_end = new_start + dur
+
+        # 约束 2：起点不能为负
+        if new_start < 0:
+            shift = -new_start
+            new_start = 0.0
+            new_end += shift
+
+        # 约束 3：时长兜底，避免压成 0 或负数（极少数边界情况下才会触发）
+        if new_end - new_start < _QWEN3_FA_MIN_SYL_DUR_SEC:
+            new_end = new_start + _QWEN3_FA_MIN_SYL_DUR_SEC
+
+        corrected.append((new_start, new_end, tok))
+        prev_end = new_end
+
+    return corrected
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # 7. Qwen3ForcedAligner
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -1905,6 +1981,13 @@ class Qwen3ForcedAligner(AltAlignerBase):
                     "error": "Qwen3-ForcedAligner 无对齐输出",
                     "processing_time": int((time.time() - t0) * 1000),
                 }
+
+            # 【全局事后偏移校正】实测 Qwen3-FA 的音节起始时间系统性早于
+            # WhisperX（中位数约 -61ms），时长本身基本一致，说明是边界
+            # 判定整体偏早而非速度差异。这里把每个音节起点统一向后推
+            # QWEN3_FA_ONSET_DELAY_SEC 秒（时长不变），让视觉/听感上的
+            # 音节位置更接近 WhisperX。详见 _apply_qwen3_fa_onset_delay()。
+            word_entries = _apply_qwen3_fa_onset_delay(word_entries)
 
             # 同上：Qwen3-ForcedAligner 同样不输出标点的时间戳，停顿只能
             # 体现为真实词与词之间的时间间隙，需要 fill_silences=True
