@@ -535,6 +535,56 @@ def _distribute_mora_across_chars(
     return lines
 
 
+def _explode_to_single_char_entries(
+    entries: List[Tuple[float, float, str]],
+) -> List[Tuple[float, float, str]]:
+    """
+    把 (start, end, text) 条目里 text 长度 > 1 的项，按字符数拆成多条
+    单字符条目，时间在原 [start, end] 区间内等分。text 长度已经是 1
+    的条目原样返回（不做任何浮点重算，避免不必要的精度损耗）。
+
+    【Bug 背景】_ja_entries_to_lab() 用 Sudachi 给 joined_text 分词后，
+    按"当前 morpheme 表层字符数 n = len(surface)"去切 char_entries
+    列表：`piece = char_entries[idx: idx+n]`，`idx += n`。这隐含一个
+    前提：char_entries 列表里每一项正好对应 1 个原始文字字符——这样
+    "表层字符数"和"要跨过的列表下标数"才是同一个数。
+
+    WhisperX 的 chars 输出（return_char_alignments=True）天然满足这个
+    前提：本来就是逐字符给时间戳，1 entry = 1 character。但
+    Qwen3-ForcedAligner 走的是它自己的（子词/BPE 类）tokenizer，常见
+    汉字词（如"日本語"）、常见英文单词（如"English"）经常被它的词表
+    当作一个完整单元一次性返回成 1 条 entry，text 却是 3 个或 7 个
+    字符——这时 1 entry ≠ 1 character。Sudachi 那边算出的 n 仍然是
+    "字符数"，但拿去切的是"列表下标"，两者一旦不再一一对应就会错位：
+    多字符的那一条目被提前/重复消费，或者 idx 越界导致后面整段切出
+    空 piece 被跳过——表现为这些汉字/英文在最终 LAB 里直接消失，正是
+    本次要修复的现象。
+
+    修复：在交给 Sudachi 分词之前，统一先把所有 entries 拆成"1 字符 =
+    1 entry"。这样无论上游对齐器给出的是真正的字符级时间戳（WhisperX）
+    还是词/子词级 token（Qwen3-FA），_ja_entries_to_lab() 后续看到的
+    永远是字符级粒度，重新满足原本就只为这种粒度设计的下标消费逻辑。
+
+    时间分配用简单的等分（按字符数平分原 entry 的时长），因为 Qwen3-FA
+    只给了"这个词整体"的起止时间，没有给词内部逐字符的真实边界，等分
+    是在没有更细粒度证据时唯一合理的近似——这与 phoneme_converter 里
+    其它"整词时长按权重/数量分配给内部音素"的兜底逻辑（如
+    distribute_arpabet_phones）是同一思路。
+    """
+    out: List[Tuple[float, float, str]] = []
+    for s, e, t in entries:
+        n = len(t)
+        if n <= 1:
+            out.append((s, e, t))
+            continue
+        dur = (e - s) / n
+        for i, ch in enumerate(t):
+            cs = s + i * dur
+            ce = e if i == n - 1 else s + (i + 1) * dur
+            out.append((cs, ce, ch))
+    return out
+
+
 def _bind_ref_text_by_asr_count(
     cleaned_ref: str,
     raw_segments: List[Dict],
@@ -624,6 +674,74 @@ def _bind_ref_text_by_asr_count(
     for seg, chunk in zip(raw_segments, chunks):
         seg["text"] = chunk.strip()
     return True
+
+
+_LATIN_LETTER_RE = re.compile(r"^[a-zA-Z']$")
+
+
+def _merge_latin_letter_chars(
+    seg_entries: List[Tuple[float, float, str]],
+) -> List[Tuple[float, float, str]]:
+    """
+    把 WhisperX 字符级对齐（return_char_alignments=True）拆出的连续单个
+    拉丁字母重新拼回完整英文单词。
+
+    【Bug 修复背景】中/粤/日/韩都走 a_seg["chars"]（逐字符）取时间戳，
+    这是 CJK 本身没有空格分词、必须逐字给时间戳的正确做法。但当参考
+    文本里混有英文单词（如中文歌词里夹的 "Singing"）时，WhisperX 的
+    char-level 输出会把这个英文单词也拆成一个个孤立字母："S" "i" "n"
+    "g" "i" "n" "g"，每个字母各自占一条 (start, end, text) entry。
+
+    这些孤立字母随后进入 _process_zh_words() / _process_yue_words()，
+    每一条都会单独命中 _is_english_word()（该函数只检查字符集合是否
+    全为字母，不关心长度），于是逐个调用 word_to_arpabet("s")、
+    word_to_arpabet("g") ……而英文词典里单个字母本身就是合法词条（字母
+    的拼读名，如 S→"ess"→eh s，G→"gee"→jh iy），得到的是"字母朗读音"
+    而不是 "Singing" 这个词本身的发音——表现为整段英文被读成挨个拼读
+    字母。
+
+    修复思路：在送入 _process_*_words() 之前，把时间上连续、且每个
+    text 都是单个拉丁字母（含内部撇号，兼容如 "o" "'" "n" 这种由
+    don't 拆出的写法）的 entries 合并成一条，text 拼接还原成完整单词，
+    时间跨度取首尾。一旦遇到非单字母 entry（CJK 字符、数字、标点、或
+    已经是多字符的 token），当前合并立即结束，不会跨过真正的词/字边界。
+
+    合并之后的整词 entry 会在 _process_zh_words() 里正常命中
+    _is_english_word() → word_to_arpabet("singing")，按真实单词走
+    G2P，得到该单词本身的音素序列，而不是逐字母拼读。
+
+    仅在 zh/yue/ko 的 chars 分支调用（具体原因见调用处注释：ja 因
+    Sudachi 的 surface-长度索引消费机制，不能做这个合并）；英语本身
+    走 words 分支，不受影响，也不需要这个合并。
+    """
+    if not seg_entries:
+        return seg_entries
+
+    merged: List[Tuple[float, float, str]] = []
+    run: List[Tuple[float, float, str]] = []
+
+    def _flush_run():
+        if not run:
+            return
+        if len(run) == 1:
+            merged.append(run[0])
+        else:
+            s = run[0][0]
+            e = run[-1][1]
+            word = "".join(t for _, _, t in run)
+            merged.append((s, e, word))
+        run.clear()
+
+    for entry in seg_entries:
+        _, _, t = entry
+        if _LATIN_LETTER_RE.match(t):
+            run.append(entry)
+        else:
+            _flush_run()
+            merged.append(entry)
+
+    _flush_run()
+    return merged
 
 
 def _inject_sentence_pauses(
@@ -942,6 +1060,13 @@ class AltAlignerBase:
             if ch and not _is_cjk_punct(ch)
         ]
 
+        # 【修复】下面的 Sudachi 分词 + 下标消费逻辑要求"1 entry = 1
+        # 字符"。WhisperX 的逐字符对齐天然满足，但 Qwen3-ForcedAligner
+        # 的 token 可能是多字符的完整汉字词/英文单词（如"日本語"
+        # "English"各占 1 条 entry）。统一展开成单字符粒度，避免汉字/
+        # 英文在 LAB 里消失（详见 _explode_to_single_char_entries 文档）。
+        char_entries = _explode_to_single_char_entries(char_entries)
+
         try:
             from sudachipy import dictionary as _sudachi_dictionary  # noqa: F401
         except ImportError:
@@ -1071,7 +1196,19 @@ class AltAlignerBase:
                 for se, ee, pe in syllable_entries:
                     lines.append(f"{se} {ee} {pe}")
             else:
-                lines.append(f"{s100} {e100} {ch}")
+                # 英语 / 拉丁字母单词：走 G2P → ARPABET 音素级输出，
+                # 与 MFAProcessor._process_ko_words 的英语回退路径保持一致。
+                if re.match(r"^[a-zA-Z''\-]+$", ch.strip()):
+                    from phoneme_converter import word_to_arpabet, distribute_arpabet_phones
+                    g2p_phones = word_to_arpabet(ch)
+                    if g2p_phones:
+                        for ps, pe, pp in distribute_arpabet_phones(s100, e100, g2p_phones):
+                            lines.append(f"{ps} {pe} {pp}")
+                    else:
+                        logger.warning(f"[ko/alt] 英语词 '{ch}' G2P 未命中，按整词输出")
+                        lines.append(f"{s100} {e100} {ch.lower()}")
+                else:
+                    lines.append(f"{s100} {e100} {ch}")
 
         from mfa_processor import MFAProcessor
         entries_p = MFAProcessor._parse_lab_lines(lines)
@@ -1440,6 +1577,27 @@ class WhisperXAligner(AltAlignerBase):
                     )
                     # 降级：整句作为单一条目，保持时间轴不断裂
                     seg_entries = [(start_sec, end_sec, seg_text)]
+
+                # 【修复】中/粤/韩走的是字符级（chars）对齐，若参考文本里混有
+                # 英文单词（如中文歌词夹的 "Singing"），WhisperX 会把该单词
+                # 也拆成一个个孤立字母，每个字母单独命中"是否为英文词"的
+                # 正则后被当成"独立单词"送进 G2P，得到的是字母拼读音
+                # （S→ess, G→gee...）而不是单词本身的发音。这里在送入
+                # _process_zh_words()/_process_yue_words()/_ko_entries_to_lab()
+                # 之前，把时间连续的单字母 entries 重新拼回完整英文单词。
+                #
+                # 注意：唯独日语 (ja) 不能做这个合并。_ja_entries_to_lab()
+                # 在 sudachipy 可用时会把 char_entries 拼成 joined_text 交给
+                # Sudachi 分词，再按每个 morpheme 的 surface 字符长度从
+                # char_entries 里"消费"对应数量的条目——这是"1 个字面字符
+                # = 1 个 entry"的强假设。先把字母合并成单词会让 surface 长度
+                # （字面字符数，不受合并影响）与可消费的 entries 数量（合并后
+                # 变少）不一致，导致该单词之后所有字符的时间戳全部错位。
+                # zh/yue 的 _process_*_words() 和 ko 的 _ko_entries_to_lab()
+                # 都是逐条独立处理每个 entry（不做基于字符位置的索引消费），
+                # 合并对它们是安全的。
+                if int_lang in ("zh", "yue", "ko"):
+                    seg_entries = _merge_latin_letter_chars(seg_entries)
 
                 # 句内标点停顿注入：在标点对应位置插入真正的 sil 条目
                 # （详见 _inject_sentence_pauses 顶部说明），条目数量会

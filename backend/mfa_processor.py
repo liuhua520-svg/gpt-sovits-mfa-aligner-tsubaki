@@ -704,7 +704,19 @@ class MFAProcessor:
                     for s, e, p in entries:
                         lines.append(f"{s} {e} {p}")
                 else:
-                    lines.append(f"{start} {end} {mark.lower()}")
+                    # MFA Phone Tier 为空（CJK 声学模型不输出 ARPABET，或替代
+                    # 对齐后端 phone_items=[]）：走 G2P 获取音素序列，再按权重
+                    # 比例把词的时间跨度分配给各个 ARPABET 音素。
+                    g2p_phones = word_to_arpabet(mark)
+                    if g2p_phones:
+                        for s, e, p in distribute_arpabet_phones(start, end, g2p_phones):
+                            lines.append(f"{s} {e} {p}")
+                    else:
+                        logger.warning(
+                            f"[zh] 英语词 '{mark}' 无法获取音素（MFA Phone Tier 为空，"
+                            "G2P 词典 / g2p_en 均未命中），按整词输出。"
+                        )
+                        lines.append(f"{start} {end} {mark.lower()}")
                 continue
 
             if self._is_digit_char(mark):
@@ -815,7 +827,16 @@ class MFAProcessor:
                     for s, e, p in entries:
                         lines.append(f"{s} {e} {p}")
                 else:
-                    lines.append(f"{start} {end} {mark.lower()}")
+                    g2p_phones = word_to_arpabet(mark)
+                    if g2p_phones:
+                        for s, e, p in distribute_arpabet_phones(start, end, g2p_phones):
+                            lines.append(f"{s} {e} {p}")
+                    else:
+                        logger.warning(
+                            f"[ja] 英语词 '{mark}' 无法获取音素（MFA Phone Tier 为空，"
+                            "G2P 词典 / g2p_en 均未命中），按整词输出。"
+                        )
+                        lines.append(f"{start} {end} {mark.lower()}")
                 continue
 
             entries = self._get_romaji_entries(start, end, phone_items)
@@ -854,7 +875,16 @@ class MFAProcessor:
                     for s, e, p in entries:
                         lines.append(f"{s} {e} {p}")
                 else:
-                    lines.append(f"{start} {end} {mark.lower()}")
+                    g2p_phones = word_to_arpabet(mark)
+                    if g2p_phones:
+                        for s, e, p in distribute_arpabet_phones(start, end, g2p_phones):
+                            lines.append(f"{s} {e} {p}")
+                    else:
+                        logger.warning(
+                            f"[ko] 英语词 '{mark}' 无法获取音素（MFA Phone Tier 为空，"
+                            "G2P 词典 / g2p_en 均未命中），按整词输出。"
+                        )
+                        lines.append(f"{start} {end} {mark.lower()}")
                 continue
 
             if self._is_korean_text(mark):
@@ -1041,7 +1071,16 @@ class MFAProcessor:
                     for s, e, p in entries:
                         lines.append(f"{s} {e} {p}")
                 else:
-                    lines.append(f"{start} {end} {mark.lower()}")
+                    g2p_phones = word_to_arpabet(mark)
+                    if g2p_phones:
+                        for s, e, p in distribute_arpabet_phones(start, end, g2p_phones):
+                            lines.append(f"{s} {e} {p}")
+                    else:
+                        logger.warning(
+                            f"[yue] 英语词 '{mark}' 无法获取音素（MFA Phone Tier 为空，"
+                            "G2P 词典 / g2p_en 均未命中），按整词输出。"
+                        )
+                        lines.append(f"{start} {end} {mark.lower()}")
                 continue
 
             if self._is_digit_char(mark):

@@ -207,6 +207,8 @@ EN_IPA_TO_ARPABET: dict[str, str] = {
     "aɪ": "ay",  "aj": "ay", # ★ aj = IPA notation for /aɪ/
     "aʊ": "aw",
     "ɔɪ": "oy",
+    "ɔj": "oy",               # ★ ɔj = IPA-style oi diphthong (Qwen3-FA 输出，如 "voice")
+    "ej": "ey",               # ★ ej = MFA /eɪ/ 替代记号（如 "late", "face"）
     "ʉ":  "uw",               # ★ U+0289 close central rounded
     "ʉː": "uw",               # ★ long variant
 
@@ -238,6 +240,7 @@ EN_IPA_TO_ARPABET: dict[str, str] = {
     
     # ── English IPA variants / common MFA outputs ─────────────────
     "ɫ": "l",    # dark l / syllabic l 的常见输出，统一到 ARPAbet l
+    "ɲ": "n",    # ★ 硬腭鼻音（偶发于 MFA 某些音节中），保底映射到 n
     "ɐ": "ax",   # 你这条里出现的弱化元音，优先归一到 ax
     "ə": "ax",   # 已有则保留
     "ɚ": "er",
@@ -526,24 +529,75 @@ def _load_en_mfa_dictionary() -> dict[str, list[str]]:
 def _get_g2p_en():
     """惰性加载 g2p_en.G2p() 单例（OOV 兜底）。
 
-    首次调用会触发 g2p_en 内部的 NLTK 数据检查/下载（cmudict、
-    averaged_perceptron_tagger），需要网络访问；之后会被 NLTK 缓存。
+    【修复说明】
+    旧版本把 _G2P_EN_LOAD_ATTEMPTED = True 设在 G2p() 调用之前，且完全
+    没有 NLTK 资源检查。这带来了两个问题：
+      1. G2p() 本身能成功实例化（NLTK 资源只在调用 g2p(word) 时才真正
+         需要），但后续每次调用 g2p(word) 都因缺少
+         averaged_perceptron_tagger_eng 而抛异常。
+      2. _G2P_EN_LOAD_ATTEMPTED = True 永久阻止重试，即使稍后资源已被
+         别的路径下载好也无法恢复。
+
+    现在的修复：
+      a. 在实例化 G2p() 之前，显式用 nltk.data.find() 检测资源，缺失时
+         自动下载（quiet=True 不打扰用户，但 logger 会记录进度）。
+      b. 把 _G2P_EN_LOAD_ATTEMPTED = True 移到 try 块最末尾——只有当
+         G2p() 成功实例化之后才标记"已尝试"；若 NLTK 下载失败或
+         ImportError，下次还会重试。
     """
     global _G2P_EN_INSTANCE, _G2P_EN_LOAD_ATTEMPTED
     if _G2P_EN_INSTANCE is not None or _G2P_EN_LOAD_ATTEMPTED:
         return _G2P_EN_INSTANCE
-    _G2P_EN_LOAD_ATTEMPTED = True
+
     try:
+        # ── Step 1: 确保 NLTK 资源可用 ──────────────────────────────────
+        # g2p_en 对每一个词都调用 nltk.pos_tag()，需要 POS tagger 资源。
+        # cmudict 是 g2p_en 的发音词典，也需要预先存在。
+        # 注：nltk.download() 是幂等的——资源已存在时直接返回 True，不重复下载。
+        _NLTK_REQUIRED = [
+            ("taggers/averaged_perceptron_tagger_eng",   "averaged_perceptron_tagger_eng"),
+            ("taggers/averaged_perceptron_tagger",       "averaged_perceptron_tagger"),
+            ("corpora/cmudict",                          "cmudict"),
+        ]
+        try:
+            import nltk as _nltk
+            for res_path, res_name in _NLTK_REQUIRED:
+                try:
+                    _nltk.data.find(res_path)
+                except LookupError:
+                    logger.info(f"[G2P] 正在下载 NLTK 资源: {res_name} …")
+                    _nltk.download(res_name, quiet=True)
+                    logger.info(f"[G2P] NLTK 资源 {res_name} 已就绪")
+        except ImportError:
+            logger.warning(
+                "[G2P] 未安装 nltk，g2p_en 词性标注可能受限；"
+                "如遇转换失败可执行: pip install nltk"
+            )
+        except Exception as _nltk_exc:
+            logger.warning(
+                f"[G2P] NLTK 资源检查/下载失败（{_nltk_exc}），"
+                "g2p_en 仍会尝试加载，但部分词可能转换失败"
+            )
+
+        # ── Step 2: 实例化 G2p ───────────────────────────────────────────
         from g2p_en import G2p
         _G2P_EN_INSTANCE = G2p()
         logger.info("[G2P] g2p_en 已加载")
+
+        # ── Step 3: 仅在成功后才标记"已尝试"────────────────────────────
+        # 若上面任何步骤抛异常，_G2P_EN_LOAD_ATTEMPTED 保持 False，
+        # 下次调用可以重试（例如在后台资源下载完成后重新初始化）。
+        _G2P_EN_LOAD_ATTEMPTED = True
+
     except ImportError:
         logger.warning(
             "[G2P] 未安装 g2p_en，词典外的英语单词将无法转换为音素级 "
             "ARPABET。请执行: pip install g2p_en"
         )
+        _G2P_EN_LOAD_ATTEMPTED = True   # ImportError 是永久性失败，不必重试
     except Exception as exc:
         logger.warning(f"[G2P] g2p_en 加载失败: {exc}")
+        # 不设 _G2P_EN_LOAD_ATTEMPTED，允许下次重试
     return _G2P_EN_INSTANCE
 
 
