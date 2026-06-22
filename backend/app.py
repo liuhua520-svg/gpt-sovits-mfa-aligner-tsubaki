@@ -1073,8 +1073,9 @@ def main(host: str = "127.0.0.1", port: int = 5000):
     print(f"📂 前端目录: {FRONTEND_DIST}")
     print(f"⏹️  按 Ctrl+C 停止服务")
     print(f"{'=' * 60}\n")
-
-    Thread(target=open_browser, args=(host, port), daemon=True).start()
+    
+    # 【已注释】不再自动打开浏览器
+    #Thread(target=open_browser, args=(host, port), daemon=True).start()
     app.run(host=host, port=port, debug=True, threaded=True, use_reloader=False)
 
 

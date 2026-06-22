@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -18,6 +19,81 @@ from mfa_processor import MFAProcessor
 from tsubaki_processor import TsubakiProcessor, AudioProcessingConfig
 
 logger = logging.getLogger(__name__)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 数字 → 各语种读法文字 转换
+#   把参考文本里的阿拉伯数字 0-9 按当前选择的语种转换成对应的读法文字。
+#   逐字转换（一三一四 → 一三一四），不做"完整数值"解析（不会把 "1234"
+#   读成"一千二百三十四"），与歌词/对齐场景里数字常被逐字唱出的习惯一致
+#   （电话号码、年份、编号等通常也是逐字读出）。
+#
+#   挂在 _run_alignment() 顶部、四个后端分支之前调用一次，MFA /
+#   WhisperX / Qwen3-ASR / Qwen3-FA 四个后端因此都能复用同一份转换结果，
+#   不需要在各自的对齐逻辑里各自实现一遍。
+# ═════════════════════════════════════════════════════════════════════════════
+
+_DIGIT_WORDS: Dict[str, list] = {
+    "zh":  ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"],
+    "yue": ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"],
+    "en":  ["zero", "one", "two", "three", "four",
+            "five", "six", "seven", "eight", "nine"],
+    "ja":  ["ぜろ", "いち", "に", "さん", "よん",
+            "ご", "ろく", "なな", "はち", "きゅう"],
+    "ko":  ["영", "일", "이", "삼", "사", "오", "육", "칠", "팔", "구"],
+}
+
+# 中/粤文字本身书写不依赖空格，逐字直接拼接（如 "1234" → "一二三四"）。
+# 英/日/韩每个数字的读法之间用空格隔开：
+#   - 英语词级对齐依赖空格做分词，连写会变成一个词典/G2P 都查不到的
+#     生造词（"onetwothree"），必须保留分隔。
+#   - 日语/韩语虽然书写习惯上不强制空格，但连续多个数字逐字读出时
+#     （如电话号码、编号）保留分隔更贴近真实唱法，也避免相邻数字的
+#     读法互相粘连产生歧义（如 いち+に 连写成"いちに"）。
+_DIGIT_WORD_SEPARATOR: Dict[str, str] = {
+    "zh": "", "yue": "", "en": " ", "ja": " ", "ko": " ",
+}
+
+_DIGIT_RUN_RE = re.compile(r"\d+")
+
+
+def _convert_digits_to_words(text: str, language: str) -> str:
+    """
+    把 text 里所有阿拉伯数字 0-9 按 language 对应的语种转换成读法文字。
+
+    转换规则（与产品需求给出的样例完全一致）：
+      中文/粤语 1234567890 → 一二三四五六七八九零（无分隔符）
+      英语      1234567890 → one two three four five six seven eight nine zero
+      日语      1234567890 → いち に さん よん ご ろく なな はち きゅう ぜろ
+      韩语      1234567890 → 일 이 삼 사 오 육 칠 팔 구 영
+
+    text 中非数字部分原样保留；language 经 _normalize_lang() 规整后若不在
+    上表中（暂不支持该语种的数字转换），原样返回 text，不做任何改动。
+    text 中本就不含数字时直接返回原文本，不做无意义的字符串重建。
+    """
+    if not text or not any(ch.isdigit() for ch in text):
+        return text
+
+    # 延迟导入：避免给 MFA-only 的主路径增加 alt_aligners.py 的导入开销，
+    # 与 _run_alignment() 里对替代后端分支的现有延迟导入风格保持一致。
+    from alt_aligners import _normalize_lang
+
+    int_lang = _normalize_lang(language)
+    words = _DIGIT_WORDS.get(int_lang)
+    if not words:
+        logger.debug(f"数字转换：语种 '{language}'（规整为 '{int_lang}'）暂不支持，文本原样保留")
+        return text
+
+    sep = _DIGIT_WORD_SEPARATOR.get(int_lang, " ")
+
+    def _replace_run(match: "re.Match") -> str:
+        digit_run = match.group(0)
+        return sep.join(words[int(d)] for d in digit_run)
+
+    converted = _DIGIT_RUN_RE.sub(_replace_run, text)
+    if converted != text:
+        logger.info(f"数字转换 [{int_lang}]：'{text}' → '{converted}'")
+    return converted
 
 
 def _run_alignment(
@@ -31,6 +107,12 @@ def _run_alignment(
     统一调度对齐后端，返回与 MFAProcessor.process() 格式兼容的字典。
     audio_file.save(path) 和 audio_file.filename 必须可用。
     """
+    # 数字 → 读法文字转换，放在四个后端分支之前统一处理一次：
+    # MFA / WhisperX / Qwen3-ASR / Qwen3-FA 都从这里拿到转换后的文本，
+    # 不需要各自重复实现。text 为空（如 Qwen3-ASR 纯识别模式不提供
+    # 参考文本）时 _convert_digits_to_words 内部直接原样返回，不受影响。
+    text = _convert_digits_to_words(text, language)
+
     if backend == "mfa":
         processor = MFAProcessor()
         return processor.process(audio_file, text, language)

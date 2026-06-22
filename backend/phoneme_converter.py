@@ -187,75 +187,96 @@ JA_AMBIGUOUS_NASALS: frozenset[str] = frozenset({"n", "m", "ng", "ny"})
 # ══════════════════════════════════════════════════════════════
 
 EN_IPA_TO_ARPABET: dict[str, str] = {
-
-    # ── 元音 (Vowels - IPA → ARPAbet) ──────────────────────────
-    "iː": "iy",  "i":  "iy",
-    "ɪ":  "ih",
-    "eɪ": "ey",
-    "ɛ":  "eh",  "e":  "eh",
-    "æ":  "ae",
-    "ɑː": "aa",  "ɑ":  "aa",
-    "ɔː": "ao",  "ɔ":  "ao",
-    "oʊ": "ow",
-    "ʊ":  "uh",
-    "uː": "uw",  "u":  "uw",
-    "ʌ":  "ah",
-    "ɜː": "er",  "ɜ":  "er",
-    "ɚ":  "er",               # r-colored schwa
-    "ɝ":  "er",               # ★ U+025D stressed rhotacized mid-central vowel
-    "ə":  "ax",
-    "aɪ": "ay",  "aj": "ay", # ★ aj = IPA notation for /aɪ/
-    "aʊ": "aw",
-    "ɔɪ": "oy",
-    "ɔj": "oy",               # ★ ɔj = IPA-style oi diphthong (Qwen3-FA 输出，如 "voice")
-    "ej": "ey",               # ★ ej = MFA /eɪ/ 替代记号（如 "late", "face"）
-    "ʉ":  "uw",               # ★ U+0289 close central rounded
-    "ʉː": "uw",               # ★ long variant
-
-    # ── 元音 ARPAbet pass-through ────────────────────────────────
-    "aa": "aa", "ae": "ae", "ah": "ah", "ao": "ao",
-    "aw": "aw", "ax": "ax", "ay": "ay",
-    "eh": "eh", "er": "er", "ey": "ey",
-    "ih": "ih", "iy": "iy",
-    "ow": "ow", "oy": "oy",
-    "uh": "uh", "uw": "uw",
-
-    # ── 辅音 (Consonants - IPA → ARPAbet) ──────────────────────
-    "p":  "p",   "b":  "b",
-    "t":  "t",   "d":  "d",
-    "k":  "k",
-    "g":  "g",   "ɡ":  "g",
-    "f":  "f",   "v":  "v",
-    "θ":  "th",  "ð":  "dh",
-    "s":  "s",   "z":  "z",
-    "ʃ":  "sh",  "ʒ":  "zh",
-    "h":  "hh",  "ɦ":  "hh",
-    "tʃ": "ch",  "dʒ": "jh",
-    "m":  "m",   "n":  "n",
-    "ŋ":  "ng",
-    "l":  "l",
-    "ɹ":  "r",   "r":  "r",
-    "w":  "w",   "j":  "y",
-    "ʔ":  "",
-    
-    # ── English IPA variants / common MFA outputs ─────────────────
-    "ɫ": "l",    # dark l / syllabic l 的常见输出，统一到 ARPAbet l
-    "ɲ": "n",    # ★ 硬腭鼻音（偶发于 MFA 某些音节中），保底映射到 n
-    "ɐ": "ax",   # 你这条里出现的弱化元音，优先归一到 ax
-    "ə": "ax",   # 已有则保留
+    # =========================
+    # Vowels / 元音
+    # =========================
+    "iː": "iy", "i": "iy",
+    "ɪ": "ih",
+    "eɪ": "ey", "ej": "ey", "ei": "ey",
+    "e": "eh", "ɛ": "eh",
+    "æ": "ae",
+    "ɑː": "aa", "ɑ": "aa", "ɒ": "aa",
+    "ɔː": "ao", "ɔ": "ao",
+    "oʊ": "ow", "ou": "ow", "o": "ow",
+    "ʊ": "uh",
+    "uː": "uw", "u": "uw", "ʉ": "uw", "ʉː": "uw",
+    "ʌ": "ah",
+    "ɜː": "er", "ɜ": "er",
     "ɚ": "er",
     "ɝ": "er",
-    "ʌ": "ah",
-    "ɾ": "dx",   # flap / tapped r, 如果你的 MFA 里有这个符号会更稳
-    "ɻ": "r",    # 卷舌近音，常见于部分变体输出
-    "ɬ": "l",    # 若偶发出现侧擦音变体，先保底到 l
-    "ɮ": "l",    # 同上，保底处理
+    "ə": "ax",
+    "ɐ": "ax",
 
-    # ── 辅音 ARPAbet pass-through ────────────────────────────────
-    "ch": "ch", "dh": "dh", "dx": "dx",
-    "dr": "dr", "tr": "tr",
-    "hh": "hh", "jh": "jh",
-    "ng": "ng", "sh": "sh", "th": "th", "zh": "zh",
+    "aɪ": "ay", "aj": "ay", "ai": "ay",
+    "aʊ": "aw", "au": "aw",
+    "ɔɪ": "oy", "ɔj": "oy", "oi": "oy",
+
+    # Common non-standard / fallback vowels
+    "ɨ": "ih",
+    "ɵ": "ow",
+    "ɘ": "ax",
+    "ɪ̈": "ih",
+    "ʊ̈": "uh",
+    "ɶ": "ae",
+    "ä": "aa",
+    "ɞ": "er",
+    "ɜ̈": "er",
+    "ɒ̈": "aa",
+
+    # ARPAbet pass-through vowels
+    "iy": "iy", "ih": "ih", "ey": "ey", "eh": "eh", "ae": "ae",
+    "aa": "aa", "ao": "ao", "ow": "ow", "uh": "uh", "uw": "uw",
+    "ah": "ah", "er": "er", "ax": "ax", "ay": "ay", "aw": "aw", "oy": "oy",
+
+    # =========================
+    # Consonants / 辅音
+    # =========================
+    "p": "p", "b": "b",
+    "t": "t", "d": "d",
+    "k": "k", "g": "g", "ɡ": "g",
+    "q": "k", "ɢ": "g",
+    "ʔ": "",
+
+    "f": "f", "v": "v",
+    "θ": "th", "ð": "dh",
+    "s": "s", "z": "z",
+    "ʃ": "sh", "ʒ": "zh",
+    "h": "hh", "ɦ": "hh",
+
+    "tʃ": "ch", "dʒ": "jh",
+    "ts": "ts", "dz": "dz",
+
+    "m": "m", "n": "n", "ŋ": "ng",
+    "ɲ": "n", "ɴ": "ng",
+
+    "l": "l", "ɫ": "l", "ʎ": "l",
+    "r": "r", "ɹ": "r", "ɾ": "dx", "ɻ": "r",
+
+    "w": "w", "j": "y", "ʋ": "w", "ɥ": "y", "ʍ": "w",
+
+    # Common fricative/approximate fallbacks
+    "x": "k", "ɣ": "g",
+    "χ": "k", "ʁ": "r",
+    "ç": "hh", "ʝ": "y",
+    "ɸ": "f", "β": "v",
+    "ʙ": "b",
+    "ɬ": "l", "ɮ": "l",
+
+    # Rare / unsupported: drop
+    "ʕ": "", "ʡ": "",
+
+    # =========================
+    # ARPAbet pass-through
+    # =========================
+    "ch": "ch", "jh": "jh",
+    "dh": "dh", "th": "th",
+    "dx": "dx", "hh": "hh",
+    "ng": "ng", "sh": "sh", "zh": "zh",
+    "y": "y", "r": "r",
+    "m": "m", "n": "n", "l": "l",
+    "p": "p", "b": "b", "t": "t", "d": "d", "k": "k", "g": "g",
+    "s": "s", "z": "z", "f": "f", "v": "v",
+    "w": "w",
 }
 
 
