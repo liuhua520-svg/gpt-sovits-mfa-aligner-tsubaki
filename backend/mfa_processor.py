@@ -23,6 +23,7 @@ from phoneme_converter import (
     word_to_arpabet,
     distribute_arpabet_phones,
     katakana_to_romaji_moras,
+    hiragana_to_katakana,
 )
 
 logger = logging.getLogger(__name__)
@@ -1020,7 +1021,39 @@ class MFAProcessor:
                 for s, e, p in entries:
                     lines.append(f"{s} {e} {p}")
             else:
-                logger.warning(f"日语 word '{mark}' 无法从 Phone Tier 获取音素，跳过")
+                # ★ MFA Phone Tier 为空（该词 OOV / 字典未收录，MFA 标注为 spn）。
+                # 这是拗音（しゅ / ちょ 等）和生僻词最常见的失败原因：
+                # MFA japanese_mfa 词典以「词」为粒度收录条目，孤立假名音节
+                # （作为歌词出现时很常见）若不在词典中，Phone Tier 就会给 spn，
+                # 导致 _get_romaji_entries 过滤掉 spn 后返回空列表，整个字/词
+                # 的时间段从 LAB 输出里彻底消失（正是"しゅ 消失只剩か"的根因）。
+                #
+                # 回退策略：把 Word Tier 里的假名文字本身当作发音依据——
+                #   平假名 → 片假名（codepoint 平移）
+                #   → katakana_to_romaji_moras → 罗马音音素 (辅音, 元音) 对列表
+                #   → _distribute_katakana_mora_phones → 等分该词时间段的各音素条目
+                #
+                # 时间精度：音素级时间戳是等分近似（MFA 给不出真实的音素级对齐），
+                # 词级时间段本身来自 MFA 的词级强制对齐，因此词边界是准确的；
+                # 这比把整个词时间段丢弃（旧行为）要好得多。
+                kata = hiragana_to_katakana(mark)
+                moras = katakana_to_romaji_moras(kata)
+                mora_entries = self._distribute_katakana_mora_phones(start, end, moras)
+                if mora_entries:
+                    for s, e, p in mora_entries:
+                        lines.append(f"{s} {e} {p}")
+                    logger.info(
+                        f"[ja] OOV 回退: '{mark}' (MFA Phone Tier 为 spn/空) → "
+                        f"由假名文字自身生成 {len(mora_entries)} 个罗马音音素条目，"
+                        f"词级时间段准确，音素级时间为等分近似。"
+                    )
+                else:
+                    # mark 含非假名字符（汉字/符号），katakana_to_romaji_moras
+                    # 无法解析 → 只能放弃，保持旧行为。
+                    logger.warning(
+                        f"[ja] word '{mark}' 无法从 Phone Tier 获取音素，"
+                        f"且假名→罗马音回退也失败（mark 含非假名字符？），跳过。"
+                    )
 
         return lines
 
