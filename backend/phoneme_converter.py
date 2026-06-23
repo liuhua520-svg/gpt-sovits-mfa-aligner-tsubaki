@@ -1007,6 +1007,117 @@ def hiragana_to_katakana(text: str) -> str:
     )
 
 
+def katakana_to_hiragana(text: str) -> str:
+    """Convert katakana characters to hiragana (one-to-one codepoint shift)."""
+    _KATAKANA_START = _HIRAGANA_START + _HIRA_TO_KATA  # 0x30A1 ァ
+    _KATAKANA_END   = _HIRAGANA_END   + _HIRA_TO_KATA  # 0x30F6 ヶ
+    return "".join(
+        chr(ord(c) - _HIRA_TO_KATA)
+        if _KATAKANA_START <= ord(c) <= _KATAKANA_END
+        else c
+        for c in text
+    )
+
+
+# ── Katakana → romaji syllable lookup table ──────────────────────────────────
+# Auto-built from JA_CV_TO_HIRAGANA (romaji → hiragana) by codepoint-shifting
+# the hiragana values to katakana.  Keeps the two tables in sync automatically.
+_KATA_MORA: dict[str, str] = {}
+for _r, _h in JA_CV_TO_HIRAGANA.items():
+    _k = hiragana_to_katakana(_h)       # e.g. "しゃ" → "シャ"
+    if _k and _k not in _KATA_MORA:
+        _KATA_MORA[_k] = _r             # e.g. "シャ" → "sha"
+_KATA_MORA.setdefault("ン", "N")        # mora nasal (no hiragana in table)
+del _r, _h, _k                          # cleanup loop vars
+
+
+def _split_cv(syllable: str) -> tuple[str, str]:
+    """Split a romaji syllable into (consonant_part, vowel).
+
+    Examples: "a" → ("","a"), "ka" → ("k","a"), "sha" → ("sh","a"),
+              "tsu" → ("ts","u"), "N" → ("N","").
+    """
+    for idx in range(len(syllable) - 1, -1, -1):
+        if syllable[idx] in "aiueo":
+            return syllable[:idx], syllable[idx]
+    return syllable, ""          # no vowel (e.g. mora nasal "N")
+
+
+def katakana_to_romaji_moras(katakana: str) -> list[tuple[str, str]]:
+    """
+    片假名字符串 → romaji 音素二元组列表 (辅音部分, 元音)。
+
+    专门用于 MFA Phone Tier 无条目时的最终兜底路径：
+    把通过 sudachipy reading_form() 得到的片假名读音转换为
+    ``build_ja_hiragana_lab()`` 能正确处理的 romaji 音素序列，
+    确保最终 LAB 输出为平假名而非 ARPABET 乱码。
+
+    返回规则
+    --------
+    ("", "a")   纯元音音素（あ行）
+    ("k", "a")  辅音 + 元音（か行；build_ja_hiragana_lab 合并为「か」）
+    ("sh", "a") 多字母辅音 + 元音（しゃ行）
+    ("N", "")   拨音 ん，无元音
+    特殊字符：
+      ー (U+30FC, 长音符) → 重复上一个元音
+      ッ (U+30C3, 促音)   → 跳过（不生成独立音素段）
+
+    Examples
+    --------
+    "ハロー" → [("h","a"), ("r","o"), ("","o")]
+    "テスト" → [("t","e"), ("s","u"), ("t","o")]
+    "アイウ"  → [("","a"), ("","i"), ("","u")]
+    "シャープ"→ [("sh","a"), ("","a"), ("p","u")]
+    """
+    moras: list[tuple[str, str]] = []
+    prev_vowel = "a"          # fallback for a leading ー (edge case)
+    i = 0
+    while i < len(katakana):
+        ch = katakana[i]
+
+        # -- Two-character combination first (e.g. シャ = "sha") ─────────
+        if i + 1 < len(katakana):
+            two = katakana[i: i + 2]
+            syl = _KATA_MORA.get(two)
+            if syl:
+                cons, vow = _split_cv(syl)
+                moras.append((cons, vow))
+                if vow:
+                    prev_vowel = vow
+                i += 2
+                continue
+
+        # -- Long vowel ー → repeat prev vowel ───────────────────────────
+        if ord(ch) == 0x30FC:                # ー
+            moras.append(("", prev_vowel))
+            i += 1
+            continue
+
+        # -- Geminate ッ → skip (no dedicated phoneme segment) ───────────
+        if ord(ch) == 0x30C3:                # ッ
+            i += 1
+            continue
+
+        # -- Single character ─────────────────────────────────────────────
+        syl = _KATA_MORA.get(ch)
+        if syl:
+            if syl == "N":
+                moras.append(("N", ""))
+            else:
+                cons, vow = _split_cv(syl)
+                moras.append((cons, vow))
+                if vow:
+                    prev_vowel = vow
+        else:
+            logger.warning(
+                "[katakana_to_romaji_moras] 未知片假名字符: %r (U+%04X) – 跳过",
+                ch, ord(ch),
+            )
+        i += 1
+
+    return moras
+
+
 # ══════════════════════════════════════════════════════════════
 # Japanese merged C+V LAB builder  (合并辅音 / 平假名 / 片假名)
 # ══════════════════════════════════════════════════════════════

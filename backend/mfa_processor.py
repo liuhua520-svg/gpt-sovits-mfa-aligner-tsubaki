@@ -22,6 +22,7 @@ from phoneme_converter import (
     merge_lab_silence,
     word_to_arpabet,
     distribute_arpabet_phones,
+    katakana_to_romaji_moras,
 )
 
 logger = logging.getLogger(__name__)
@@ -338,6 +339,155 @@ class MFAProcessor:
     def _is_digit_char(self, word: str) -> bool:
         """检测是否为单个数字字符"""
         return word.strip() in '0123456789'
+
+    # =====================================================================
+    # 日语：英语 → 片假名（MFA 对齐前预处理 + 兜底转换）
+    # =====================================================================
+    # 背景：MFA 的 japanese_mfa 词典只收录假名/汉字词条，完全不认识拉丁字母
+    # 拼写的英语单词——送进去只会被判定成 OOV（spn），拿不到任何音素级时间
+    # 戳。但日语外来语本身在词典里就是以片假名形式收录的（例如 "love" 对应
+    # 词条其实是「ラブ」），所以思路是：在文本送入 MFA 之前，先用 sudachipy
+    # 把能识别的英语单词换成它的片假名读音，MFA 就能像处理普通外来语一样正
+    # 常给出对齐结果；万一个别词 sudachi 也不认识（生僻词/专有名词），则在
+    # 下面 _process_ja_words() 里用同一套转换逻辑做最后兜底，至少能输出合
+    # 理的假名近似，而不是把 ARPABET 音素硬塞进只认日语罗马音的
+    # build_ja_hiragana_lab()。
+
+    @staticmethod
+    def _is_full_katakana(s: str) -> bool:
+        """字符串是否整体由片假名字符组成（含长音符ー、促音ッ等片假名区块字符）"""
+        if not s:
+            return False
+        return all("\u30A0" <= ch <= "\u30FF" for ch in s)
+
+    def _valid_katakana_reading(self, surface: str, reading: Optional[str]) -> Optional[str]:
+        """
+        校验 sudachipy 给出的 reading_form() 是否是"真正转换成功"的片假名读音。
+
+        sudachi 对完全不认识的词通常会原样返回 surface 本身，或者读音里混杂
+        非片假名字符——这两种情况都说明 sudachi 没能给出有效转换，不应当替
+        换，否则会把英语原文误判成转换成功，产生错误读音。
+        """
+        reading = (reading or "").strip()
+        if not reading or reading == surface:
+            return None
+        if not self._is_full_katakana(reading):
+            return None
+        return reading
+
+    def _normalize_japanese_text_for_mfa(self, text: str) -> str:
+        """
+        MFA 对齐前的日语文本预处理：把文本中夹杂的英语单词替换成 sudachipy
+        给出的片假名读音，写入 MFA 语料 txt 之前调用。
+
+        只替换 sudachi 词典里确实有片假名读音的词；sudachi 不认识的生僻词/
+        专有名词原样保留英语，交给 _process_ja_words() 里的兜底逻辑处理
+        （那样至少在日志里能看到，而不是被静默替换成错误读音）。
+        """
+        global _ja_tokenizer
+        if not text:
+            return text
+
+        try:
+            from sudachipy import Dictionary
+            if _ja_tokenizer is None:
+                _ja_tokenizer = Dictionary().create()
+            morphemes = _ja_tokenizer.tokenize(text)
+        except Exception as e:
+            logger.warning(
+                f"[ja] sudachipy 分词失败，跳过英语→片假名预处理（文本中的英语单词"
+                f"送入 MFA 可能直接判定为 OOV）：{e}"
+            )
+            return text
+
+        pieces: List[str] = []
+        substitutions: List[Tuple[str, str]] = []
+        for m in morphemes:
+            surface = m.surface()
+            if self._is_english_word(surface):
+                try:
+                    reading = m.reading_form()
+                except Exception:
+                    reading = None
+                katakana = self._valid_katakana_reading(surface, reading)
+                if katakana:
+                    pieces.append(katakana)
+                    substitutions.append((surface, katakana))
+                    continue
+            pieces.append(surface)
+
+        if substitutions:
+            logger.info(
+                f"[ja] MFA 预处理：{len(substitutions)} 个英语单词已转换为片假名读音"
+                f"以便对齐：{substitutions}"
+            )
+
+        return "".join(pieces)
+
+    def _get_katakana_reading_for_word(self, word: str) -> Optional[str]:
+        """
+        单词级兜底：用 sudachipy 查询一个孤立英语单词（已在 Word Tier 里，
+        说明 _normalize_japanese_text_for_mfa() 没能在预处理阶段替换掉它，
+        或调用方根本没经过那一步，例如复用本类的替代对齐后端）的片假名读音。
+        """
+        global _ja_tokenizer
+        word = (word or "").strip()
+        if not word:
+            return None
+        try:
+            from sudachipy import Dictionary
+            if _ja_tokenizer is None:
+                _ja_tokenizer = Dictionary().create()
+            morphemes = _ja_tokenizer.tokenize(word)
+            reading = "".join((m.reading_form() or "") for m in morphemes)
+        except Exception as e:
+            logger.debug(f"[ja] sudachipy 片假名读音查询失败 '{word}': {e}")
+            return None
+        return self._valid_katakana_reading(word, reading)
+
+    def _distribute_katakana_mora_phones(
+        self,
+        word_start: int,
+        word_end: int,
+        moras: List[Tuple[str, str]],
+    ) -> List[Tuple[int, int, str]]:
+        """
+        把 katakana_to_romaji_moras() 给出的 (辅音, 元音) 二元组列表，展开成
+        build_ja_hiragana_lab() 能直接消费的单音素条目序列，并把该词已有的
+        时间跨度按音素个数等分。
+
+        日语各音素之间的时长差异远小于英语 ARPABET（不像英语有明显的长元音/
+        短辅音之分），等分是这里足够合理的近似；这是 MFA Phone Tier 完全没
+        有该词真实音素时的最后一道兜底——只要 sudachi 能给出片假名读音，就
+        能保证最终 LAB 至少是合理的平假名序列，而不是 ARPABET 乱码或被 '-'
+        吞掉。
+        """
+        flat: List[str] = []
+        for cons, vow in moras:
+            if cons:
+                flat.append(cons)
+            if vow:
+                flat.append(vow)
+
+        if not flat:
+            return []
+        if len(flat) == 1:
+            return [(word_start, word_end, flat[0])]
+
+        duration = word_end - word_start
+        n = len(flat)
+        result: List[Tuple[int, int, str]] = []
+        cursor = word_start
+        for i, p in enumerate(flat):
+            if i == n - 1:
+                seg_end = word_end
+            else:
+                seg_end = word_start + int(round(duration * (i + 1) / n))
+                seg_end = max(seg_end, cursor + 1)
+            result.append((cursor, seg_end, p))
+            cursor = seg_end
+
+        return result
 
     # =====================================================================
     # Phone 清洗
@@ -822,6 +972,27 @@ class MFAProcessor:
                 continue
 
             if self._is_english_word(mark):
+                # ① 首选：sudachi 片假名读音 → romaji 音素序列。
+                # 正常情况下文本已经在 process() 里被 _normalize_japanese_text_
+                # for_mfa() 预处理过，这里基本不会再遇到英语单词；会走到这条
+                # 分支通常是：(a) sudachi 在预处理阶段没认出这个词，或 (b) 调
+                # 用方是复用本类逻辑的替代对齐后端（WhisperX / Qwen3 等），从
+                # 未经过那一步预处理。两种情况都先再查一次片假名读音——只要
+                # sudachi 认得，就能展开成 build_ja_hiragana_lab() 能正确处理
+                # 的日语罗马音，而不是 ARPABET。
+                katakana = self._get_katakana_reading_for_word(mark)
+                if katakana:
+                    moras = katakana_to_romaji_moras(katakana)
+                    mora_entries = self._distribute_katakana_mora_phones(start, end, moras)
+                    if mora_entries:
+                        for s, e, p in mora_entries:
+                            lines.append(f"{s} {e} {p}")
+                        continue
+
+                # ② sudachi 也无法识别（生僻词/专有名词）：保留旧的 ARPABET
+                # 兜底，至少不丢时间轴；但明确告警——音素体系不是日语罗马音，
+                # build_ja_hiragana_lab() 无法正确转换，对应位置在最终 LAB
+                # 里可能变成 '-' 占位或被吞掉，建议检查该词。
                 entries = self._get_arpabet_entries(start, end, phone_items)
                 if entries:
                     for s, e, p in entries:
@@ -837,6 +1008,11 @@ class MFAProcessor:
                             "G2P 词典 / g2p_en 均未命中），按整词输出。"
                         )
                         lines.append(f"{start} {end} {mark.lower()}")
+                logger.warning(
+                    f"[ja] 英语词 '{mark}' sudachipy 未能给出片假名读音，已退回 "
+                    "ARPABET 兜底；由于音素体系不是日语罗马音，最终 LAB 中对应"
+                    "位置可能不是有效假名，建议检查该词是否为生僻外来语/专有名词。"
+                )
                 continue
 
             entries = self._get_romaji_entries(start, end, phone_items)
@@ -1326,7 +1502,10 @@ class MFAProcessor:
                 phoneme_text = text.strip()
             elif raw_lang in ("ja", "japanese", "jpn"):
                 lang = "ja"
-                text_for_mfa = text.strip()
+                # ★ 新增：送入 MFA 之前，把文本里的英语单词换成 sudachipy 给出
+                # 的片假名读音——japanese_mfa 词典不认识拉丁字母拼写，原样送
+                # 进去只会被判定为 OOV（spn），完全拿不到音素级对齐结果。
+                text_for_mfa = self._normalize_japanese_text_for_mfa(text.strip())
                 phoneme_text = text.strip()
             elif raw_lang in ("ko", "korean", "kor"):
                 lang = "ko"
