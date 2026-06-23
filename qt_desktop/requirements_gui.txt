@@ -1,7 +1,0 @@
-# requirements_gui.txt — GUI frontend dependencies
-# Install with: pip install -r requirements_gui.txt
-
-PySide6>=6.6.0
-qt-material>=2.14
-requests>=2.31.0
-orjson>=3.9.0
