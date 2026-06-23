@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import os
-import sys
-import time
-import subprocess
 import logging
+import os
+import subprocess
+import sys
 import threading
+import time
+from importlib.metadata import PackageNotFoundError, version as pkg_version
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -133,15 +134,30 @@ class MFAChecker:
     @staticmethod
     def check_mfa_installed() -> Tuple[bool, str]:
         """
-        先做轻量级 import 检查，再做版本检查。
-        任何一次版本探测超时，都不要直接把它判成“未安装”。
+        检查 MFA 是否可用，并尽量返回真实版本号。
+        优先读取安装元数据；如果失败，再尝试 CLI 版本命令。
+        任何一次探测成功，都返回实际版本字符串，而不是 installed。
         """
         py = MFAChecker.env_python()
 
+        def _normalize_version_text(text: str) -> str:
+            text = (text or "").strip()
+            if not text:
+                return ""
+            # 取最后一行，避免前面带欢迎信息/警告
+            return text.splitlines()[-1].strip()
+
         probes = [
-            # 轻量级：只确认包可导入
-            [str(py), "-c", "import montreal_forced_aligner as mfa; print(getattr(mfa, '__version__', 'installed'))"],
-            # 重一点：确认 CLI 版本
+            # 1) 先读包元数据里的版本号，最干净
+            [
+                str(py),
+                "-c",
+                (
+                    "from importlib.metadata import version; "
+                    "print(version('montreal-forced-aligner'))"
+                ),
+            ],
+            # 2) 再试 CLI
             [str(py), "-m", "montreal_forced_aligner.command_line.mfa", "version"],
         ]
 
@@ -153,15 +169,24 @@ class MFAChecker:
                     cmd,
                     capture_output=True,
                     text=True,
-                    timeout=120,   # 原来太短的话，Windows 下很容易误判
+                    timeout=120,
                 )
 
                 stdout = (result.stdout or "").strip()
                 stderr = (result.stderr or "").strip()
 
                 if result.returncode == 0:
-                    msg = stdout.splitlines()[-1] if stdout else "OK"
-                    return True, msg
+                    version_text = _normalize_version_text(stdout)
+                    if version_text:
+                        return True, version_text
+
+                    if stderr:
+                        # 有些环境版本号会被打到 stderr，顺手兼容一下
+                        version_text = _normalize_version_text(stderr)
+                        if version_text:
+                            return True, version_text
+
+                    return True, "unknown"
 
                 last_msg = stderr or stdout or f"returncode={result.returncode}"
 

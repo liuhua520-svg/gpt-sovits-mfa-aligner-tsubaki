@@ -848,6 +848,7 @@ class MFAProcessor:
             if mark in self.SIL_PHONES or mark in ("sp", "spn"):
                 lines.append(f"{start} {end} sil")
                 continue
+               
 
             if self._is_english_word(mark):
                 entries = self._get_arpabet_entries(start, end, phone_items)
@@ -971,7 +972,17 @@ class MFAProcessor:
             if mark in self.SIL_PHONES or mark in ("sp", "spn"):
                 lines.append(f"{start} {end} sil")
                 continue
-
+                
+            # 纯日文假名直通，避免 しゅ 这类拗音被后面的英语/兜底逻辑吞掉
+            if re.fullmatch(r"[\u3040-\u309F\u30A0-\u30FFー]+", mark):
+                katakana = hiragana_to_katakana(mark)
+                moras = katakana_to_romaji_moras(katakana)
+                mora_entries = self._distribute_katakana_mora_phones(start, end, moras)
+                if mora_entries:
+                    for s, e, p in mora_entries:
+                        lines.append(f"{s} {e} {p}")
+                    continue
+                
             if self._is_english_word(mark):
                 # ① 首选：sudachi 片假名读音 → romaji 音素序列。
                 # 正常情况下文本已经在 process() 里被 _normalize_japanese_text_
