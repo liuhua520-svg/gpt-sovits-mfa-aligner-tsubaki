@@ -359,11 +359,11 @@
                       <span>Harvest (精确)</span>
                       <el-icon class="icon-tip"><InfoFilled /></el-icon>
                     </el-radio>
-                    <el-radio label="crepe" :disabled="systemStatus.audio_processing?.f0_backends?.crepe?.available === false">
+                    <el-radio label="crepe" :disabled="(!advancedConfig.export_pitch_line && !advancedConfig.auto_note_pitch) || systemStatus.audio_processing?.f0_backends?.crepe?.available === false">
                       <span>CREPE (神经网络，抗噪)</span>
                       <el-icon class="icon-tip"><InfoFilled /></el-icon>
                     </el-radio>
-                    <el-radio label="rmvpe" :disabled="systemStatus.audio_processing?.f0_backends?.rmvpe?.available === false">
+                    <el-radio label="rmvpe" :disabled="(!advancedConfig.export_pitch_line && !advancedConfig.auto_note_pitch) || systemStatus.audio_processing?.f0_backends?.rmvpe?.available === false">
                       <span>RMVPE (深度模型，最鲁棒)</span>
                       <el-icon class="icon-tip"><InfoFilled /></el-icon>
                     </el-radio>
