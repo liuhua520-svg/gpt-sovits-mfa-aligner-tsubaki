@@ -33,6 +33,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+mfa_is_running = False
+
 BASE_DIR = Path(__file__).resolve().parent
 FRONTEND_DIST = (BASE_DIR.parent / "frontend" / "dist").resolve()
 WORK_DIR = (BASE_DIR / "work").resolve()
@@ -201,6 +203,33 @@ def aligner_status():
         logger.error(f"查询对齐器状态失败: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
 
+@app.route("/api/align", methods=["POST"]) # 请替换为你实际的对齐接口路由
+def align_audio():
+    global mfa_is_running # 必须声明 global 才能修改这个全局变量
+    
+    # 1. 检查锁状态
+    if mfa_is_running:
+        return jsonify({
+            "success": False, 
+            "error": "上一个对齐任务正在运行中，请勿重复提交或频繁刷新页面！"
+        }), 429
+        
+    try:
+        # 2. 上锁
+        mfa_is_running = True
+        logger.info("MFA 对齐任务开始执行，全局锁已启用。")
+        
+        # 3. 这里执行你原本的对齐逻辑
+        # ... 原来的 pipeline 运行代码 ...
+        
+        return jsonify({"success": True})
+    except Exception as e:
+        logger.error(f"对齐失败: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        # 4. 无论成功还是失败，最终一定要释放锁
+        mfa_is_running = False
+        logger.info("MFA 对齐任务结束，全局锁已释放。")
 
 @app.route("/api/pipeline/job/<job_id>", methods=["GET"])
 def pipeline_job_status(job_id):

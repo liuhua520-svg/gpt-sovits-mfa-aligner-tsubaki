@@ -2010,6 +2010,17 @@ class Qwen3ASRAligner(AltAlignerBase):
             final_text = transcribed or (text.strip() if text else "")
             if not transcribed and text:
                 logger.warning("[Qwen3-ASR] 未返回转录文本，回退使用外部 text 进行后处理")
+
+            # 【全局事后偏移校正 —— ASR 侧】
+            # Qwen3-ASR 内部使用与独立 Qwen3-ForcedAligner 相同的对齐器
+            # (qwen3_server.py 在 from_pretrained 时传入 forced_aligner=
+            # FORCED_ALIGNER_ID)，因此输出的音节起始时间同样存在系统性偏早
+            # 约 60 ms 的现象。这里复用 _apply_qwen3_fa_onset_delay()，
+            # 传入独立常量 QWEN3_ASR_ONSET_DELAY_SEC，把每个 entry 的起始
+            # 时间统一向后推，时长保持不变。安全约束（不重叠、不为负、时长兜底）
+            # 同 ForcedAligner 侧，详见 _apply_qwen3_fa_onset_delay() 注释。
+            entries = _apply_qwen3_fa_onset_delay(entries, delay_sec=QWEN3_ASR_ONSET_DELAY_SEC)
+
             # 【修复说明】Qwen3-ASR 不为标点输出时间戳，句末/句中停顿只能
             # 体现为相邻字符之间天然的时间间隙。之前这里传 fill_silences=False，
             # 导致这些天然间隙跟 WhisperX 旧版本一样只是数值上的空隙，没有
@@ -2062,6 +2073,14 @@ class Qwen3ASRAligner(AltAlignerBase):
 
 # 全局偏移量（秒）。基于实测中位数 -0.061s 取整，便于后续按实际素材微调。
 QWEN3_FA_ONSET_DELAY_SEC: float = 0.06
+
+# Qwen3-ASR 端：与 ForcedAligner 相同的系统性起始偏早问题。
+# ASR 的时间戳由 Qwen3-ForcedAligner-0.6B 内嵌对齐器产生（qwen3_server.py
+# 在加载 Qwen3ASRModel 时统一启用了 forced_aligner=FORCED_ALIGNER_ID），
+# 因此表现出与独立 ForcedAligner 几乎一致的 "onset 偏早" 特性。
+# 这里单独提取为可独立调节的常量，与 FA 常量保持相同初始值；
+# 若后续实测 ASR 侧偏移量与 FA 侧有明显差异，可在不影响 FA 的前提下单独修改。
+QWEN3_ASR_ONSET_DELAY_SEC: float = 0.06
 
 # 校正后允许的最短音节时长（秒），避免极端情况下时长被压成 0 或负数。
 _QWEN3_FA_MIN_SYL_DUR_SEC: float = 0.02

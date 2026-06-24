@@ -156,6 +156,52 @@ def _resample(x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
 # CREPE (torchcrepe)
 # ---------------------------------------------------------------------------
 
+def _run_crepe_on_device(
+    x: np.ndarray,
+    sr: int,
+    hop_length: int,
+    fmin: float,
+    fmax: float,
+    model_size: str,
+    batch_size: int,
+    device: str,
+    periodicity_threshold: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    在指定 device 上执行 torchcrepe 推理，返回 (f0, t)。
+    调用方负责捕获 CUDA 相关异常并回退 CPU。
+    """
+    import torch
+    import torchcrepe
+
+    audio_tensor = torch.from_numpy(x).unsqueeze(0).to(device)
+
+    pitch, periodicity = torchcrepe.predict(
+        audio_tensor,
+        sr,
+        hop_length,
+        fmin=fmin,
+        fmax=fmax,
+        model=model_size,
+        batch_size=batch_size,
+        device=device,
+        return_periodicity=True,
+        pad=True,
+    )
+
+    # 周期性中值滤波 + 音高均值滤波，抑制抖动
+    periodicity = torchcrepe.filter.median(periodicity, 3)
+    pitch = torchcrepe.filter.mean(pitch, 3)
+
+    # 低置信度帧标记为未发声 (NaN → 之后转为 0)
+    pitch = torchcrepe.threshold.At(periodicity_threshold)(pitch, periodicity)
+
+    f0 = pitch.squeeze(0).detach().cpu().numpy().astype(np.float64)
+    n_frames = f0.shape[0]
+    t = np.arange(n_frames, dtype=np.float64) * (hop_length / float(sr))
+    return f0, t
+
+
 def extract_f0_crepe(
     audio: np.ndarray,
     sr: int,
@@ -182,7 +228,6 @@ def extract_f0_crepe(
     Returns:
         (f0_hz, t_sec): 未发声帧 f0 = 0.0
     """
-    import torch
     import torchcrepe
 
     if not torchcrepe_available():
@@ -195,38 +240,30 @@ def extract_f0_crepe(
         x = np.mean(x, axis=1)
 
     hop_length = max(1, int(round(sr * frame_period_ms / 1000.0)))
-
-    audio_tensor = torch.from_numpy(x).unsqueeze(0).to(device)
-
     fmin = max(float(f0_floor), 1.0)
     fmax = min(float(f0_ceil), float(torchcrepe.MAX_FMAX))
 
-    pitch, periodicity = torchcrepe.predict(
-        audio_tensor,
-        sr,
-        hop_length,
-        fmin=fmin,
-        fmax=fmax,
-        model=model_size,
-        batch_size=batch_size,
-        device=device,
-        return_periodicity=True,
-        pad=True,
-    )
+    try:
+        f0, t = _run_crepe_on_device(
+            x, sr, hop_length, fmin, fmax,
+            model_size, batch_size, device, periodicity_threshold,
+        )
+    except (AssertionError, RuntimeError) as e:
+        # Torch 未编译 CUDA 支持 / 显卡初始化失败 → 自动回退到 CPU
+        if device != "cpu" and ("CUDA" in str(e) or "cuda" in str(e)):
+            logger.warning(
+                f"CREPE CUDA 初始化失败，自动回退到 CPU: {e}"
+            )
+            device = "cpu"
+            f0, t = _run_crepe_on_device(
+                x, sr, hop_length, fmin, fmax,
+                model_size, batch_size, device, periodicity_threshold,
+            )
+        else:
+            raise
 
-    # 周期性中值滤波 + 音高均值滤波，抑制抖动
-    periodicity = torchcrepe.filter.median(periodicity, 3)
-    pitch = torchcrepe.filter.mean(pitch, 3)
-
-    # 低置信度帧标记为未发声 (NaN -> 之后转为 0)
-    pitch = torchcrepe.threshold.At(periodicity_threshold)(pitch, periodicity)
-
-    f0 = pitch.squeeze(0).detach().cpu().numpy().astype(np.float64)
     f0 = np.nan_to_num(f0, nan=0.0, posinf=0.0, neginf=0.0)
     f0[(f0 > 0) & ((f0 < f0_floor * 0.5) | (f0 > f0_ceil * 1.2))] = 0.0
-
-    n_frames = f0.shape[0]
-    t = np.arange(n_frames, dtype=np.float64) * (hop_length / float(sr))
 
     return f0, t
 
