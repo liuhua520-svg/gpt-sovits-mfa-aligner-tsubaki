@@ -1,0 +1,8 @@
+# requirements_gui.txt — Qt Quick GUI frontend dependencies
+# Install with: pip install -r requirements_gui.txt
+#
+# Qt Quick replaces qt-material; the Material style ships with PySide6.
+
+PySide6>=6.6.0
+requests>=2.31.0
+orjson>=3.9.0
