@@ -37,12 +37,14 @@ See the repository `LICENSE` file for the full text of the MIT License.
 - mido
 - textgrid
 
-#### BSD 3-Clause / BSD-style
+#### BSD 3-Clause
 - Flask
-- soundfile
 - numpy
 - torch
 - torchaudio
+
+#### BSD 2-Clause
+- soundfile
 
 #### Apache License 2.0
 - sudachipy
