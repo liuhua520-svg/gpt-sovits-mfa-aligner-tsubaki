@@ -140,6 +140,36 @@
           </div>
         </el-form-item>
 
+        <!-- WhisperX 模型选择 -->
+        <el-form-item
+          v-if="processingMode !== 'project-only' && alignerBackend === 'whisperx'"
+          label="Whisper 模型"
+        >
+          <el-select v-model="advancedConfig.whisperx_model" style="width:240px">
+            <el-option value="large-v3"       label="large-v3（默认，最强多语言）" />
+            <el-option value="large-v3-turbo" label="large-v3-turbo（快速版 v3）" />
+            <el-option value="large-v2"       label="large-v2（上一代）" />
+            <el-option value="medium"         label="medium（中等）" />
+            <el-option value="small"          label="small（轻量）" />
+            <el-option value="base"           label="base（极轻）" />
+            <el-option value="tiny"           label="tiny（最轻，精度最低）" />
+          </el-select>
+          <div class="help-text" style="margin-top:6px">
+            <small v-if="advancedConfig.whisperx_model === 'large-v3'">
+              🌟 <strong>large-v3</strong>：最新 Whisper 大模型，多语言识别精度最优，推荐用于中日韩语歌声对齐。首次使用将自动下载约 3 GB 权重。
+            </small>
+            <small v-else-if="advancedConfig.whisperx_model === 'large-v3-turbo'">
+              ⚡ <strong>large-v3-turbo</strong>：v3 的蒸馏加速版，速度约为 v3 的 3×，精度略低。适合显存不足或需快速出结果的场景。
+            </small>
+            <small v-else-if="advancedConfig.whisperx_model === 'large-v2'">
+              🔵 <strong>large-v2</strong>：上一代大模型，稳定可靠。若 large-v3 遇到兼容性问题可回退至此。
+            </small>
+            <small v-else>
+              ⚠️ 小模型（medium/small/base/tiny）速度快但识别精度明显下降，仅建议在快速测试或硬件严格受限时使用。
+            </small>
+          </div>
+        </el-form-item>
+
 		<!-- LAB / MIDI 单文件上传（仅 project-only 模式） -->
 		<el-form-item v-if="processingMode === 'project-only'" label="LAB / MIDI 文件">
 		  <el-upload
@@ -213,6 +243,17 @@
             <el-option label="韩语 🇰🇷" value="kor" />
             <el-option label="粤语 🇭🇰" value="yue" />
           </el-select>
+        </el-form-item>
+
+        <!-- 英语单词级对齐：仅当语言非日语时显示 -->
+        <el-form-item
+          v-if="processingMode !== 'project-only' && formData.language !== 'jpn'"
+          label="英语单词级对齐"
+        >
+          <el-switch v-model="englishWordAlign" />
+          <span class="option-hint">
+            开启后，混合文本中的英语单词直接输出（如&nbsp;<code>hello</code>），不转换为 ARPABET 音素（<code>hh&nbsp;ax&nbsp;l&nbsp;ow</code>）
+          </span>
         </el-form-item>
 
         <el-form-item label="处理模式">
@@ -553,6 +594,7 @@
                     <li v-if="result.config.f0_method === 'crepe'">CREPE 模型: {{ result.config.crepe_model }}</li>
                     <li v-if="result.config.f0_method === 'crepe' || result.config.f0_method === 'rmvpe'">运行设备: {{ result.config.f0_device }}</li>
                     <li v-if="result.config.aligner_device !== undefined">对齐设备: {{ result.config.aligner_device }}</li>
+                    <li v-if="result.whisperxModel">Whisper 模型: {{ result.whisperxModel }}</li>
                     <li>精度: {{ result.config.use_double_precision ? '双精度 (Float64)' : '单精度 (Float32)' }}</li>
                   </ul>
                 </el-col>
@@ -750,6 +792,7 @@ interface AdvancedConfig {
   f0_method: 'dio' | 'harvest' | 'crepe' | 'rmvpe'
   f0_device: 'auto' | 'cpu' | 'cuda'
   aligner_device: 'auto' | 'cpu' | 'cuda'  // WhisperX / Qwen3 对齐工具运行设备
+  whisperx_model: string                    // WhisperX Whisper 模型选择
   crepe_model: 'full' | 'tiny'
   precision: 'single' | 'double'
   f0_smooth: boolean
@@ -788,6 +831,7 @@ interface SystemStatus {
 
 // 核心表单与模式状态（合并唯一声明）
 const processingMode = ref<ProcessingMode>('mfa-only')
+const englishWordAlign = ref<boolean>(false)  // 英语单词级对齐（不做 ARPABET 音素拆分）
 const alignerBackend = ref<string>('mfa')   // 对齐后端选择
 const alignerStatus = ref<Record<string, any>>({
   whisperx:      { available: false, message: '检查中...' },
@@ -814,6 +858,7 @@ const advancedConfig = ref<AdvancedConfig>({
   f0_method: 'dio',
   f0_device: 'auto',
   aligner_device: 'auto',
+  whisperx_model: 'large-v3',
   crepe_model: 'full',
   precision: 'double',
   f0_smooth: true,
@@ -1027,6 +1072,7 @@ const normalizeResult = (payload: any) => {
     projectPath,
     projectFormat: payload?.project_format || payload?.projectFormat || formData.value.outputFormat,
     segments: payload?.segments || 0,
+    whisperxModel: alignerBackend.value === 'whisperx' ? advancedConfig.value.whisperx_model : undefined,
     config: payload?.config || {
       bpm: advancedConfig.value.bpm,
       base_pitch: advancedConfig.value.base_pitch,
@@ -1326,6 +1372,8 @@ if (processingMode.value === 'project-only') {
     formDataObj.append('language', formData.value.language)
     formDataObj.append('aligner_backend', alignerBackend.value)
     formDataObj.append('aligner_device', advancedConfig.value.aligner_device)
+    formDataObj.append('whisperx_model', advancedConfig.value.whisperx_model)
+    formDataObj.append('english_word_align', (englishWordAlign.value && formData.value.language !== 'jpn').toString())
 
     if (processingMode.value === 'full') {
       formDataObj.append('format', formData.value.outputFormat)
@@ -1576,6 +1624,21 @@ const newProcess = () => {
   color: #909399;
   font-size: 12px;
   margin-top: 6px;
+}
+
+.option-hint {
+  margin-left: 10px;
+  color: #909399;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.option-hint code {
+  background: #f0f0f0;
+  border-radius: 3px;
+  padding: 0 3px;
+  font-family: monospace;
+  color: #476582;
 }
 
 .pitch-input-group {
