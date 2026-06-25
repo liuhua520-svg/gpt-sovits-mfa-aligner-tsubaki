@@ -1,49 +1,74 @@
 <template>
-  <div class="app-container">
-    <!-- 头部 -->
-    <el-header class="app-header">
-      <div class="header-content">
-        <div class="header-left">
-          <h1>歌声合成 Lab 标注工具 - SVS Lab Aligner</h1>
-          <p class="subtitle">MFA自动标注 + 音高提取 + 工程文件生成</p>
+  <el-config-provider :locale="elementPlusLocale">
+    <div class="app-container">
+      <!-- 头部 -->
+      <el-header class="app-header">
+        <div class="header-content">
+          <div class="header-left">
+            <h1>{{ t('app.title') }}</h1>
+            <p class="subtitle">{{ t('app.subtitle') }}</p>
+          </div>
+          <div class="header-right">
+            <el-select v-model="localeModel" size="small" style="width: 120px">
+              <el-option label="简体中文" value="zh-CN" />
+			  <el-option label="繁體中文" value="zh-TW" />
+              <el-option label="English" value="en" />
+			  <el-option label="日本語" value="ja" />
+              <el-option label="한국어" value="ko" />
+            </el-select>
+            <el-tooltip :content="t('app.systemStatus')" placement="bottom">
+              <el-tag v-if="systemReady" type="success" size="large">✓ {{ t('app.ready') }}</el-tag>
+              <el-tag v-else type="danger" size="large">⚠️ {{ t('app.needConfig') }}</el-tag>
+            </el-tooltip>
+          </div>
         </div>
-        <div class="header-right">
-          <el-tooltip content="系统状态" placement="bottom">
-            <el-tag v-if="systemReady" type="success" size="large">✓ 系统就绪</el-tag>
-            <el-tag v-else type="danger" size="large">⚠️ 需要配置</el-tag>
-          </el-tooltip>
+      </el-header>
+
+      <!-- 主体 -->
+      <el-main class="app-main">
+        <AudioProcessor @status-changed="onSystemStatusChanged" />
+      </el-main>
+
+      <!-- 页脚 -->
+      <el-footer class="app-footer">
+        <div class="footer-content">
+          <p>{{ t('app.footer') }}</p>
+          <p>
+            <a href="https://github.com/liuhua520-svg/SVS-Lab-Aligner" target="_blank">
+              📚 GitHub
+            </a>
+            |
+            <a href="https://github.com/liuhua520-svg/SVS-Lab-Aligner/issues" target="_blank">
+              🐛 Issue
+            </a>
+          </p>
         </div>
-      </div>
-    </el-header>
-
-    <!-- 主体 -->
-    <el-main class="app-main">
-      <AudioProcessor @status-changed="onSystemStatusChanged" />
-    </el-main>
-
-    <!-- 页脚 -->
-    <el-footer class="app-footer">
-      <div class="footer-content">
-        <p>SVS Lab Aligner • Built with PyWORLD + MFA + Vue3</p>
-        <p>
-          <a href="https://github.com/liuhua520-svg/SVS-Lab-Aligner" target="_blank">
-            📚 GitHub
-          </a>
-          |
-          <a href="https://github.com/liuhua520-svg/SVS-Lab-Aligner/issues" target="_blank">
-            🐛 Issue
-          </a>
-        </p>
-      </div>
-    </el-footer>
-  </div>
+      </el-footer>
+    </div>
+  </el-config-provider>
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import AudioProcessor from './components/MFAProcessor.vue'
+import { getElementPlusLocale, useAppLocale } from './i18n'
+import { useI18n } from 'vue-i18n'
 
 const systemReady = ref(false)
+const { t, currentLocale, setLocale } = useAppLocale()
+const { locale } = useI18n()
+
+const localeModel = computed({
+  get: () => currentLocale.value,
+  set: (value) => setLocale(value),
+})
+
+watch(locale, (value) => {
+  document.documentElement.lang = value
+  localStorage.setItem('app-locale', value)
+})
+
+const elementPlusLocale = computed(() => getElementPlusLocale(currentLocale.value))
 
 // 【修复】右上角"系统就绪"标签不再自己单独 fetch 一次 /api/pipeline/status。
 // 子组件 MFAProcessor 在 onMounted 时已经会做一次完整的状态检查

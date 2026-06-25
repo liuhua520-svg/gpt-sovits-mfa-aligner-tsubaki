@@ -3,28 +3,28 @@
     <el-card class="processor-card" shadow="hover">
       <template #header>
         <div class="card-header">
-          <span class="card-title">📁 单文件处理</span>
+          <span class="card-title">📁 {{ t('processor.cardTitle') }}</span>
           <div class="header-actions">
-            <el-tooltip content="访问GitHub项目" placement="bottom">
+            <el-tooltip :content="t('processor.githubTooltip')" placement="bottom">
               <el-button 
                 link 
                 @click="openGitHub"
                 type="primary"
               >
-                🔗 GitHub 项目链接
+                🔗 {{ t('processor.githubLink') }}
               </el-button>
             </el-tooltip>
-            <el-tooltip content="检查状态" placement="bottom">
+            <el-tooltip :content="t('processor.checkStatus')" placement="bottom">
               <el-button link @click="refreshStatus" :loading="checkingStatus">
-                🔄 检查状态
+                🔄 {{ t('processor.checkStatus') }}
               </el-button>
             </el-tooltip>
           </div>
         </div>
       </template>
 
-      <el-form :model="formData" label-width="100px">
-        <el-form-item label="音频文件">
+      <el-form :model="formData" label-position="top" class="processor-form">
+        <el-form-item :label="t('processor.audioFile')">
           <el-upload
             drag
             action="#"
@@ -36,11 +36,11 @@
           >
             <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
             <div class="el-upload__text">
-              拖拽或<em>点击选择</em>音频文件
+              {{ t('processor.dragAudio') }}
             </div>
             <template #tip>
               <div class="el-upload__tip">
-                支持 WAV / MP3 / FLAC / M4A / AAC，最大 512MB
+                {{ t('processor.supportedAudio') }}
               </div>
             </template>
           </el-upload>
@@ -50,65 +50,63 @@
         </el-form-item>
 
         <!-- 对齐后端选择器（project-only 模式不需要对齐） -->
-        <el-form-item v-if="processingMode !== 'project-only'" label="对齐后端">
+        <el-form-item v-if="processingMode !== 'project-only'" :label="t('processor.backendLabel')">
           <el-radio-group v-model="alignerBackend">
             <el-radio value="mfa">
-              <span>MFA</span>
+              <span>{{ t('processor.backendMfa') }}</span>
               <el-tag
                 :type="systemStatus.mfa?.installed ? 'success' : 'danger'"
                 size="small" style="margin-left:4px"
               >{{ systemStatus.mfa?.installed ? '✓' : '✗' }}</el-tag>
             </el-radio>
             <el-radio value="whisperx">
-              <span>WhisperX</span>
+              <span>{{ t('processor.backendWhisperx') }}</span>
               <el-tag
                 :type="alignerStatus['whisperx']?.available ? 'success' : 'info'"
                 size="small" style="margin-left:4px"
-              >{{ alignerStatus['whisperx']?.available ? '✓' : '需安装' }}</el-tag>
+              >{{ alignerStatus['whisperx']?.available ? '✓' : t('processor.backendStatusNeedInstall') }}</el-tag>
             </el-radio>
             <el-radio value="qwen3_asr">
-              <span>Qwen3-ASR</span>
+              <span>{{ t('processor.backendQwen3Asr') }}</span>
               <el-tag
                 :type="alignerStatus['qwen3_asr']?.available ? 'success' : 'info'"
                 size="small" style="margin-left:4px"
-              >{{ alignerStatus['qwen3_asr']?.available ? '✓' : '需安装' }}</el-tag>
+              >{{ alignerStatus['qwen3_asr']?.available ? '✓' : t('processor.backendStatusNeedInstall') }}</el-tag>
             </el-radio>
             <el-radio value="qwen3_aligner">
-              <span>Qwen3-FA</span>
+              <span>{{ t('processor.backendQwen3Aligner') }}</span>
               <el-tag
                 :type="alignerStatus['qwen3_aligner']?.available ? 'success' : 'info'"
                 size="small" style="margin-left:4px"
-              >{{ alignerStatus['qwen3_aligner']?.available ? '✓' : '需安装' }}</el-tag>
+              >{{ alignerStatus['qwen3_aligner']?.available ? '✓' : t('processor.backendStatusNeedInstall') }}</el-tag>
             </el-radio>
           </el-radio-group>
           <div class="help-text" style="margin-top:6px">
             <small v-if="alignerBackend === 'mfa'">
-              🎯 <strong>MFA</strong>：基于 Kaldi 的音素级强制对齐，精度高但需要提前安装 MFA 及语言模型。<em>需要参考文本。</em>
+              🎯 {{ t('processor.backendMfaHelp') }}
             </small>
             <small v-else-if="alignerBackend === 'whisperx'">
-              🤖 <strong>WhisperX</strong>：Whisper ASR + wav2vec2 强制对齐，无需预先安装语言模型，支持字符级时间戳。
-              对结构化文本（编号/列表/标题）会自动做口语化预处理以提升对齐成功率。
-              <em>文本可选（留空则自动转录）。</em>
+              🤖 {{ t('processor.backendWhisperxHelp') }}
             </small>
             <small v-else-if="alignerBackend === 'qwen3_asr'">
-              🌐 <strong>Qwen3-ASR-1.7B</strong>：对中文多口音更鲁棒。<em>文本可选。</em>
+              🌐 {{ t('processor.backendQwen3AsrHelp') }}
             </small>
             <small v-else-if="alignerBackend === 'qwen3_aligner'">
-              📌 <strong>Qwen3-ForcedAligner-0.6B</strong>：轻量级神经网络强制对齐，专为歌声设计。<em>需要参考文本。</em>
+              📌 {{ t('processor.backendQwen3AlignerHelp') }}
             </small>
             <div v-if="alignerBackend !== 'mfa' && alignerStatus.models_dir"
                  style="margin-top:4px;color:#67c23a;font-size:12px">
-              📁 模型缓存目录：<code>{{ alignerStatus.models_dir }}</code>
+              📁 {{ t('processor.modelCacheDir') }}：<code>{{ alignerStatus.models_dir }}</code>
             </div>
           </div>
           <el-alert
             v-if="alignerBackend !== 'mfa' && !alignerStatus[alignerBackend]?.available"
             type="warning" :closable="false" show-icon style="margin-top:8px"
           >
-            <template #title>{{ alignerStatus[alignerBackend]?.message || '请安装对应依赖' }}</template>
+            <template #title>{{ alignerStatus[alignerBackend]?.message || t('processor.backendInstallHint') }}</template>
             <div style="font-size:12px;margin-top:4px">
-              <span v-if="alignerBackend === 'whisperx'">pip install whisperx</span>
-              <span v-else>pip install transformers torch torchaudio accelerate</span>
+              <span v-if="alignerBackend === 'whisperx'">{{ t('processor.packageHintWhisperx') }}</span>
+              <span v-else>{{ t('processor.packageHintTransformers') }} torchaudio accelerate</span>
             </div>
           </el-alert>
         </el-form-item>
@@ -116,26 +114,25 @@
         <!-- 对齐工具运行设备（仅非 MFA 后端显示） -->
         <el-form-item
           v-if="processingMode !== 'project-only' && alignerBackend !== 'mfa'"
-          label="对齐运行设备"
+          :label="t('processor.alignDevice')"
         >
           <el-radio-group v-model="advancedConfig.aligner_device">
-            <el-radio label="auto">自动 (优先 GPU)</el-radio>
-            <el-radio label="cpu">CPU</el-radio>
-            <el-radio label="cuda">CUDA (GPU)</el-radio>
+            <el-radio label="auto">{{ t('processor.deviceAuto') }}</el-radio>
+            <el-radio label="cpu">{{ t('processor.deviceCpu') }}</el-radio>
+            <el-radio label="cuda">{{ t('processor.deviceCuda') }}</el-radio>
           </el-radio-group>
           <div class="help-text" style="margin-top:6px">
             <small v-if="advancedConfig.aligner_device === 'cuda' && alignerBackend === 'whisperx'">
-              💡 <strong>WhisperX (GPU)：</strong>精度根据 GPU 能力自动调整：
-              Turing/RTX 20xx+ → float16，Pascal/旧卡 → int8（已内置自动降级，无需手动配置）。
+              💡 {{ t('processor.deviceWhisperxGpu') }}
             </small>
             <small v-else-if="advancedConfig.aligner_device === 'cuda' && alignerBackend.startsWith('qwen3')">
-              💡 <strong>Qwen3 (GPU)：</strong>Ampere/RTX 30xx+ 使用 bfloat16；Pascal/Volta/Turing 使用 float16；CPU 使用 float32。
+              💡 {{ t('processor.deviceQwen3Gpu') }}
             </small>
             <small v-else-if="advancedConfig.aligner_device === 'cpu'">
-              ⚠️ CPU 模式下速度较慢，建议仅在无 GPU 或显存不足时选择。
+              ⚠️ {{ t('processor.deviceCpuHelp') }}
             </small>
             <small v-else>
-              自动检测：有 CUDA 设备则优先使用 GPU，精度根据显卡架构自动选择。
+              {{ t('processor.deviceAutoHelp') }}
             </small>
           </div>
         </el-form-item>
@@ -143,35 +140,35 @@
         <!-- WhisperX 模型选择 -->
         <el-form-item
           v-if="processingMode !== 'project-only' && alignerBackend === 'whisperx'"
-          label="Whisper 模型"
+          :label="t('processor.whisperModel')"
         >
           <el-select v-model="advancedConfig.whisperx_model" style="width:240px">
-            <el-option value="large-v3"       label="large-v3（默认，最强多语言）" />
-            <el-option value="large-v3-turbo" label="large-v3-turbo（快速版 v3）" />
-            <el-option value="large-v2"       label="large-v2（上一代）" />
-            <el-option value="medium"         label="medium（中等）" />
-            <el-option value="small"          label="small（轻量）" />
-            <el-option value="base"           label="base（极轻）" />
-            <el-option value="tiny"           label="tiny（最轻，精度最低）" />
+            <el-option value="large-v3"       :label="t('processor.whisperModelLargeV3')" />
+            <el-option value="large-v3-turbo" :label="t('processor.whisperModelLargeV3Turbo')" />
+            <el-option value="large-v2"       :label="t('processor.whisperModelLargeV2')" />
+            <el-option value="medium"         :label="t('processor.whisperModelMedium')" />
+            <el-option value="small"          :label="t('processor.whisperModelSmall')" />
+            <el-option value="base"           :label="t('processor.whisperModelBase')" />
+            <el-option value="tiny"           :label="t('processor.whisperModelTiny')" />
           </el-select>
           <div class="help-text" style="margin-top:6px">
             <small v-if="advancedConfig.whisperx_model === 'large-v3'">
-              🌟 <strong>large-v3</strong>：最新 Whisper 大模型，多语言识别精度最优，推荐用于中日韩语歌声对齐。首次使用将自动下载约 3 GB 权重。
+              🌟 {{ t('processor.whisperDescLargeV3') }}
             </small>
             <small v-else-if="advancedConfig.whisperx_model === 'large-v3-turbo'">
-              ⚡ <strong>large-v3-turbo</strong>：v3 的蒸馏加速版，速度约为 v3 的 3×，精度略低。适合显存不足或需快速出结果的场景。
+              ⚡ {{ t('processor.whisperDescLargeV3Turbo') }}
             </small>
             <small v-else-if="advancedConfig.whisperx_model === 'large-v2'">
-              🔵 <strong>large-v2</strong>：上一代大模型，稳定可靠。若 large-v3 遇到兼容性问题可回退至此。
+              🔵 {{ t('processor.whisperDescLargeV2') }}
             </small>
             <small v-else>
-              ⚠️ 小模型（medium/small/base/tiny）速度快但识别精度明显下降，仅建议在快速测试或硬件严格受限时使用。
+              ⚠️ {{ t('processor.whisperDescSmall') }}
             </small>
           </div>
         </el-form-item>
 
 		<!-- LAB / MIDI 单文件上传（仅 project-only 模式） -->
-		<el-form-item v-if="processingMode === 'project-only'" label="LAB / MIDI 文件">
+		<el-form-item v-if="processingMode === 'project-only'" :label="t('processor.labMidiFile')">
 		  <el-upload
 			:key="labMidiUploadKey"
 			drag
@@ -184,14 +181,11 @@
 		  >
 			<el-icon class="el-icon--upload"><UploadFilled /></el-icon>
 			<div class="el-upload__text">
-			  拖拽或<em>点击选择</em>一个文件（LAB 或 MIDI）
+			  {{ t('processor.dragLabMidi') }}
 			</div>
 			<template #tip>
 			  <div class="el-upload__tip">
-				只允许导入一个文件：
-				<strong>.lab</strong> 音素标注
-				或
-				<strong>.mid / .midi</strong> MIDI 音符 / BPM 来源
+				{{ t('processor.labMidiTip') }}
 			  </div>
 			</template>
 		  </el-upload>
@@ -211,118 +205,128 @@
 			show-icon
 			style="margin-top:8px"
 		  >
-			<template #title>已导入 MIDI — 以下选项已由 MIDI 数据接管</template>
+			<template #title>{{ t('processor.midiImportedTitle') }}</template>
 			<p style="margin:4px 0 0;font-size:12px;color:#606266">
-			  🔒 自动音符音高 &nbsp;·&nbsp; BPM &nbsp;·&nbsp; 基准音高 (MIDI Note)
-			  <br>将直接从 MIDI 文件中读取，手动调整已被禁用
+			  🔒 {{ t('processor.midiImportedTip') }}
 			</p>
 		  </el-alert>
 		</el-form-item>
 
-        <el-form-item v-if="processingMode !== 'project-only'" label="输入文本">
-          <el-input
-            v-model="formData.text"
-            type="textarea"
-            :rows="4"
-            :placeholder="isTextOptional ? '（可选）留空则自动转录，或粘贴参考文本提升精度' : '粘贴文本内容'"
-            show-word-limit
-          />
-          <div class="help-text">
-            <span v-if="isTextOptional" style="color:#67c23a">
-              ✓ 支持纯 ASR 模式，文本留空也可处理 当前字符数：{{ formData.text.length }}
-            </span>
-            <span v-else>当前字符数：{{ formData.text.length }}</span>
-          </div>
-        </el-form-item>
+		<el-form-item
+		  v-if="processingMode !== 'project-only'"
+		  :label="t('processor.inputText')"
+		>
+		  <el-input
+			v-model="formData.text"
+			type="textarea"
+			:rows="4"
+			style="width: 100%"
+			:placeholder="
+			  isTextOptional
+				? t('processor.textPlaceholderOptional')
+				: t('processor.textPlaceholderRequired')
+			"
+		  />
+		  
+		  <div class="help-text" style="margin-top: 6px; font-size: 12px; color: #909399; line-height: 1.4; width: 100%;">
+			<span v-if="isTextOptional" style="color: #67c23a; font-weight: 500;">
+			  ✓ {{ t('processor.textOptionalHint') }} | {{ t('processor.currentChars') }}{{ formData.text.length }}
+			</span>
 
-        <el-form-item v-if="processingMode !== 'project-only'" label="语言">
-          <el-select v-model="formData.language" placeholder="选择语言">
-            <el-option label="普通话 🇨🇳" value="cmn" />
-            <el-option label="英语 🇬🇧" value="eng" />
-            <el-option label="日语 🇯🇵" value="jpn" />
-            <el-option label="韩语 🇰🇷" value="kor" />
-            <el-option label="粤语 🇭🇰" value="yue" />
+			<span v-else>
+			  {{ t('processor.currentChars') }}{{ formData.text.length }}
+			</span>
+		  </div>
+		</el-form-item>
+
+        <el-form-item v-if="processingMode !== 'project-only'" :label="t('processor.language')">
+          <el-select v-model="formData.language" :placeholder="t('processor.languagePlaceholder')">
+            <el-option :label="t('processor.languageCmn')" value="cmn" />
+            <el-option :label="t('processor.languageEng')" value="eng" />
+            <el-option :label="t('processor.languageJpn')" value="jpn" />
+            <el-option :label="t('processor.languageKor')" value="kor" />
+            <el-option :label="t('processor.languageYue')" value="yue" />
           </el-select>
         </el-form-item>
 
         <!-- 英语单词级对齐：仅当语言非日语时显示 -->
         <el-form-item
           v-if="processingMode !== 'project-only' && formData.language !== 'jpn'"
-          label="英语单词级对齐"
+          :label="t('processor.englishWordAlign')"
         >
           <el-switch v-model="englishWordAlign" />
           <span class="option-hint">
-            开启后，混合文本中的英语单词直接输出（如&nbsp;<code>hello</code>），不转换为 ARPABET 音素（<code>hh&nbsp;ax&nbsp;l&nbsp;ow</code>）
+            {{ t('processor.englishWordAlignHint') }}
           </span>
         </el-form-item>
 
-        <el-form-item label="处理模式">
+        <el-form-item :label="t('processor.processingMode')">
           <el-radio-group v-model="processingMode">
-            <el-radio value="mfa-only">仅标注 (快速)</el-radio>
-            <el-radio value="full">完整处理 (标注+F0+工程文件)</el-radio>
-            <el-radio value="project-only">仅生成工程 (WAV + LAB / MIDI)</el-radio>
+            <el-radio value="mfa-only">{{ t('processor.processingModeMfaOnly') }}</el-radio>
+            <el-radio value="full">{{ t('processor.processingModeFull') }}</el-radio>
+            <el-radio value="project-only">{{ t('processor.processingModeProjectOnly') }}</el-radio>
           </el-radio-group>
           <div class="mode-help">
             <small v-if="processingMode === 'mfa-only'">
-              只进行自动标注，生成 LAB 文件（使用 {{ alignerBackendLabel }} 后端）
+              {{ t('processor.processingModeMfaOnlyHint', { backend: alignerBackendLabel }) }}
             </small>
             <small v-else-if="processingMode === 'full'">
-              执行完整流程：{{ alignerBackendLabel }} 标注 → F0提取 → 工程文件生成
+              {{ t('processor.processingModeFullHint', { backend: alignerBackendLabel }) }}
             </small>
             <small v-else>
-              直接整合现有 WAV 和 LAB / MIDI 文件生成工程文件，跳过自动标注
+              {{ t('processor.processingModeProjectOnlyHint') }}
             </small>
           </div>
         </el-form-item>
 
-        <el-form-item v-if="processingMode === 'full' || processingMode === 'project-only'" label="输出格式">
-          <el-select v-model="formData.outputFormat" placeholder="选择输出格式">
-            <el-option label="Synthesizer V Studio (.svp)" value="sv" />
-            <el-option label="OpenUtau/UTAU (.ustx)" value="utau" />
+        <el-form-item v-if="processingMode === 'full' || processingMode === 'project-only'" :label="t('processor.outputFormat')">
+          <el-select v-model="formData.outputFormat" :placeholder="t('processor.outputFormat')">
+            <el-option :label="t('processor.outputFormatSv')" value="sv" />
+            <el-option :label="t('processor.outputFormatUtau')" value="utau" />
           </el-select>
         </el-form-item>
 
-        <el-form-item v-if="processingMode === 'project-only'" label="音素转换">
+        <el-form-item v-if="processingMode === 'project-only'" :label="t('processor.phonemeMode')">
           <el-radio-group v-model="formData.phonemeMode">
-            <el-radio value="none">不转换</el-radio>
-            <el-radio value="merge">合并辅音</el-radio>
-            <el-radio value="hiragana">平假名</el-radio>
-            <el-radio value="katakana">片假名</el-radio>
+            <el-radio value="none">{{ t('processor.phonemeNone') }}</el-radio>
+            <el-radio value="merge">{{ t('processor.phonemeMerge') }}</el-radio>
+            <el-radio value="hiragana">{{ t('processor.phonemeHiragana') }}</el-radio>
+            <el-radio value="katakana">{{ t('processor.phonemeKatakana') }}</el-radio>
           </el-radio-group>
           <div class="help-text">
             <small v-if="formData.phonemeMode === 'none'">
-              保持 LAB 中的原始音素标签不变（适用于所有语言）
+              {{ t('processor.phonemeNoneHint') }}
             </small>
             <small v-else-if="formData.phonemeMode === 'merge'">
-              将辅音与后续元音合并为罗马字音节（s + a → sa，N → N，p + u → pu）
+              {{ t('processor.phonemeMergeHint') }}
             </small>
             <small v-else-if="formData.phonemeMode === 'hiragana'">
-              合并辅音+元音并转换为平假名（s + a → さ，N → ん，p + u → ぷ）
+              {{ t('processor.phonemeHiraganaHint') }}
             </small>
             <small v-else>
-              合并辅音+元音并转换为片假名（s + a → サ，N → ン，p + u → プ）
+              {{ t('processor.phonemeKatakanaHint') }}
             </small>
           </div>
           <div class="help-text" style="margin-top:4px">
             <small style="color:#909399">
-              ⚠ 合并/假名转换适用于含逐个音素的日语 LAB 文件（如原始 MFA 输出）
+              ⚠ {{ t('processor.phonemeWarning') }}
             </small>
           </div>
         </el-form-item>
 
-        <el-form-item v-if="processingMode === 'full' || processingMode === 'project-only'" label="音轨名">
+        <el-form-item v-if="processingMode === 'full' || processingMode === 'project-only'" :label="t('processor.projectTitle')">
           <el-input
             v-model="formData.projectTitle"
-            placeholder="输入音轨名"
+            :placeholder="t('processor.projectTitlePlaceholder')"
             maxlength="248"
           />
         </el-form-item>
 
         <el-collapse v-if="processingMode === 'full' || processingMode === 'project-only'" accordion>
-          <el-collapse-item title="⚙️ 高级设置" name="advanced">
+          <el-collapse-item :title="`⚙️ ${t('processor.advancedSettingsTitle')}`" name="advanced">
             <el-row :gutter="20">
               <el-col :xs="24" :sm="12">
-                <el-form-item label="BPM (节拍/分钟)">
+                <el-form-item :label="t('processor.bpm')">
                   <el-input-number
                     v-model="advancedConfig.bpm"
                     :min="20"
@@ -332,16 +336,16 @@
                     :disabled="midiLoaded"
                   />
                   <span v-if="midiLoaded && midiInfo.loaded" class="midi-lock-tip">
-                    🔒 {{ midiInfo.bpm }} (来自 MIDI)
+                    🔒 {{ midiInfo.bpm }} ({{ t('processor.midiImportedTitle') }})
                   </span>
                   <span v-else-if="midiLoaded" class="midi-lock-tip">
-                    🔒 从 MIDI 读取
+                    🔒 {{ t('processor.midiImportedMore') }}
                   </span>
                 </el-form-item>
               </el-col>
 
               <el-col :xs="24" :sm="12">
-                <el-form-item label="基准音高 (MIDI Note)">
+                <el-form-item :label="t('processor.basePitch')">
                   <div class="pitch-input-group">
                     <el-input-number
                       v-model="advancedConfig.base_pitch"
@@ -350,115 +354,115 @@
                       :step="1"
                       controls-position="right"
                       :disabled="midiLoaded"
-                    />
+                  />
                     <span class="pitch-name">{{ midiNoteToName(advancedConfig.base_pitch) }}</span>
-                    <span v-if="midiLoaded" class="midi-lock-tip">🔒 从 MIDI 读取</span>
+                    <span v-if="midiLoaded" class="midi-lock-tip">🔒 {{ t('processor.midiImportedMore') }}</span>
                   </div>
                 </el-form-item>
               </el-col>
 
               <el-col :xs="24">
-                <el-divider>📈 音高精细控制</el-divider>
+                <el-divider>📈 {{ t('processor.pitchControl') }}</el-divider>
               </el-col>
 
               <el-col :xs="24" :sm="12">
-                <el-form-item label="自动音符音高">
+                <el-form-item :label="t('processor.autoNotePitch')">
                   <el-switch 
                     v-model="advancedConfig.auto_note_pitch"
-                    active-text="自动对齐实际音高"
-                    inactive-text="固定在基准音高"
+                    :active-text="t('processor.autoNotePitchActive')"
+                    :inactive-text="t('processor.autoNotePitchInactive')"
                     :disabled="midiLoaded"
                   />
                   <span v-if="midiLoaded" class="midi-lock-tip" style="display:block;margin-top:4px">
-                    🔒 音符音高由 MIDI 提供
+                    🔒 {{ t('processor.midiImportedTip') }}
                   </span>
                 </el-form-item>
               </el-col>
 
               <el-col :xs="24" :sm="12">
-                <el-form-item label="导出连续音高">
+                <el-form-item :label="t('processor.exportPitchLine')">
                   <el-switch 
                     v-model="advancedConfig.export_pitch_line"
-                    active-text="写入 F0 曲线参数"
-                    inactive-text="仅生成纯净音符"
+                    :active-text="t('processor.exportPitchLineActive')"
+                    :inactive-text="t('processor.exportPitchLineInactive')"
                   />
                 </el-form-item>
               </el-col>
 
               <el-col :xs="24">
-                <el-divider>F0 提取算法与范围</el-divider>
+                <el-divider>{{ t('processor.f0RangeDivider') }}</el-divider>
               </el-col>
 
               <el-col :xs="24" :sm="12">
-                <el-form-item label="F0 提取方法">
+                <el-form-item :label="t('processor.f0Method')">
                   <el-radio-group v-model="advancedConfig.f0_method" :disabled="!advancedConfig.export_pitch_line && !advancedConfig.auto_note_pitch">
                     <el-radio label="dio">
-                      <span>DIO (快速)</span>
+                      <span>{{ t('processor.f0Dio') }}</span>
                       <el-icon class="icon-tip"><InfoFilled /></el-icon>
                     </el-radio>
                     <el-radio label="harvest">
-                      <span>Harvest (精确)</span>
+                      <span>{{ t('processor.f0Harvest') }}</span>
                       <el-icon class="icon-tip"><InfoFilled /></el-icon>
                     </el-radio>
                     <el-radio label="crepe" :disabled="(!advancedConfig.export_pitch_line && !advancedConfig.auto_note_pitch) || systemStatus.audio_processing?.f0_backends?.crepe?.available === false">
-                      <span>CREPE (神经网络，抗噪)</span>
+                      <span>{{ t('processor.f0Crepe') }}</span>
                       <el-icon class="icon-tip"><InfoFilled /></el-icon>
                     </el-radio>
                     <el-radio label="rmvpe" :disabled="(!advancedConfig.export_pitch_line && !advancedConfig.auto_note_pitch) || systemStatus.audio_processing?.f0_backends?.rmvpe?.available === false">
-                      <span>RMVPE (深度模型，最鲁棒)</span>
+                      <span>{{ t('processor.f0Rmvpe') }}</span>
                       <el-icon class="icon-tip"><InfoFilled /></el-icon>
                     </el-radio>
                   </el-radio-group>
                   <p v-if="advancedConfig.f0_method === 'crepe' && systemStatus.audio_processing?.f0_backends?.crepe?.available === false" class="help-text">
-                    ⚠ 未检测到 torch / torchcrepe，请先安装依赖
+                    ⚠ {{ t('processor.crepeDependencyMissing') }}
                   </p>
                   <p v-if="advancedConfig.f0_method === 'rmvpe' && systemStatus.audio_processing?.f0_backends?.rmvpe?.available === false" class="help-text">
-                    ⚠ 未检测到 RMVPE 模型权重，请下载 rmvpe.pt 并放入 models/rmvpe/ 目录
+                    ⚠ {{ t('processor.rmvpeModelMissing') }}
                   </p>
                 </el-form-item>
               </el-col>
 
               <el-col v-if="advancedConfig.f0_method === 'crepe'" :xs="24" :sm="12">
-                <el-form-item label="CREPE 模型规格">
+                <el-form-item :label="t('processor.crepeModelSpec')">
                   <el-radio-group v-model="advancedConfig.crepe_model">
-                    <el-radio label="full">Full (精度高)</el-radio>
-                    <el-radio label="tiny">Tiny (速度快)</el-radio>
+                    <el-radio label="full">{{ t('processor.crepeFull') }}</el-radio>
+                    <el-radio label="tiny">{{ t('processor.crepeTiny') }}</el-radio>
                   </el-radio-group>
                 </el-form-item>
               </el-col>
 
               <el-col v-if="advancedConfig.f0_method === 'crepe' || advancedConfig.f0_method === 'rmvpe'" :xs="24" :sm="12">
-                <el-form-item label="运行设备">
+                <el-form-item :label="t('processor.f0Device')">
                   <el-radio-group v-model="advancedConfig.f0_device">
-                    <el-radio label="auto">自动 (优先 GPU)</el-radio>
-                    <el-radio label="cpu">CPU</el-radio>
-                    <el-radio label="cuda">CUDA (GPU)</el-radio>
+                    <el-radio label="auto">{{ t('processor.deviceAuto') }}</el-radio>
+                    <el-radio label="cpu">{{ t('processor.deviceCpu') }}</el-radio>
+                    <el-radio label="cuda">{{ t('processor.deviceCuda') }}</el-radio>
                   </el-radio-group>
                 </el-form-item>
               </el-col>
 
               <el-col :xs="24" :sm="12">
-                <el-form-item label="浮点精度">
+                <el-form-item :label="t('processor.precision')">
                   <el-radio-group v-model="advancedConfig.precision">
-                    <el-radio label="single">单精度 (Float32)</el-radio>
-                    <el-radio label="double">双精度 (Float64)</el-radio>
+                    <el-radio label="single">{{ t('processor.precisionSingle') }}</el-radio>
+                    <el-radio label="double">{{ t('processor.precisionDouble') }}</el-radio>
                   </el-radio-group>
                 </el-form-item>
               </el-col>
 
               <el-col :xs="24" :sm="12">
-                <el-form-item label="F0 平滑处理">
+                <el-form-item :label="t('processor.f0Smooth')">
                   <el-switch 
                     v-model="advancedConfig.f0_smooth"
-                    active-text="启用"
-                    inactive-text="禁用"
+                    :active-text="t('processor.enabled')"
+                    :inactive-text="t('processor.disabled')"
                     :disabled="!advancedConfig.export_pitch_line"
                   />
                 </el-form-item>
               </el-col>
 
               <el-col v-if="advancedConfig.f0_smooth" :xs="24" :sm="12">
-                <el-form-item label="平滑窗口大小">
+                <el-form-item :label="t('processor.smoothWindow')">
                   <el-input-number
                     v-model="advancedConfig.f0_smooth_window"
                     :min="1"
@@ -467,12 +471,12 @@
                     controls-position="right"
                     :disabled="!advancedConfig.export_pitch_line"
                   />
-                  <span class="help-text">推荐值: 3-7 (越大越平滑)</span>
+                  <span class="help-text">{{ t('processor.smoothWindowTip') }}</span>
                 </el-form-item>
               </el-col>
 
               <el-col :xs="24" :sm="12">
-                <el-form-item label="最低频率 (Hz)">
+                <el-form-item :label="t('processor.f0Floor')">
                   <el-input-number
                     v-model="advancedConfig.f0_floor"
                     :min="40"
@@ -484,7 +488,7 @@
               </el-col>
 
               <el-col :xs="24" :sm="12">
-                <el-form-item label="最高频率 (Hz)">
+                <el-form-item :label="t('processor.f0Ceil')">
                   <el-input-number
                     v-model="advancedConfig.f0_ceil"
                     :min="300"
@@ -497,14 +501,14 @@
             </el-row>
 
             <el-alert type="info" :closable="false" show-icon class="settings-info">
-              <template #title>💡 高级设置说明</template>
-              <p><strong>BPM:</strong> 用于工程文件的节拍数，不影响实际处理速度</p>
-              <p><strong>基准音高:</strong> 工程文件的默认基准音（60 = C4）</p>
-              <p><strong>自动音符音高:</strong> 音符块将自动放置在音频识别出的实际 MIDI 键位上</p>
-              <p><strong>导出连续音高:</strong> 是否将精细的基频起伏数据（F0）以参数线形式导入到工程底部</p>
-              <p><strong>DIO / Harvest / CREPE / RMVPE：</strong>DIO 最快但偶有跳音；Harvest 更精确但稍慢；CREPE 基于神经网络，对噪声/伴奏有较强鲁棒性；RMVPE 是目前对人声最鲁棒的深度模型，推荐在条件允许时优先使用（CREPE/RMVPE 需要 torch，RMVPE 还需额外下载模型权重）</p>
-              <p><strong>运行设备：</strong>CREPE/RMVPE 可选择 CPU 或 CUDA(GPU)，GPU 可大幅加速；"自动"会在检测到可用 GPU 时优先使用</p>
-              <p><strong>F0 范围:</strong> 女声通常 150-300Hz，男声 80-150Hz，根据需要调整</p>
+              <template #title>💡 {{ t('processor.advancedHelpTitle') }}</template>
+              <p><strong>BPM:</strong> {{ t('processor.advancedHelpBpm') }}</p>
+              <p><strong>{{ t('processor.basePitch') }}:</strong> {{ t('processor.advancedHelpBasePitch') }}</p>
+              <p><strong>{{ t('processor.autoNotePitch') }}:</strong> {{ t('processor.advancedHelpAutoNotePitch') }}</p>
+              <p><strong>{{ t('processor.exportPitchLine') }}:</strong> {{ t('processor.advancedHelpExportPitchLine') }}</p>
+              <p><strong>DIO / Harvest / CREPE / RMVPE：</strong>{{ t('processor.advancedHelpF0Method') }}</p>
+              <p><strong>{{ t('processor.f0Device') }}：</strong>{{ t('processor.advancedHelpDevice') }}</p>
+              <p><strong>{{ t('processor.f0Floor') }} / {{ t('processor.f0Ceil') }}:</strong> {{ t('processor.advancedHelpRange') }}</p>
             </el-alert>
           </el-collapse-item>
         </el-collapse>
@@ -517,12 +521,12 @@
             @click="processAudio"
             :disabled="isSubmitDisabled"
           >
-            <span v-if="!processing">🚀 开始处理</span>
-            <span v-else>处理中... {{ progressPercent }}%</span>
+            <span v-if="!processing">🚀 {{ t('processor.startProcessing') }}</span>
+            <span v-else>{{ t('processor.processing') }} {{ progressPercent }}%</span>
           </el-button>
-          <el-button @click="reset" :disabled="processing">🔄 重置</el-button>
+          <el-button @click="reset" :disabled="processing">🔄 {{ t('processor.reset') }}</el-button>
           <span v-if="!isReady && processingMode !== 'project-only'" class="disabled-text">
-            (系统未就绪或语言模型未下载)
+            ({{ t('processor.systemReadyHint') }})
           </span>
         </el-form-item>
 
@@ -537,22 +541,22 @@
       <div v-if="result" class="result-section">
         <el-divider />
 
-        <h3>✅ 处理结果</h3>
+        <h3>✅ {{ t('processor.result') }}</h3>
         <div class="result-info">
           <el-row :gutter="20">
             <el-col :xs="24" :sm="12">
-              <p><strong>处理时间:</strong> {{ formatTime(result.processingTime) }}</p>
-              <p v-if="result.labPath"><strong>LAB 文件:</strong> {{ getFileName(result.labPath) }}</p>
+              <p><strong>{{ t('processor.processingTime') }}:</strong> {{ formatTime(result.processingTime) }}</p>
+              <p v-if="result.labPath"><strong>{{ t('processor.labFile') }}:</strong> {{ getFileName(result.labPath) }}</p>
             </el-col>
             <el-col :xs="24" :sm="12">
-              <p v-if="result.projectPath"><strong>工程文件:</strong> {{ getFileName(result.projectPath) }}</p>
-              <p v-if="result.segments"><strong>标注段数:</strong> {{ result.segments }}</p>
+              <p v-if="result.projectPath"><strong>{{ t('processor.projectFile') }}:</strong> {{ getFileName(result.projectPath) }}</p>
+              <p v-if="result.segments"><strong>{{ t('processor.segmentCount') }}:</strong> {{ result.segments }}</p>
             </el-col>
           </el-row>
         </div>
 
         <el-tabs>
-          <el-tab-pane v-if="result.labContent" label="LAB 标注内容">
+          <el-tab-pane v-if="result.labContent" :label="t('processor.labContentTab')">
             <el-input
               v-model="result.labContent"
               type="textarea"
@@ -562,58 +566,60 @@
             />
             <div class="tab-actions">
               <el-button @click="copyLabToClipboard" size="small">
-                📋 复制 LAB
+                📋 {{ t('processor.copyLab') }}
               </el-button>
               <el-button @click="downloadLab" size="small" type="success">
-                📥 下载 LAB
+                📥 {{ t('processor.downloadLab') }}
               </el-button>
             </div>
           </el-tab-pane>
 
-          <el-tab-pane v-if="result.projectPath" label="文件信息">
+          <el-tab-pane v-if="result.projectPath" :label="t('processor.fileInfoTab')">
             <div class="file-info-box">
               <el-row :gutter="20">
                 <el-col :xs="24" v-if="result.labPath">
-                  <p><strong>LAB 标注文件:</strong></p>
+                  <p><strong>{{ t('processor.labFile') }}:</strong></p>
                   <code>{{ result.labPath }}</code>
                 </el-col>
                 <el-col :xs="24">
-                  <p><strong>工程文件:</strong></p>
+                  <p><strong>{{ t('processor.projectFile') }}:</strong></p>
                   <code>{{ result.projectPath }}</code>
                 </el-col>
                 <el-col :xs="24">
-                  <p><strong>输出格式:</strong> {{ result.projectFormat === 'sv' ? 'Synthesizer V Studio' : 'OpenUtau/UTAU' }}</p>
-                  <p v-if="result.segments"><strong>标注段数:</strong> {{ result.segments }}</p>
-                  <p v-if="result.config"><strong>处理配置:</strong></p>
+                  <p><strong>{{ t('processor.outputFormat') }}:</strong> {{ result.projectFormat === 'sv' ? t('processor.outputFormatSv') : t('processor.outputFormatUtau') }}</p>
+                  <p v-if="result.segments"><strong>{{ t('processor.segmentCount') }}:</strong> {{ result.segments }}</p>
+                  <p v-if="result.config"><strong>{{ t('processor.processingConfig') }}:</strong></p>
                   <ul v-if="result.config">
-                    <li>BPM: {{ result.config.bpm }}</li>
-                    <li>基准音高: {{ midiNoteToName(result.config.base_pitch) }} (MIDI {{ result.config.base_pitch }})</li>
-                    <li>自动音符音高: {{ result.config.auto_note_pitch ? '已启用' : '已禁用' }}</li>
-                    <li>导出连续音高: {{ result.config.export_pitch_line ? '已启用' : '已禁用' }}</li>
-                    <li>F0 方法: {{ result.config.f0_method?.toUpperCase?.() || result.config.f0_method }}</li>
-                    <li v-if="result.config.f0_method === 'crepe'">CREPE 模型: {{ result.config.crepe_model }}</li>
-                    <li v-if="result.config.f0_method === 'crepe' || result.config.f0_method === 'rmvpe'">运行设备: {{ result.config.f0_device }}</li>
-                    <li v-if="result.config.aligner_device !== undefined">对齐设备: {{ result.config.aligner_device }}</li>
-                    <li v-if="result.whisperxModel">Whisper 模型: {{ result.whisperxModel }}</li>
-                    <li>精度: {{ result.config.use_double_precision ? '双精度 (Float64)' : '单精度 (Float32)' }}</li>
+                    <li>{{ t('processor.bpm') }}: {{ result.config.bpm }}</li>
+                    <li>{{ t('processor.basePitch') }}: {{ midiNoteToName(result.config.base_pitch) }} (MIDI {{ result.config.base_pitch }})</li>
+                    <li>{{ t('processor.autoNotePitch') }}: {{ result.config.auto_note_pitch ? t('processor.enabled') : t('processor.disabled') }}</li>
+                    <li>{{ t('processor.exportPitchLine') }}: {{ result.config.export_pitch_line ? t('processor.enabled') : t('processor.disabled') }}</li>
+                    <li>{{ t('processor.f0Method') }}: {{ result.config.f0_method?.toUpperCase?.() || result.config.f0_method }}</li>
+                    <li v-if="result.config.f0_method === 'crepe'">{{ t('processor.crepeModelSpec') }}: {{ result.config.crepe_model }}</li>
+                    <li v-if="result.config.f0_method === 'crepe' || result.config.f0_method === 'rmvpe'">{{ t('processor.f0Device') }}: {{ result.config.f0_device }}</li>
+                    <li v-if="result.config.aligner_device !== undefined">{{ t('processor.alignDevice') }}: {{ result.config.aligner_device }}</li>
+                    <li v-if="result.whisperxModel">{{ t('processor.whisperModel') }}: {{ result.whisperxModel }}</li>
+                    <li>{{ t('processor.precision') }}: {{ result.config.use_double_precision ? t('processor.precisionDouble') : t('processor.precisionSingle') }}</li>
                   </ul>
                 </el-col>
               </el-row>
             </div>
           </el-tab-pane>
 
-          <el-tab-pane label="处理详情">
+          <el-tab-pane :label="t('processor.stageTab')">
             <div class="details-box">
               <el-table :data="processingDetails" stripe style="width: 100%">
-                <el-table-column prop="stage" label="处理阶段" width="200" />
-                <el-table-column prop="status" label="状态" width="100">
+                <el-table-column prop="stage" :label="t('processor.processingStage')" width="200" />
+                <el-table-column prop="status" :label="t('processor.status')" width="100">
                   <template #default="{ row }">
-                    <el-tag v-if="row.status === '完成'" type="success">{{ row.status }}</el-tag>
-                    <el-tag v-else-if="row.status === '跳过'" type="warning">{{ row.status }}</el-tag>
+                    <el-tag v-if="row.status === '完成'" type="success">{{ t('processor.statusDone') }}</el-tag>
+                    <el-tag v-else-if="row.status === '跳过'" type="warning">{{ t('processor.statusSkipped') }}</el-tag>
+                    <el-tag v-else-if="row.status === '等待'" type="info">{{ t('processor.statusWaiting') }}</el-tag>
+                    <el-tag v-else-if="row.status === '进行中'" type="warning">{{ t('processor.statusProcessing') }}</el-tag>
                     <el-tag v-else type="info">{{ row.status }}</el-tag>
                   </template>
                 </el-table-column>
-                <el-table-column prop="message" label="详情" show-overflow-tooltip />
+                <el-table-column prop="message" :label="t('processor.detail')" show-overflow-tooltip />
               </el-table>
             </div>
           </el-tab-pane>
@@ -621,7 +627,7 @@
 
         <div class="action-buttons">
           <el-button v-if="result.labContent" type="success" @click="downloadLab" size="large">
-            📥 下载 LAB 文件
+            📥 {{ t('processor.downloadLabFile') }}
           </el-button>
           <el-button 
             v-if="result.projectPath" 
@@ -630,20 +636,20 @@
             size="large"
             :loading="downloadingProject"
           >
-            📥 下载工程文件
+            📥 {{ t('processor.downloadProjectFile') }}
           </el-button>
           <el-button v-if="result.labContent" @click="copyLabToClipboard" size="large">
-            📋 复制 LAB 内容
+            📋 {{ t('processor.copyLabContent') }}
           </el-button>
           <el-button type="info" @click="newProcess" size="large">
-            🔄 处理下一个
+            🔄 {{ t('processor.processNext') }}
           </el-button>
         </div>
       </div>
 
       <div v-if="error" class="error-section">
         <el-alert
-          :title="`错误: ${error}`"
+          :title="`${t('processor.errorPrefix')}: ${error}`"
           type="error"
           :closable="true"
           @close="error = ''"
@@ -655,25 +661,25 @@
     <div v-if="systemStatus" class="status-box">
       <el-card shadow="hover">
         <template #header>
-          <span>🔧 系统状态</span>
+          <span>🔧 {{ t('app.systemStatus') }}</span>
         </template>
 
         <el-row :gutter="20">
           <el-col :xs="24" :sm="12">
             <div class="status-item">
-              <span class="label">MFA 状态:</span>
+              <span class="label">{{ t('processor.mfaStatus') }}:</span>
               <el-tag :type="systemStatus.mfa?.installed ? 'success' : 'danger'" size="large">
-                {{ systemStatus.mfa?.installed ? '✓ 已安装' : '✗ 未安装' }}
+                {{ systemStatus.mfa?.installed ? `✓ ${t('processor.available')}` : `✗ ${t('processor.notInstalled')}` }}
               </el-tag>
             </div>
             <div v-if="systemStatus.mfa?.installed" class="status-item">
-              <span class="label">版本:</span>
+              <span class="label">{{ t('processor.version') }}:</span>
               <span>{{ systemStatus.mfa?.version }}</span>
             </div>
           </el-col>
 
           <el-col :xs="24" :sm="12">
-            <div class="label">语言模型状态:</div>
+            <div class="label">{{ t('processor.modelStatus') }}:</div>
             <div class="model-list">
               <div v-for="(downloaded, lang) in normalizedModels" :key="lang" class="model-item">
                 <el-tag :type="downloaded ? 'success' : 'warning'" size="small">
@@ -686,14 +692,14 @@
                   @click="downloadModel(lang)"
                   :loading="downloadingLangs.includes(lang)"
                 >
-                  下载
+                  {{ t('processor.download') }}
                 </el-button>
               </div>
             </div>
           </el-col>
 
           <el-col :xs="24">
-            <div class="label">处理模块:</div>
+            <div class="label">{{ t('processor.processingModules') }}:</div>
             <div class="model-list">
               <div class="model-item">
                 <el-tag 
@@ -723,21 +729,21 @@
           </el-col>
 
           <el-col :xs="24">
-            <div class="label">替代对齐后端:</div>
+            <div class="label">{{ t('processor.altBackends') }}:</div>
             <div class="model-list">
               <div v-for="(info, key) in altBackends" :key="key" class="model-item">
                 <el-tag :type="info.available ? 'success' : 'info'" size="small">
-                  {{ key === 'whisperx' ? 'WhisperX' : key === 'qwen3_asr' ? 'Qwen3-ASR-1.7B' : 'Qwen3-FA-0.6B' }}:
-                  {{ info.available ? '✓ 可用' : '✗ 未安装' }}
+                  {{ key === 'whisperx' ? t('processor.backendWhisperx') : key === 'qwen3_asr' ? 'Qwen3-ASR-1.7B' : 'Qwen3-FA-0.6B' }}:
+                  {{ info.available ? `✓ ${t('processor.available')}` : `✗ ${t('processor.notInstalled')}` }}
                 </el-tag>
                 <span v-if="!info.available" class="help-text" style="font-size:11px;margin-left:6px">
-                  {{ key === 'whisperx' ? 'pip install whisperx' : 'pip install transformers torch' }}
+                  {{ key === 'whisperx' ? t('processor.packageHintWhisperx') : t('processor.packageHintTransformers') }}
                 </span>
               </div>
             </div>
             <div v-if="alignerStatus.models_dir" style="margin-top:6px;font-size:12px;color:#909399">
-              📁 模型下载位置：<code style="color:#67c23a">{{ alignerStatus.models_dir }}</code>
-              <span style="margin-left:6px">（非 C 盘，节省系统盘空间）</span>
+              📁 {{ t('processor.modelsLocation') }}：<code style="color:#67c23a">{{ alignerStatus.models_dir }}</code>
+              <span style="margin-left:6px">{{ t('processor.modelsLocationHint') }}</span>
             </div>
           </el-col>
         </el-row>
@@ -746,30 +752,33 @@
 
     <div v-if="systemStatus && !systemStatus.mfa?.installed" class="warning-box">
       <el-alert type="error" :closable="false" show-icon>
-        <template #title>❌ MFA 未安装</template>
-        <p>请先安装 Montreal Forced Aligner:</p>
+        <template #title>❌ {{ t('processor.mfaNotInstalledTitle') }}</template>
+        <p>{{ t('processor.mfaNotInstalledBody') }}</p>
         <code>pip install montreal-forced-aligner</code>
-        <p style="margin-top: 10px">然后下载所需的语言模型</p>
+        <p style="margin-top: 10px">{{ t('processor.mfaNotInstalledMore') }}</p>
       </el-alert>
     </div>
 
     <div v-if="systemStatus && systemStatus.mfa?.installed && !isReady && processingMode !== 'project-only'" class="warning-box">
       <el-alert type="warning" :closable="false" show-icon>
-        <template #title>⚠️ 警告: 组件未就绪</template>
-        <p>请 download 所需的语言模型或检查系统状态。</p>
+        <template #title>⚠️ {{ t('processor.notReadyTitle') }}</template>
+        <p>{{ t('processor.notReadyBody') }}</p>
       </el-alert>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { UploadFilled, InfoFilled } from '@element-plus/icons-vue'
+import { useI18n } from 'vue-i18n'
 
 const emit = defineEmits<{
   (e: 'status-changed', status: SystemStatus): void
 }>()
+
+const { t, locale } = useI18n()
 
 type ProcessingMode = 'mfa-only' | 'full' | 'project-only'
 
@@ -834,9 +843,9 @@ const processingMode = ref<ProcessingMode>('mfa-only')
 const englishWordAlign = ref<boolean>(false)  // 英语单词级对齐（不做 ARPABET 音素拆分）
 const alignerBackend = ref<string>('mfa')   // 对齐后端选择
 const alignerStatus = ref<Record<string, any>>({
-  whisperx:      { available: false, message: '检查中...' },
-  qwen3_asr:     { available: false, message: '检查中...' },
-  qwen3_aligner: { available: false, message: '检查中...' },
+  whisperx:      { available: false, message: t('processor.backendStatusChecking') },
+  qwen3_asr:     { available: false, message: t('processor.backendStatusChecking') },
+  qwen3_aligner: { available: false, message: t('processor.backendStatusChecking') },
 })
 
 const formData = ref<FormData>({
@@ -894,9 +903,9 @@ const systemStatus = ref<SystemStatus>({
 })
 
 const processingDetails = ref<any[]>([
-  { stage: '1. MFA 自动标注', status: '等待', message: '准备进行音频对齐' },
-  { stage: '2. F0 音高提取', status: '等待', message: '提取音频基频信息' },
-  { stage: '3. 工程文件生成', status: '等待', message: '生成 Synthesizer V / OpenUtau 工程文件' }
+  { stage: t('processor.stageAlign'), status: '等待', message: t('processor.stagePrepareAlign') },
+  { stage: t('processor.stageF0'), status: '等待', message: t('processor.stageExtractF0') },
+  { stage: t('processor.stageProject'), status: '等待', message: t('processor.stageGenerateProject') },
 ])
 
 const currentJobId = ref<string>('')
@@ -907,7 +916,6 @@ const midiInfo = ref<{ bpm: number; loaded: boolean }>({ bpm: 120, loaded: false
 const labMidiUploadKey = ref(0)
 
 const midiLoaded = computed(() => processingMode.value === 'project-only' && !!formData.value.midiFile)
-const hasNotationFile = computed(() => !!formData.value.labFile || !!formData.value.midiFile)
 const selectedNotationFile = computed(() => formData.value.labFile || formData.value.midiFile)
 
 // 计算属性
@@ -939,13 +947,20 @@ const altBackends = computed(() => {
 })
 
 const alignerBackendLabel = computed(() => {
+  void locale.value
   const labels: Record<string, string> = {
-    mfa: 'MFA',
-    whisperx: 'WhisperX',
-    qwen3_asr: 'Qwen3-ASR',
-    qwen3_aligner: 'Qwen3-FA',
+    mfa: t('processor.backendMfa'),
+    whisperx: t('processor.backendWhisperx'),
+    qwen3_asr: t('processor.backendQwen3Asr'),
+    qwen3_aligner: t('processor.backendQwen3Aligner'),
   }
   return labels[alignerBackend.value] || alignerBackend.value
+})
+
+watch(alignerBackend, (backend) => {
+  if (processingMode.value === 'project-only' && ['whisperx', 'qwen3_asr', 'qwen3_aligner'].includes(backend)) {
+    processingMode.value = 'mfa-only'
+  }
 })
 
 // 根据不同模式控制提交按钮的禁用状态
@@ -958,7 +973,7 @@ const isSubmitDisabled = computed(() => {
 })
 
 const handleLabMidiExceed = () => {
-  ElMessage.error('只能选择一个文件：LAB 或 MIDI')
+  ElMessage.error(t('processor.chooseOneFile'))
 }
 
 const handleLabMidiChange = (file: any) => {
@@ -987,7 +1002,7 @@ const handleLabMidiChange = (file: any) => {
     return
   }
 
-  ElMessage.error('只支持 .lab / .mid / .midi 文件')
+  ElMessage.error(t('processor.onlySupportNotation'))
   labMidiUploadKey.value += 1
 }
 
@@ -1031,14 +1046,14 @@ const clearJobPolling = () => {
 }
 
 const resetProcessingSteps = () => {
-  const stageLabel = alignerBackend.value === 'mfa' ? 'MFA 自动标注'
-    : alignerBackend.value === 'whisperx' ? 'WhisperX 对齐'
-    : alignerBackend.value === 'qwen3_asr' ? 'Qwen3-ASR 转录'
-    : 'Qwen3-FA 强制对齐'
+  const stageLabel = alignerBackend.value === 'mfa' ? t('processor.backendMfa')
+    : alignerBackend.value === 'whisperx' ? t('processor.backendWhisperx')
+    : alignerBackend.value === 'qwen3_asr' ? t('processor.backendQwen3Asr')
+    : t('processor.backendQwen3Aligner')
   processingDetails.value = [
-    { stage: `1. ${stageLabel}`, status: '等待', message: '准备进行音频对齐' },
-    { stage: '2. F0 音高提取', status: '等待', message: '提取音频基频信息' },
-    { stage: '3. 工程文件生成', status: '等待', message: '生成 Synthesizer V / OpenUtau 工程文件' }
+    { stage: `1. ${stageLabel}`, status: '等待', message: t('processor.stagePrepareAlign') },
+    { stage: t('processor.stageF0'), status: '等待', message: t('processor.stageExtractF0') },
+    { stage: t('processor.stageProject'), status: '等待', message: t('processor.stageGenerateProject') }
   ]
 }
 
@@ -1099,7 +1114,7 @@ const waitForJobFinished = (jobId: string): Promise<any> => {
         const data = await res.json()
 
         if (!res.ok || !data.success) {
-          throw new Error(data.error || '获取任务状态失败')
+          throw new Error(data.error || t('processor.jobStatusFailed'))
         }
 
         const job = data.job || {}
@@ -1108,7 +1123,7 @@ const waitForJobFinished = (jobId: string): Promise<any> => {
           resolve(job.result || job)
           return
         } else if (job.status === 'failed') {
-          throw new Error(job.error || '处理失败')
+          throw new Error(job.error || t('processor.jobFailed'))
         }
         // queued / running: 继续轮询
 
@@ -1149,7 +1164,7 @@ const checkSystemStatus = async () => {
     emit('status-changed', systemStatus.value)
   } catch (e) {
     console.warn('无法检查系统状态:', e)
-    ElMessage.warning('无法连接到后端')
+    ElMessage.warning(t('processor.backendConnectionFailed'))
   } finally {
     checkingStatus.value = false
   }
@@ -1157,7 +1172,7 @@ const checkSystemStatus = async () => {
 
 const refreshStatus = async () => {
   await checkSystemStatus()
-  ElMessage.success('已刷新系统状态')
+  ElMessage.success(t('processor.backendRefreshSuccess'))
 }
 
 const openGitHub = () => {
@@ -1165,7 +1180,7 @@ const openGitHub = () => {
 }
 
 const handleExceed = () => {
-  ElMessage.error('只能上传一个文件')
+  ElMessage.error(t('processor.chooseOneUpload'))
 }
 
 const handleAudioSelect = (file: any) => {
@@ -1211,13 +1226,13 @@ const downloadModel = async (lang: string) => {
     const res = await fetch(`/api/mfa/download-model/${lang}`, { method: 'POST' })
     const data = await res.json()
     if (data.success) {
-      ElMessage.success(`模型 ${lang} 下载成功`)
+      ElMessage.success(t('processor.modelDownloaded', { lang: lang.toUpperCase() }))
       await checkSystemStatus()
     } else {
-      ElMessage.error(`模型下载失败: ${data.error}`)
+      ElMessage.error(t('processor.modelDownloadFailed', { error: data.error }))
     }
   } catch (e) {
-    ElMessage.error(`下载模型出错: ${e}`)
+    ElMessage.error(t('processor.modelDownloadError', { error: String(e) }))
   } finally {
     downloadingLangs.value = downloadingLangs.value.filter(l => l !== lang)
   }
@@ -1230,19 +1245,19 @@ const processAudio = async () => {
   // ============================================================
 if (processingMode.value === 'project-only') {
   if (!formData.value.audioFile) {
-    ElMessage.warning('请选择 WAV 文件')
+    ElMessage.warning(t('processor.selectWav'))
     return
   }
 
   const notationFile = selectedNotationFile.value
   if (!notationFile) {
-    ElMessage.warning('请选择 LAB 或 MIDI 文件')
+    ElMessage.warning(t('processor.selectLabOrMidi'))
     return
   }
 
   const notationExt = notationFile.name.toLowerCase().split('.').pop() || ''
   if (!['lab', 'mid', 'midi'].includes(notationExt)) {
-    ElMessage.warning('请选择有效的 LAB / MIDI 文件')
+    ElMessage.warning(t('processor.selectValidNotation'))
     return
   }
 
@@ -1253,9 +1268,9 @@ if (processingMode.value === 'project-only') {
   result.value = null
   currentJobId.value = ''
   resetProcessingSteps()
-  updateProcessingStep(0, '跳过', '工程文件模式：已跳过 MFA 自动标注')
-  updateProcessingStep(1, '进行中', 'F0 提取 + 工程文件生成中，请耐心等待...')
-  updateProcessingStep(2, '等待', '等待工程文件生成')
+  updateProcessingStep(0, t('processor.statusSkipped'), t('processor.projectModeSkipAlign'))
+  updateProcessingStep(1, t('processor.statusProcessing'), t('processor.projectModeProcessing'))
+  updateProcessingStep(2, t('processor.statusWaiting'), t('processor.projectModeWaitProject'))
 
   let progressTimer: number | null = null
 
@@ -1295,7 +1310,7 @@ if (processingMode.value === 'project-only') {
     })
     const data = await res.json()
 
-    if (!res.ok) throw new Error(data.error || '提交失败')
+    if (!res.ok) throw new Error(data.error || t('processor.submitFailed'))
 
     if (data.job_id) {
       if (progressTimer !== null) { window.clearInterval(progressTimer); progressTimer = null }
@@ -1304,25 +1319,25 @@ if (processingMode.value === 'project-only') {
       const finalPayload = await waitForJobFinished(data.job_id)
       const normalized = normalizeResult(finalPayload)
 
-      if (!normalized.projectPath) throw new Error('工程文件未生成，无法视为处理成功')
+      if (!normalized.projectPath) throw new Error(t('processor.projectMissing'))
 
       result.value = normalized
       progressPercent.value = 100
-      updateProcessingStep(0, '跳过', '工程文件模式不需要 MFA 标注')
-      updateProcessingStep(1, '完成', 'F0 提取已完成')
-      updateProcessingStep(2, '完成', `工程文件已生成: ${getFileName(normalized.projectPath)}`)
-      ElMessage.success('✅ 工程文件生成成功！')
+      updateProcessingStep(0, t('processor.statusSkipped'), t('processor.projectModeNoAlign'))
+      updateProcessingStep(1, t('processor.statusDone'), t('processor.projectModeF0Done'))
+      updateProcessingStep(2, t('processor.statusDone'), `${t('processor.projectFile')}: ${getFileName(normalized.projectPath)}`)
+      ElMessage.success(`✅ ${t('processor.projectModeSuccess')}`)
       return
     }
 
-    if (!data.success) throw new Error(data.error || '工程文件生成失败')
+    if (!data.success) throw new Error(data.error || t('processor.submitFailed'))
     const normalized = normalizeResult(data)
     result.value = normalized
     progressPercent.value = 100
-    updateProcessingStep(0, '跳过', '工程文件模式不需要 MFA 标注')
-    updateProcessingStep(1, '完成', 'F0 提取已完成')
-    updateProcessingStep(2, '完成', `工程文件已生成: ${getFileName(normalized.projectPath || '')}`)
-    ElMessage.success('✅ 工程文件生成成功！')
+    updateProcessingStep(0, t('processor.statusSkipped'), t('processor.projectModeNoAlign'))
+    updateProcessingStep(1, t('processor.statusDone'), t('processor.projectModeF0Done'))
+    updateProcessingStep(2, t('processor.statusDone'), `${t('processor.projectFile')}: ${getFileName(normalized.projectPath || '')}`)
+    ElMessage.success(`✅ ${t('processor.projectModeSuccess')}`)
   } catch (e: any) {
     error.value = e?.message || String(e)
     ElMessage.error(`❌ ${error.value}`)
@@ -1338,21 +1353,21 @@ if (processingMode.value === 'project-only') {
   // 分支 2) 其他传统模式：需要音频，非 ASR 后端需要文本
   // ============================================================
   if (!formData.value.audioFile) {
-    ElMessage.warning('请选择音频文件')
+    ElMessage.warning(t('processor.selectAudio'))
     return
   }
   if (!formData.value.text.trim() && !isTextOptional.value) {
-    ElMessage.warning('请输入文本（MFA / Qwen3-ForcedAligner 模式需要参考文本）')
+    ElMessage.warning(t('processor.selectText'))
     return
   }
   if (!isReady.value) {
-    ElMessage.error('当前对齐后端未就绪，请检查系统状态')
+    ElMessage.error(t('processor.backendNotReady'))
     return
   }
 
   const maxSize = 512 * 1024 * 1024
   if (formData.value.audioFile.size > maxSize) {
-    ElMessage.warning('音频文件过大（>512MB），建议分割后再处理')
+    ElMessage.warning(t('processor.fileTooLarge'))
   }
 
   clearJobPolling()
@@ -1400,7 +1415,7 @@ if (processingMode.value === 'project-only') {
     const res = await fetch(endpoint, { method: 'POST', body: formDataObj })
     const data = await res.json()
 
-    if (!res.ok) throw new Error(data.error || '提交失败')
+    if (!res.ok) throw new Error(data.error || t('processor.submitFailed'))
 
     // full 和 mfa-only 均走异步轮询（后端返回 job_id）
     if (data.job_id) {
@@ -1408,35 +1423,35 @@ if (processingMode.value === 'project-only') {
       progressPercent.value = 35
 
       if (processingMode.value === 'mfa-only') {
-        updateProcessingStep(0, '进行中', `${alignerBackendLabel.value} 对齐中，请耐心等待...`)
-        updateProcessingStep(1, '等待', '仅标注模式将跳过此步骤')
-        updateProcessingStep(2, '等待', '仅标注模式将跳过此步骤')
+        updateProcessingStep(0, t('processor.statusProcessing'), `${alignerBackendLabel.value} ${t('processor.processing')}...`)
+        updateProcessingStep(1, t('processor.statusWaiting'), t('processor.projectModeNoAlign'))
+        updateProcessingStep(2, t('processor.statusWaiting'), t('processor.projectModeNoAlign'))
       } else {
-        updateProcessingStep(0, '进行中', `${alignerBackendLabel.value} 标注 + F0 提取 + 工程文件生成中...`)
-        updateProcessingStep(1, '等待', '等待 F0 提取')
-        updateProcessingStep(2, '等待', '等待工程文件生成')
+        updateProcessingStep(0, t('processor.statusProcessing'), `${alignerBackendLabel.value} ${t('processor.projectModeProcessing')}`)
+        updateProcessingStep(1, t('processor.statusWaiting'), t('processor.stageExtractF0'))
+        updateProcessingStep(2, t('processor.statusWaiting'), t('processor.projectModeWaitProject'))
       }
 
       const finalPayload = await waitForJobFinished(data.job_id)
       const normalized = normalizeResult(finalPayload)
 
       if (processingMode.value === 'full') {
-        if (!normalized.projectPath) throw new Error('工程文件未生成，无法视为处理成功')
-        updateProcessingStep(0, '完成', 'MFA 已完成')
-        updateProcessingStep(1, '完成', 'F0 提取已完成')
-        updateProcessingStep(2, '完成', `工程文件已生成: ${getFileName(normalized.projectPath)}`)
+        if (!normalized.projectPath) throw new Error(t('processor.projectMissing'))
+        updateProcessingStep(0, t('processor.statusDone'), `${t('processor.backendMfa')} ${t('processor.statusDone')}`)
+        updateProcessingStep(1, t('processor.statusDone'), t('processor.projectModeF0Done'))
+        updateProcessingStep(2, t('processor.statusDone'), `${t('processor.projectFile')}: ${getFileName(normalized.projectPath)}`)
       } else {
         // mfa-only
-        if (!normalized.labContent) throw new Error('LAB 内容为空，MFA 处理失败')
+        if (!normalized.labContent) throw new Error(t('processor.labEmpty'))
         const segCount = countLabSegments(normalized.labContent)
-        updateProcessingStep(0, '完成', `${segCount} 个标注段`)
-        updateProcessingStep(1, '跳过', '仅标注模式未执行 F0 提取')
-        updateProcessingStep(2, '跳过', '仅标注模式未生成工程文件')
+        updateProcessingStep(0, t('processor.statusDone'), `${segCount} ${t('processor.segmentCount')}`)
+        updateProcessingStep(1, t('processor.statusSkipped'), t('processor.projectModeNoAlign'))
+        updateProcessingStep(2, t('processor.statusSkipped'), t('processor.projectModeNoAlign'))
       }
 
       result.value = normalized
       progressPercent.value = 100
-      ElMessage.success('✅ 处理成功！')
+      ElMessage.success(`✅ ${t('processor.success')}`)
       return
     }
 
@@ -1444,28 +1459,28 @@ if (processingMode.value === 'project-only') {
     if (processingMode.value === 'full') {
       const normalized = normalizeResult(data)
       if (data.success && normalized.projectPath) {
-        updateProcessingStep(0, '完成', 'MFA 已完成')
-        updateProcessingStep(1, '完成', 'F0 提取已完成')
-        updateProcessingStep(2, '完成', `工程文件已生成: ${getFileName(normalized.projectPath)}`)
+        updateProcessingStep(0, t('processor.statusDone'), `${t('processor.backendMfa')} ${t('processor.statusDone')}`)
+        updateProcessingStep(1, t('processor.statusDone'), t('processor.projectModeF0Done'))
+        updateProcessingStep(2, t('processor.statusDone'), `${t('processor.projectFile')}: ${getFileName(normalized.projectPath)}`)
         result.value = normalized
         progressPercent.value = 100
-        ElMessage.success('✅ 处理成功！')
+        ElMessage.success(`✅ ${t('processor.success')}`)
         return
       }
-      throw new Error(data.error || '工程文件未生成，无法视为处理成功')
+      throw new Error(data.error || t('processor.projectMissing'))
     }
 
     // mfa-only 同步回退（后端已异步，此分支仅做兼容保留）
-    if (!data.success) throw new Error(data.error || 'MFA 处理失败')
+    if (!data.success) throw new Error(data.error || t('processor.jobFailed'))
     const normalized = normalizeResult(data)
-    if (!normalized.labContent) throw new Error('LAB 内容为空，MFA 处理失败')
+    if (!normalized.labContent) throw new Error(t('processor.labEmpty'))
     const segCount = countLabSegments(normalized.labContent)
     result.value = normalized
     progressPercent.value = 100
-    updateProcessingStep(0, '完成', `${segCount} 个标注段`)
-    updateProcessingStep(1, '跳过', '仅标注模式未执行 F0 提取')
-    updateProcessingStep(2, '跳过', '仅标注模式未生成工程文件')
-    ElMessage.success('✅ 处理成功！')
+    updateProcessingStep(0, t('processor.statusDone'), `${segCount} ${t('processor.segmentCount')}`)
+    updateProcessingStep(1, t('processor.statusSkipped'), t('processor.projectModeNoAlign'))
+    updateProcessingStep(2, t('processor.statusSkipped'), t('processor.projectModeNoAlign'))
+    ElMessage.success(`✅ ${t('processor.success')}`)
   } catch (e: any) {
     error.value = e?.message || String(e)
     ElMessage.error(`❌ ${error.value}`)
@@ -1478,7 +1493,7 @@ if (processingMode.value === 'project-only') {
 
 const downloadLab = () => {
   if (!result.value?.labContent) {
-    ElMessage.warning('没有 LAB 内容可下载')
+    ElMessage.warning(t('processor.noLabContent'))
     return
   }
 
@@ -1504,7 +1519,7 @@ const downloadLab = () => {
   element.click()
   document.body.removeChild(element)
 
-  ElMessage.success(`✅ LAB 文件已下载: ${filename}`)
+  ElMessage.success(`✅ ${t('processor.downloadLabFile')}: ${filename}`)
 }
 
 const downloadProject = async () => {
@@ -1514,7 +1529,7 @@ const downloadProject = async () => {
     const filename = result.value.projectPath.split(/[\\/]/).pop()
     const response = await fetch(`/api/work-dir/download/${encodeURIComponent(filename)}`)
     if (!response.ok) {
-      ElMessage.error('下载失败')
+      ElMessage.error(t('processor.submitFailed'))
       return
     }
     const blob = await response.blob()
@@ -1526,9 +1541,9 @@ const downloadProject = async () => {
     element.click()
     document.body.removeChild(element)
     window.URL.revokeObjectURL(url)
-    ElMessage.success('工程文件已下载')
+    ElMessage.success(t('processor.downloadProjectFile'))
   } catch (e) {
-    ElMessage.error(`下载失败: ${e}`)
+    ElMessage.error(`${t('processor.submitFailed')}: ${e}`)
   } finally {
     downloadingProject.value = false
   }
@@ -1537,9 +1552,9 @@ const downloadProject = async () => {
 const copyLabToClipboard = () => {
   if (!result.value?.labContent) return
   navigator.clipboard.writeText(result.value.labContent).then(() => {
-    ElMessage.success('已复制到剪贴板')
+    ElMessage.success(t('processor.copied'))
   }).catch(() => {
-    ElMessage.error('复制失败')
+    ElMessage.error(t('processor.copyFailed'))
   })
 }
 
@@ -1552,7 +1567,7 @@ const reset = () => {
     text: '',
     language: 'cmn',
     outputFormat: 'sv',
-    projectTitle: 'Project',
+    projectTitle: t('processor.defaultProjectTitle'),
     phonemeMode: 'none'
   }
   midiInfo.value = { bpm: 120, loaded: false }
@@ -1581,6 +1596,20 @@ const newProcess = () => {
   border-radius: 8px;
   box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
   margin-bottom: 20px;
+}
+
+.processor-form :deep(.el-form-item) {
+  margin-bottom: 20px;
+}
+
+.processor-form :deep(.el-form-item__label) {
+  white-space: normal;
+  line-height: 1.35;
+  padding-bottom: 8px;
+}
+
+.processor-form :deep(.el-form-item__content) {
+  width: 100%;
 }
 
 .card-header {
@@ -1615,6 +1644,11 @@ const newProcess = () => {
   color: #909399;
   font-size: 12px;
   margin-top: 5px;
+}
+
+.help-text .text-optional-hint {
+  color: #67c23a;
+  font-weight: 500;
 }
 
 /* 确保模式帮助文本在 Element 表单条目中强制换行，不向右侧外溢 */
