@@ -66,9 +66,20 @@ See the repository `LICENSE` file for the full text of the MIT License.
 
 ### 2.2 Frontend dependencies
 
-Include the license notices emitted by your frontend build toolchain for the packages bundled into the production output.
+#### MIT License
+- vue
+- element-plus
+- @element-plus/icons-vue
+- axios
+- @vitejs/plugin-vue
+- @vue/tsconfig
+- vite
+- vue-tsc
+- terser
 
-If you distribute a production bundle generated from the frontend, keep the license notices for all bundled dependencies that your build process emits.
+#### Other notes
+- `typescript` is included as a frontend development dependency and should be treated according to the license stated by its upstream package metadata in the version you ship.
+- If you redistribute a production bundle generated from the frontend, keep the license notices for all bundled dependencies that your build toolchain emits.
 
 ---
 
