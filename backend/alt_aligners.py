@@ -398,6 +398,21 @@ _LIGHT_END_PUNCT = "、，；,;"
 #      会用到这条规则，因此这里统一用 "sil" 而不是 "sp"。
 _SIL_MARK = "sil"
 
+# ── CTC 拉伸修复参数 ──────────────────────────────────────────────────────────
+# CTC blank frame 无"强制停顿"概念：blank frame 在最优路径下被分配给短语末尾
+# 的最后一个 token，导致换气/停顿处 token 时长被系统性拉长（实测 1.2s～1.7s）。
+# 以下常量定义各类 token 的时长上限，超过 _CTC_MAX_*_SEC + _CTC_MIN_SP_SEC
+# 的 token 会被截断，多出的时长转为 SP 静音标记。
+#
+# 典型问题案例（来自实际日志）：
+#   话(1.36s)  啦(1.34s)  来(1.22s)  害(1.24s)  杖(1.14s)  。(1.74s)
+# 均发生在短语内部的呼气/换气停顿处，而非仅限于句末。
+_CTC_PARTICLES: frozenset = frozenset('啦呀嘛哦呢吧了的地得着过噢喔哈嗯唔嘞哇')
+_CTC_MAX_CJK_CHAR_SEC:    float = 0.50   # CJK 单字符最大时长
+_CTC_MAX_CJK_PARTICLE_SEC: float = 0.35  # 语气词最大时长（通常更短）
+_CTC_MAX_EN_WORD_SEC:     float = 1.20   # 英文单词最大时长（宽松，仅捕获极端拉伸）
+_CTC_MIN_SP_SEC:          float = 0.15   # 低于此值的剩余时长不值得插入 SP
+
 # ─────────────────────────────────────────────────────────────────────────
 # SudachiPy 惰性单例；
 # 词典加载较慢，进程内只创建一次。
@@ -964,6 +979,118 @@ def _refine_sil_boundaries_by_energy(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# 3b. CTC 短语边界拉伸修复
+#
+#     根本原因：WhisperX / wav2vec2 的 CTC forced alignment 无"强制停顿"概念，
+#     只有 token 和 blank（空白帧）。CTC 最优路径会把短语边界处的所有 blank
+#     frame 分配给最后一个 token，导致换气/停顿处 token 时长被系统性拉长。
+#
+#     现象：说话/演唱时短语末尾字符（如"话""啦""来""害"等）出现 1.2s～1.7s
+#     超长时长，下游 LAB→SVP 流程将其转化为超长音符，音符首尾相连（legato）。
+#
+#     这与标点/句末无关——任何呼气停顿处（包括句子内部）都会出现。
+#     _inject_sentence_pauses() 仅处理参考文本中有标点标记的位置（且上限为
+#     40/80ms），无法解决这种无标点标记的短语内部呼气停顿。
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _fix_ctc_stretch(
+    entries: List[Tuple[float, float, str]],
+    int_lang: str,
+    max_cjk_char_sec:    float = _CTC_MAX_CJK_CHAR_SEC,
+    max_cjk_particle_sec: float = _CTC_MAX_CJK_PARTICLE_SEC,
+    max_en_word_sec:     float = _CTC_MAX_EN_WORD_SEC,
+    min_sp_sec:          float = _CTC_MIN_SP_SEC,
+) -> List[Tuple[float, float, str]]:
+    """
+    修复 WhisperX CTC 短语边界拉伸问题。
+
+    对超过时长上限的 token 进行截断，并将多出的时长转为 SP 静音条目，
+    供 _refine_sil_boundaries_by_energy() 进一步精化至真实静音边界。
+
+    **调用时机**：在 _inject_sentence_pauses() 之后、
+    _refine_sil_boundaries_by_energy() 之前。
+
+    之所以在 _inject_sentence_pauses 之后调用：
+      _inject_sentence_pauses 按"seg_text 中第 k 个可发音字符对应
+      seg_entries[k]"的逐索引映射工作。若在它之前就插入 SP，则
+      seg_entries 中会混有 SP 条目，导致映射错位（sp 条目被错误地
+      当作可发音字符处理，后续的真实字符全部偏移一位）。
+
+    **相邻 SP 合并**：_inject_sentence_pauses 可能已在标点处插入了小 SP
+    （40/80ms），本函数截断后可能在同位置紧接着再产生一条 SP，两条
+    相邻 SP 会被 _refine_sil_boundaries_by_energy 直接跳过（该函数有
+    "prev_t == sil_mark 则 continue"的保护）。这里在第二步将所有相邻
+    SP 合并为一条，确保能量修正能正常扩展到真实静音区域。
+
+    参数
+    ----
+    max_cjk_char_sec    : CJK 单字符时长上限（默认 0.50s）
+    max_cjk_particle_sec : 语气词时长上限（默认 0.35s）
+    max_en_word_sec     : 英文单词时长上限（默认 1.20s，宽松值）
+    min_sp_sec          : 低于此值不插入 SP（避免无意义的极短静音）
+    """
+    if not entries:
+        return entries
+
+    _SIL_SET = frozenset({_SIL_MARK, "sp", "sil", "pau", "spn"})
+    is_cjk = int_lang in ("zh", "yue", "ja", "ko")
+
+    # ── 第一步：扫描超长 token，截断并插入 SP 占位 ───────────────────────
+    raw: List[Tuple[float, float, str]] = []
+    clipped = 0
+
+    for s, e, t in entries:
+        dur     = e - s
+        t_lower = (t or "").strip().lower()
+
+        # 已是静音标记或零长度条目，原样保留
+        if t_lower in _SIL_SET or dur <= 0:
+            raw.append((s, e, t))
+            continue
+
+        # 选择当前 token 对应的时长上限
+        if is_cjk:
+            ceiling = (max_cjk_particle_sec
+                       if t in _CTC_PARTICLES
+                       else max_cjk_char_sec)
+        else:
+            ceiling = max_en_word_sec
+
+        if dur > ceiling + min_sp_sec:
+            clip_end = s + ceiling
+            sp_dur   = e - clip_end
+            raw.append((s, clip_end, t))
+            if sp_dur >= min_sp_sec:
+                raw.append((clip_end, e, _SIL_MARK))
+            clipped += 1
+            logger.debug(
+                f"[ctc_fix] '{t}' {dur:.3f}s → {ceiling:.3f}s"
+                f"{f' + SP {sp_dur:.3f}s' if sp_dur >= min_sp_sec else ' (SP 过短跳过)'}"
+            )
+        else:
+            raw.append((s, e, t))
+
+    if clipped:
+        logger.info(f"[ctc_fix] 共修复 {clipped} 个 CTC 拉伸 token")
+
+    # ── 第二步：合并相邻 SP 条目 ─────────────────────────────────────────
+    # 保证 _refine_sil_boundaries_by_energy 能正常扩展边界（该函数遇到
+    # 相邻两条 SP 会 continue 跳过）。
+    merged: List[Tuple[float, float, str]] = []
+    for entry in raw:
+        s_e, e_e, t_e = entry
+        if (merged
+                and (merged[-1][2] or "").strip().lower() in _SIL_SET
+                and (t_e or "").strip().lower() in _SIL_SET):
+            # 扩展前一条 SP 的结束时间而不是新建条目
+            merged[-1] = (merged[-1][0], e_e, _SIL_MARK)
+        else:
+            merged.append(entry)
+
+    return merged
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # 4. 基类
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -977,7 +1104,8 @@ class AltAlignerBase:
         from mfa_processor import MFAProcessor
         self._mfa = MFAProcessor()
 
-    def align(self, audio_path: str, text: Optional[str], language: str) -> Dict:
+    def align(self, audio_path: str, text: Optional[str], language: str,
+              english_word_align: bool = False) -> Dict:
         raise NotImplementedError
 
     # ── 词语时间戳 → LAB（含静音间隙补全）────────────────────────────────
@@ -987,10 +1115,12 @@ class AltAlignerBase:
         text: str,
         language: str,
         fill_silences: bool = False,
+        english_word_align: bool = False,
     ) -> str:
         """
         将词语 / 字符级时间戳 → LAB 格式，复用 MFAProcessor 的音素转换逻辑。
         fill_silences=True 时自动在时间间隙中插入 SIL。
+        english_word_align=True 时英语单词直接输出，不做 ARPABET 音素拆分。
 
         关于标点：
           Qwen3 不产生标点字符的对齐时间戳（标点不可发音）。
@@ -1023,18 +1153,21 @@ class AltAlignerBase:
             lab = self._ja_entries_to_lab(word_entries, text)
             return _fill_silences_lab(lab) if fill_silences else lab
         if lang == "ko":
-            lab = self._ko_entries_to_lab(word_entries, text)
+            lab = self._ko_entries_to_lab(word_entries, text, english_word_align=english_word_align)
             return _fill_silences_lab(lab) if fill_silences else lab
 
         word_tier = [_MI(s, e, w) for s, e, w in word_entries]
         phone_items: List[Tuple[int, int, str]] = []
 
         if lang in ("zh", "cmn"):
-            lines = self._mfa._process_zh_words(word_tier, phone_items, text)
+            lines = self._mfa._process_zh_words(word_tier, phone_items, text,
+                                                 english_word_align=english_word_align)
         elif lang == "yue":
-            lines = self._mfa._process_yue_words(word_tier, phone_items, text)
+            lines = self._mfa._process_yue_words(word_tier, phone_items, text,
+                                                  english_word_align=english_word_align)
         else:
-            lines = self._mfa._process_en_words(word_tier, phone_items, text)
+            lines = self._mfa._process_en_words(word_tier, phone_items, text,
+                                                 english_word_align=english_word_align)
 
         lines = self._mfa._apply_lab_postprocess(lines, lang)
         lab = "\n".join(lines)
@@ -1163,6 +1296,7 @@ class AltAlignerBase:
         self,
         word_entries: List[Tuple[float, float, str]],
         text: str,
+        english_word_align: bool = False,
     ) -> str:
         lines: List[str] = []
         for s, e, ch in word_entries:
@@ -1173,20 +1307,6 @@ class AltAlignerBase:
             e100 = int(e * 10_000_000)
 
             if self._mfa._is_korean_text(ch):
-                # 【修复说明】旧版对 len(ch) == 1 才走逐字分解路径，多字情况
-                # （整词 / 整句落在一个 entry 里，如 WhisperX wav2vec2-ko
-                # 只能输出 eojeol 级时间戳、或对齐异常降级为全句单条目时）
-                # 直接落入 else 分支，整个字符串写成一行 LAB，后续 SVP 无法
-                # 按音节切分，表现为"整句粘连为单一时间区间"。
-                #
-                # 修复：无论单字还是多字（甚至整句），统一调用 MFA 的韩语逐字
-                # 分解逻辑 _decompose_korean_syllable_with_onset：
-                #   - phone_items=None → 走等比例时长兜底路径，按 jamo 数
-                #     给每个音节块分配时间，再按有无初声 (- + char / char) 输出。
-                #   - 单字情况行为与旧版完全一致（向后兼容）。
-                #
-                # 同时过滤掉混入 ch 的标点 / 空格（降级回退时 seg_text 可能
-                # 含逗号、问号等），保留纯韩文字符交给分解函数。
                 ko_only = "".join(c for c in ch if self._mfa._is_korean_text(c))
                 if not ko_only:
                     continue
@@ -1196,17 +1316,19 @@ class AltAlignerBase:
                 for se, ee, pe in syllable_entries:
                     lines.append(f"{se} {ee} {pe}")
             else:
-                # 英语 / 拉丁字母单词：走 G2P → ARPABET 音素级输出，
-                # 与 MFAProcessor._process_ko_words 的英语回退路径保持一致。
-                if re.match(r"^[a-zA-Z''\-]+$", ch.strip()):
-                    from phoneme_converter import word_to_arpabet, distribute_arpabet_phones
-                    g2p_phones = word_to_arpabet(ch)
-                    if g2p_phones:
-                        for ps, pe, pp in distribute_arpabet_phones(s100, e100, g2p_phones):
-                            lines.append(f"{ps} {pe} {pp}")
-                    else:
-                        logger.warning(f"[ko/alt] 英语词 '{ch}' G2P 未命中，按整词输出")
+                if re.match(r"^[a-zA-Z\'\'-]+$", ch.strip()):
+                    if english_word_align:
+                        # 英语单词级对齐：直接输出单词，不做 ARPABET 拆分
                         lines.append(f"{s100} {e100} {ch.lower()}")
+                    else:
+                        from phoneme_converter import word_to_arpabet, distribute_arpabet_phones
+                        g2p_phones = word_to_arpabet(ch)
+                        if g2p_phones:
+                            for ps, pe, pp in distribute_arpabet_phones(s100, e100, g2p_phones):
+                                lines.append(f"{ps} {pe} {pp}")
+                        else:
+                            logger.warning(f"[ko/alt] 英语词 '{ch}' G2P 未命中，按整词输出")
+                            lines.append(f"{s100} {e100} {ch.lower()}")
                 else:
                     lines.append(f"{s100} {e100} {ch}")
 
@@ -1215,7 +1337,6 @@ class AltAlignerBase:
         from phoneme_converter import merge_lab_silence
         merged = merge_lab_silence(entries_p)
         return "\n".join(f"{s} {e} {p}" for s, e, p in merged)
-
     def _get_audio_duration_100ns(self, audio_path: str) -> int:
         return self._mfa._get_audio_duration(audio_path)
 
@@ -1240,9 +1361,20 @@ class WhisperXAligner(AltAlignerBase):
       - 安装：pip install whisperx
     """
 
+    # 当前支持的 Whisper 模型列表（由前端选择器引用）
+    SUPPORTED_MODELS: List[str] = [
+        "large-v3",
+        "large-v3-turbo",
+        "large-v2",
+        "medium",
+        "small",
+        "base",
+        "tiny",
+    ]
+
     def __init__(
         self,
-        whisper_model: str = "large-v2",
+        whisper_model: str = "large-v3",
         device: str = "auto",
         compute_type: str = "float16",
         batch_size: int = 16,
@@ -1375,7 +1507,8 @@ class WhisperXAligner(AltAlignerBase):
         return self._align_models[lang_code]
 
     # ── 核心对齐（句子隔离版）────────────────────────────────────────────────
-    def align(self, audio_path: str, text: Optional[str], language: str) -> Dict:
+    def align(self, audio_path: str, text: Optional[str], language: str,
+              english_word_align: bool = False) -> Dict:
         """
         句子隔离强制对齐（Sentence-Isolated Alignment）。
 
@@ -1605,6 +1738,17 @@ class WhisperXAligner(AltAlignerBase):
                 # 新的拼音/音节错位。
                 seg_entries = _inject_sentence_pauses(seg_entries, seg_text)
 
+                # 【CTC 拉伸修复】WhisperX wav2vec2 CTC blank frame 无"强制
+                # 停顿"概念，会把短语边界换气/停顿处的 blank frame 全部分配给
+                # 上一个 token，导致短语末尾字符时长被严重拉长（实测 1.2s～
+                # 1.7s）。_inject_sentence_pauses 只处理有标点标记的位置且
+                # 上限仅 40/80ms，无法解决无标点的呼气停顿拉伸问题。
+                # 此步截断超限 token 并插入 SP 占位，供下一步能量修正扩展到
+                # 真实静音边界（详见 _fix_ctc_stretch 顶部说明）。
+                # 注意：必须在 _inject_sentence_pauses 之后调用，避免破坏
+                # 该函数按字符索引映射 gap_after 的内部逻辑。
+                seg_entries = _fix_ctc_stretch(seg_entries, int_lang)
+
                 # 上一步给的 40/80ms 只是"至少要有多长停顿"的下限，
                 # 不代表音频里真实的换气/停顿就这么短——wav2vec2 经常
                 # 把真正的静音错误地算进标点前最后一个字的时长里。这里
@@ -1640,7 +1784,8 @@ class WhisperXAligner(AltAlignerBase):
                 if not seg_entries:
                     continue
                 block = self._word_entries_to_lab(
-                    seg_entries, seg_text, language, fill_silences=False
+                    seg_entries, seg_text, language, fill_silences=False,
+                    english_word_align=english_word_align
                 )
                 if block.strip():
                     lab_blocks.append(block)
@@ -1799,7 +1944,8 @@ class WhisperXAligner(AltAlignerBase):
         lang = _normalize_lang(language)
         if lang not in ("zh", "yue", "ja") or not full_text:
             flat = [e for seg in seg_entries_list for e in seg]
-            return self._word_entries_to_lab(flat, full_text, language, fill_silences=False)
+            return self._word_entries_to_lab(flat, full_text, language, fill_silences=False,
+                                              english_word_align=english_word_align)
         spoken_chars = [
             ch for ch in full_text
             if not unicodedata.category(ch).startswith(("P", "Z", "S"))
@@ -1813,7 +1959,8 @@ class WhisperXAligner(AltAlignerBase):
             blocks = []
             for seg_entries in seg_entries_list:
                 seg_text = "".join(t for _, _, t in seg_entries)
-                b = self._word_entries_to_lab(seg_entries, seg_text, language, fill_silences=False)
+                b = self._word_entries_to_lab(seg_entries, seg_text, language, fill_silences=False,
+                                          english_word_align=english_word_align)
                 if b.strip():
                     blocks.append(b)
             return "\n".join(blocks)
@@ -1823,7 +1970,8 @@ class WhisperXAligner(AltAlignerBase):
             n = len(seg_entries)
             seg_text = "".join(spoken_chars[cursor:cursor + n])
             cursor += n
-            b = self._word_entries_to_lab(seg_entries, seg_text, language, fill_silences=False)
+            b = self._word_entries_to_lab(seg_entries, seg_text, language, fill_silences=False,
+                                      english_word_align=english_word_align)
             if b.strip():
                 blocks.append(b)
         return "\n".join(blocks)
@@ -1951,7 +2099,8 @@ class Qwen3ASRAligner(AltAlignerBase):
 
         return entries
 
-    def align(self, audio_path: str, text: Optional[str], language: str) -> Dict:
+    def align(self, audio_path: str, text: Optional[str], language: str,
+              english_word_align: bool = False) -> Dict:
         t0 = time.time()
         try:
             int_lang = _normalize_lang(language)
@@ -2032,6 +2181,7 @@ class Qwen3ASRAligner(AltAlignerBase):
                 final_text,
                 language,
                 fill_silences=True,
+                english_word_align=english_word_align,
             )
 
             return {
@@ -2179,7 +2329,8 @@ class Qwen3ForcedAligner(AltAlignerBase):
             device_map=device,
         )
 
-    def align(self, audio_path: str, text: Optional[str], language: str) -> Dict:
+    def align(self, audio_path: str, text: Optional[str], language: str,
+              english_word_align: bool = False) -> Dict:
         t0 = time.time()
         if not text:
             return {
@@ -2233,7 +2384,8 @@ class Qwen3ForcedAligner(AltAlignerBase):
             # 体现为真实词与词之间的时间间隙，需要 fill_silences=True
             # 才能把这些间隙转换成 SVP 能识别的 SIL 标记。
             lab = self._word_entries_to_lab(
-                word_entries, text, language, fill_silences=True
+                word_entries, text, language, fill_silences=True,
+                english_word_align=english_word_align,
             )
 
             return {
@@ -2374,12 +2526,23 @@ def get_aligner(backend: str, device: str = "auto", **kwargs) -> AltAlignerBase:
     """
     工厂函数：按 backend 名称创建或复用对齐器单例。
     backend: "whisperx" | "qwen3_asr" | "qwen3_aligner"
+
+    对于 "whisperx"，额外识别 whisper_model 关键字参数（默认 "large-v3"）。
+    不同 model 使用独立缓存键，切换模型会创建新实例（旧实例保留在内存中，
+    避免重复初始化开销）。
     """
     global _SINGLETON
+    if backend == "whisperx":
+        whisper_model = kwargs.pop("whisper_model", "large-v3")
+        cache_key = f"whisperx:{whisper_model}"
+        if cache_key not in _SINGLETON:
+            _SINGLETON[cache_key] = WhisperXAligner(
+                whisper_model=whisper_model, device=device, **kwargs
+            )
+        return _SINGLETON[cache_key]
+
     if backend not in _SINGLETON:
-        if backend == "whisperx":
-            _SINGLETON[backend] = WhisperXAligner(device=device, **kwargs)
-        elif backend == "qwen3_asr":
+        if backend == "qwen3_asr":
             _SINGLETON[backend] = Qwen3ASRAligner(device=device, **kwargs)
         elif backend == "qwen3_aligner":
             _SINGLETON[backend] = Qwen3ForcedAligner(device=device, **kwargs)
@@ -2397,10 +2560,12 @@ def get_alt_aligner_status() -> Dict:
     return {
         "models_dir": str(_MODELS_DIR),        # ← 前端可展示此路径
         "whisperx": {
-            "available":     wx_ok,
-            "message":       wx_msg,
-            "requires_text": False,
-            "description":   "WhisperX (Whisper ASR + wav2vec2 强制对齐)",
+            "available":       wx_ok,
+            "message":         wx_msg,
+            "requires_text":   False,
+            "description":     "WhisperX (Whisper ASR + wav2vec2 强制对齐)",
+            "default_model":   "large-v3",
+            "supported_models": WhisperXAligner.SUPPORTED_MODELS,
         },
         "qwen3_asr": {
             "available":     qa_ok,

@@ -352,6 +352,8 @@ def run_pipeline_job(
     f0_device: str = "auto",
     crepe_model: str = "full",
     aligner_backend: str = "mfa",
+    whisperx_model: str = "large-v3",
+    english_word_align: bool = False,
 ):
     try:
         set_job(
@@ -399,6 +401,8 @@ def run_pipeline_job(
             f0_device=f0_device,
             crepe_model=crepe_model,
             aligner_backend=aligner_backend,
+            whisperx_model=whisperx_model,
+            english_word_align=english_word_align,
         )
 
         if result.get("success"):
@@ -485,6 +489,12 @@ def pipeline_full_process():
         if aligner_backend not in ("mfa", "whisperx", "qwen3_asr", "qwen3_aligner"):
             aligner_backend = "mfa"
 
+        whisperx_model = request.form.get("whisperx_model", "large-v3")
+        if whisperx_model not in ("large-v3", "large-v3-turbo", "large-v2", "medium", "small", "base", "tiny"):
+            whisperx_model = "large-v3"
+
+        english_word_align = request.form.get("english_word_align", "false").lower() == "true"
+
         stem, wav_path, lab_path = build_job_paths(audio_file.filename or "audio.wav")
 
         audio_file.save(str(wav_path))
@@ -525,6 +535,8 @@ def pipeline_full_process():
                 f0_device,
                 crepe_model,
                 aligner_backend,
+                whisperx_model,
+                english_word_align,
             ),
         ).start()
 
@@ -546,7 +558,9 @@ def pipeline_full_process():
 # =====================================================================
 
 def run_mfa_only_job(job_id: str, wav_path: str, text: str, language: str,
-                     aligner_backend: str = "mfa", f0_device: str = "auto"):
+                     aligner_backend: str = "mfa", f0_device: str = "auto",
+                     whisperx_model: str = "large-v3",
+                     english_word_align: bool = False):
     try:
         set_job(
             job_id,
@@ -573,7 +587,9 @@ def run_mfa_only_job(job_id: str, wav_path: str, text: str, language: str,
         # 执行对齐标注
         result = pipeline.process_mfa_only(compat_audio_file, text, language,
                                            aligner_backend=aligner_backend,
-                                           f0_device=f0_device)
+                                           f0_device=f0_device,
+                                           whisperx_model=whisperx_model,
+                                           english_word_align=english_word_align)
 
         if result.get("success"):
             set_job(
@@ -617,6 +633,12 @@ def pipeline_mfa_only():
             aligner_backend = "mfa"
         f0_device = request.form.get("f0_device", "auto")
 
+        whisperx_model = request.form.get("whisperx_model", "large-v3")
+        if whisperx_model not in ("large-v3", "large-v3-turbo", "large-v2", "medium", "small", "base", "tiny"):
+            whisperx_model = "large-v3"
+
+        english_word_align = request.form.get("english_word_align", "false").lower() == "true"
+
         # WhisperX / Qwen3-ASR 支持纯 ASR 模式，文本可选
         text_optional = aligner_backend in ("whisperx", "qwen3_asr")
         if not audio_file or (not text and not text_optional):
@@ -640,7 +662,8 @@ def pipeline_mfa_only():
         Thread(
             target=run_mfa_only_job,
             daemon=True,
-            args=(job_id, str(wav_path), text, language, aligner_backend, f0_device),
+            args=(job_id, str(wav_path), text, language, aligner_backend, f0_device,
+                  whisperx_model, english_word_align),
         ).start()
 
         # 4. 立即返回 job_id 供前端轮询

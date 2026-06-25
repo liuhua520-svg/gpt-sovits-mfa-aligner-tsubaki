@@ -830,7 +830,8 @@ class MFAProcessor:
         self,
         word_tier,
         phone_items: List[Tuple[int, int, str]],
-        text: str
+        text: str,
+        english_word_align: bool = False,
     ) -> List[str]:
         """处理中文 Word Tier → 拼音 + con 标记"""
         target_syls = self._normalize_no_tone_pinyin(self._text_to_pinyin_notone(text))
@@ -851,24 +852,28 @@ class MFAProcessor:
                
 
             if self._is_english_word(mark):
-                entries = self._get_arpabet_entries(start, end, phone_items)
-                if entries:
-                    for s, e, p in entries:
-                        lines.append(f"{s} {e} {p}")
+                if english_word_align:
+                    # 英语单词级对齐模式：直接输出单词，不做音素拆分
+                    lines.append(f"{start} {end} {mark.lower()}")
                 else:
-                    # MFA Phone Tier 为空（CJK 声学模型不输出 ARPABET，或替代
-                    # 对齐后端 phone_items=[]）：走 G2P 获取音素序列，再按权重
-                    # 比例把词的时间跨度分配给各个 ARPABET 音素。
-                    g2p_phones = word_to_arpabet(mark)
-                    if g2p_phones:
-                        for s, e, p in distribute_arpabet_phones(start, end, g2p_phones):
+                    entries = self._get_arpabet_entries(start, end, phone_items)
+                    if entries:
+                        for s, e, p in entries:
                             lines.append(f"{s} {e} {p}")
                     else:
-                        logger.warning(
-                            f"[zh] 英语词 '{mark}' 无法获取音素（MFA Phone Tier 为空，"
-                            "G2P 词典 / g2p_en 均未命中），按整词输出。"
-                        )
-                        lines.append(f"{start} {end} {mark.lower()}")
+                        # MFA Phone Tier 为空（CJK 声学模型不输出 ARPABET，或替代
+                        # 对齐后端 phone_items=[]）：走 G2P 获取音素序列，再按权重
+                        # 比例把词的时间跨度分配给各个 ARPABET 音素。
+                        g2p_phones = word_to_arpabet(mark)
+                        if g2p_phones:
+                            for s, e, p in distribute_arpabet_phones(start, end, g2p_phones):
+                                lines.append(f"{s} {e} {p}")
+                        else:
+                            logger.warning(
+                                f"[zh] 英语词 '{mark}' 无法获取音素（MFA Phone Tier 为空，"
+                                "G2P 词典 / g2p_en 均未命中），按整词输出。"
+                            )
+                            lines.append(f"{start} {end} {mark.lower()}")
                 continue
 
             if self._is_digit_char(mark):
@@ -902,9 +907,10 @@ class MFAProcessor:
         self,
         word_tier,
         phone_items: List[Tuple[int, int, str]],
-        text: str
+        text: str,
+        english_word_align: bool = False,
     ) -> List[str]:
-        """处理英语 Word Tier → ARPABET"""
+        """处理英语 Word Tier → ARPABET（或单词级，取决于 english_word_align）"""
         lines: List[str] = []
 
         for interval in word_tier:
@@ -917,6 +923,11 @@ class MFAProcessor:
                 continue
             if mark in self.SIL_PHONES or mark in ("sp", "spn"):
                 lines.append(f"{start} {end} sil")
+                continue
+
+            # 英语单词级对齐模式：直接输出单词，跳过音素拆分
+            if english_word_align:
+                lines.append(f"{start} {end} {mark.lower()}")
                 continue
 
             entries = self._get_arpabet_entries(start, end, phone_items)
@@ -1072,7 +1083,8 @@ class MFAProcessor:
         self,
         word_tier,
         phone_items: List[Tuple[int, int, str]],
-        text: str
+        text: str,
+        english_word_align: bool = False,
     ) -> List[str]:
         """处理韩语 Word Tier"""
         lines: List[str] = []
@@ -1090,21 +1102,25 @@ class MFAProcessor:
                 continue
 
             if self._is_english_word(mark):
-                entries = self._get_arpabet_entries(start, end, phone_items)
-                if entries:
-                    for s, e, p in entries:
-                        lines.append(f"{s} {e} {p}")
+                if english_word_align:
+                    # 英语单词级对齐模式：直接输出单词，不做音素拆分
+                    lines.append(f"{start} {end} {mark.lower()}")
                 else:
-                    g2p_phones = word_to_arpabet(mark)
-                    if g2p_phones:
-                        for s, e, p in distribute_arpabet_phones(start, end, g2p_phones):
+                    entries = self._get_arpabet_entries(start, end, phone_items)
+                    if entries:
+                        for s, e, p in entries:
                             lines.append(f"{s} {e} {p}")
                     else:
-                        logger.warning(
-                            f"[ko] 英语词 '{mark}' 无法获取音素（MFA Phone Tier 为空，"
-                            "G2P 词典 / g2p_en 均未命中），按整词输出。"
-                        )
-                        lines.append(f"{start} {end} {mark.lower()}")
+                        g2p_phones = word_to_arpabet(mark)
+                        if g2p_phones:
+                            for s, e, p in distribute_arpabet_phones(start, end, g2p_phones):
+                                lines.append(f"{s} {e} {p}")
+                        else:
+                            logger.warning(
+                                f"[ko] 英语词 '{mark}' 无法获取音素（MFA Phone Tier 为空，"
+                                "G2P 词典 / g2p_en 均未命中），按整词输出。"
+                            )
+                            lines.append(f"{start} {end} {mark.lower()}")
                 continue
 
             if self._is_korean_text(mark):
@@ -1266,7 +1282,8 @@ class MFAProcessor:
         self,
         word_tier,
         phone_items: List[Tuple[int, int, str]],
-        text: str
+        text: str,
+        english_word_align: bool = False,
     ) -> List[str]:
         """处理粤语 Word Tier → 粤拼 + con 标记"""
         target_syls = self._normalize_jyutping(self._text_to_jyutping(text))
@@ -1286,21 +1303,25 @@ class MFAProcessor:
                 continue
 
             if self._is_english_word(mark):
-                entries = self._get_arpabet_entries(start, end, phone_items)
-                if entries:
-                    for s, e, p in entries:
-                        lines.append(f"{s} {e} {p}")
+                if english_word_align:
+                    # 英语单词级对齐模式：直接输出单词，不做音素拆分
+                    lines.append(f"{start} {end} {mark.lower()}")
                 else:
-                    g2p_phones = word_to_arpabet(mark)
-                    if g2p_phones:
-                        for s, e, p in distribute_arpabet_phones(start, end, g2p_phones):
+                    entries = self._get_arpabet_entries(start, end, phone_items)
+                    if entries:
+                        for s, e, p in entries:
                             lines.append(f"{s} {e} {p}")
                     else:
-                        logger.warning(
-                            f"[yue] 英语词 '{mark}' 无法获取音素（MFA Phone Tier 为空，"
-                            "G2P 词典 / g2p_en 均未命中），按整词输出。"
-                        )
-                        lines.append(f"{start} {end} {mark.lower()}")
+                        g2p_phones = word_to_arpabet(mark)
+                        if g2p_phones:
+                            for s, e, p in distribute_arpabet_phones(start, end, g2p_phones):
+                                lines.append(f"{s} {e} {p}")
+                        else:
+                            logger.warning(
+                                f"[yue] 英语词 '{mark}' 无法获取音素（MFA Phone Tier 为空，"
+                                "G2P 词典 / g2p_en 均未命中），按整词输出。"
+                            )
+                            lines.append(f"{start} {end} {mark.lower()}")
                 continue
 
             if self._is_digit_char(mark):
@@ -1344,7 +1365,8 @@ class MFAProcessor:
         self,
         textgrid_path: str,
         text: str,
-        lang: str = 'zh'
+        lang: str = 'zh',
+        english_word_align: bool = False,
     ) -> str:
         """Word Tier 对齐主逻辑（含 LAB 后处理）"""
         try:
@@ -1370,24 +1392,24 @@ class MFAProcessor:
                 phone_items = self._extract_phone_items(phone_tier)
             
             if lang in ('zh', 'cmn'):
-                lines = self._process_zh_words(word_tier, phone_items, text)
+                lines = self._process_zh_words(word_tier, phone_items, text, english_word_align=english_word_align)
             elif lang == 'en':
-                lines = self._process_en_words(word_tier, phone_items, text)
+                lines = self._process_en_words(word_tier, phone_items, text, english_word_align=english_word_align)
             elif lang == 'ja':
                 lines = self._process_ja_words(word_tier, phone_items, text)
             elif lang == 'ko':
-                lines = self._process_ko_words(word_tier, phone_items, text)
+                lines = self._process_ko_words(word_tier, phone_items, text, english_word_align=english_word_align)
             elif lang == 'yue':
-                lines = self._process_yue_words(word_tier, phone_items, text)
+                lines = self._process_yue_words(word_tier, phone_items, text, english_word_align=english_word_align)
             else:
-                lines = self._process_en_words(word_tier, phone_items, text)
+                lines = self._process_en_words(word_tier, phone_items, text, english_word_align=english_word_align)
             
             # ★ 后处理：日语 romaji → hiragana；所有语言合并 '-' 标记
             lines = self._apply_lab_postprocess(lines, lang)
             return "\n".join(lines)
             
         except ImportError:
-            return self._parse_textgrid_manual(textgrid_path, text, lang)
+            return self._parse_textgrid_manual(textgrid_path, text, lang, english_word_align=english_word_align)
         except Exception as e:
             logger.error(f"对齐失败: {e}", exc_info=True)
             return ""
@@ -1439,7 +1461,8 @@ class MFAProcessor:
         self,
         textgrid_path: str,
         text: str,
-        lang: str = 'zh'
+        lang: str = 'zh',
+        english_word_align: bool = False,
     ) -> str:
         """手工解析 TextGrid"""
         try:
@@ -1478,17 +1501,17 @@ class MFAProcessor:
                 phone_items = self._extract_phone_items(phone_tier)
             
             if lang in ('zh', 'cmn'):
-                lines = self._process_zh_words(word_tier, phone_items, text)
+                lines = self._process_zh_words(word_tier, phone_items, text, english_word_align=english_word_align)
             elif lang == 'en':
-                lines = self._process_en_words(word_tier, phone_items, text)
+                lines = self._process_en_words(word_tier, phone_items, text, english_word_align=english_word_align)
             elif lang == 'ja':
                 lines = self._process_ja_words(word_tier, phone_items, text)
             elif lang == 'ko':
-                lines = self._process_ko_words(word_tier, phone_items, text)
+                lines = self._process_ko_words(word_tier, phone_items, text, english_word_align=english_word_align)
             elif lang == 'yue':
-                lines = self._process_yue_words(word_tier, phone_items, text)
+                lines = self._process_yue_words(word_tier, phone_items, text, english_word_align=english_word_align)
             else:
-                lines = self._process_en_words(word_tier, phone_items, text)
+                lines = self._process_en_words(word_tier, phone_items, text, english_word_align=english_word_align)
             
             # ★ 后处理：日语 romaji → hiragana；所有语言合并 '-' 标记
             lines = self._apply_lab_postprocess(lines, lang)
@@ -1498,8 +1521,10 @@ class MFAProcessor:
             logger.error(f"手工解析失败: {e}", exc_info=True)
             return ""
 
-    def _textgrid_to_lab(self, textgrid_path: str, text: str, lang: str = 'zh') -> str:
-        return self._textgrid_to_lab_word_tier_primary(textgrid_path, text, lang)
+    def _textgrid_to_lab(self, textgrid_path: str, text: str, lang: str = 'zh',
+                          english_word_align: bool = False) -> str:
+        return self._textgrid_to_lab_word_tier_primary(textgrid_path, text, lang,
+                                                        english_word_align=english_word_align)
 
     def _get_audio_duration(self, audio_path: str) -> int:
         try:
@@ -1522,7 +1547,8 @@ class MFAProcessor:
     # =====================================================================
     # 主流程（修改位置）
     # =====================================================================
-    def process(self, audio_file, text: str, language: str = "cmn") -> Dict:
+    def process(self, audio_file, text: str, language: str = "cmn",
+                english_word_align: bool = False) -> Dict:
         """处理单个音频文件"""
         start_time = time.time()
         try:
@@ -1625,7 +1651,8 @@ class MFAProcessor:
                 }
             textgrid_path = str(textgrid_files[0])
 
-            lab_content = self._textgrid_to_lab(textgrid_path, text, lang=lang)
+            lab_content = self._textgrid_to_lab(textgrid_path, text, lang=lang,
+                                                  english_word_align=english_word_align)
 
             if not lab_content:
                 return {

@@ -102,6 +102,8 @@ def _run_alignment(
     language: str,
     backend: str = "mfa",
     f0_device: str = "auto",
+    whisperx_model: str = "large-v3",
+    english_word_align: bool = False,
 ) -> Dict:
     """
     统一调度对齐后端，返回与 MFAProcessor.process() 格式兼容的字典。
@@ -115,7 +117,8 @@ def _run_alignment(
 
     if backend == "mfa":
         processor = MFAProcessor()
-        return processor.process(audio_file, text, language)
+        return processor.process(audio_file, text, language,
+                                 english_word_align=english_word_align)
 
     # ── 替代后端 ──────────────────────────────────────────────────────────
     import tempfile, shutil, os
@@ -128,8 +131,12 @@ def _run_alignment(
         tmp_wav = os.path.join(tmp_dir, filename)
         audio_file.save(tmp_wav)
 
-        aligner = get_aligner(backend, device=f0_device)
-        return aligner.align(tmp_wav, text or None, language)
+        extra = {}
+        if backend == "whisperx":
+            extra["whisper_model"] = whisperx_model
+        aligner = get_aligner(backend, device=f0_device, **extra)
+        return aligner.align(tmp_wav, text or None, language,
+                             english_word_align=english_word_align)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -172,6 +179,8 @@ class AudioProcessingPipeline:
         f0_device: str = "auto",
         crepe_model: str = "full",
         aligner_backend: str = "mfa",           # ← 新增
+        whisperx_model: str = "large-v3",       # ← WhisperX 模型大小
+        english_word_align: bool = False,        # ← 英语单词级对齐
     ) -> Dict:
         config = AudioProcessingConfig(
             bpm=bpm,
@@ -208,7 +217,9 @@ class AudioProcessingPipeline:
 
             # ── 步骤 1：对齐标注 ──────────────────────────────────────────
             logger.info(f"[ 步骤 1/3 ] 对齐标注 (backend={aligner_backend})...")
-            align_result = _run_alignment(audio_file, text, language, aligner_backend, f0_device)
+            align_result = _run_alignment(audio_file, text, language, aligner_backend,
+                                           f0_device, whisperx_model,
+                                           english_word_align=english_word_align)
             if not align_result.get("success"):
                 error = align_result.get("error", "对齐处理失败")
                 logger.error(f"✗ 对齐失败: {error}")
@@ -296,6 +307,8 @@ class AudioProcessingPipeline:
         language: str = "cmn",
         aligner_backend: str = "mfa",           # ← 新增
         f0_device: str = "auto",
+        whisperx_model: str = "large-v3",       # ← WhisperX 模型大小
+        english_word_align: bool = False,        # ← 英语单词级对齐
     ) -> Dict:
         """仅执行对齐标注（不生成工程文件）"""
         import time
@@ -304,7 +317,9 @@ class AudioProcessingPipeline:
         try:
             logger.info(f"[ 标注模式 ] 执行自动标注 (backend={aligner_backend})")
 
-            result = _run_alignment(audio_file, text, language, aligner_backend, f0_device)
+            result = _run_alignment(audio_file, text, language, aligner_backend,
+                                    f0_device, whisperx_model,
+                                    english_word_align=english_word_align)
 
             if result.get("success"):
                 lab_content = result.get("lab_content", "")
