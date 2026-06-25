@@ -22,7 +22,7 @@ class MFAChecker:
     # 刚好赶上系统不那么忙）。
     _status_cache_lock = threading.Lock()
     _last_good_mfa_check: Optional[Tuple[bool, str, float]] = None  # (ok, msg, timestamp)
-    _MFA_CHECK_CACHE_TTL = 45.0  # 秒：在这个窗口内允许复用上一次的成功结果
+    _MFA_CHECK_CACHE_TTL = 120.0  # 秒：在这个窗口内允许复用上一次的成功结果
 
     # MFA 3.3.9 模型映射：语言代码 -> {"dictionary": ..., "acoustic": ...}
     LANGUAGE_MODELS: Dict[str, Dict[str, str]] = {
@@ -207,7 +207,7 @@ class MFAChecker:
                     cmd,
                     capture_output=True,
                     text=True,
-                    timeout=45,
+                    timeout=120,
                 )
 
                 stdout = (result.stdout or "").strip()
