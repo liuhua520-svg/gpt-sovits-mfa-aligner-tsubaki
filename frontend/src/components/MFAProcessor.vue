@@ -499,20 +499,19 @@
                   />
                 </el-form-item>
               </el-col>
-            </el-row>
+			</el-row> <el-row :gutter="20">
+				<el-col :span="24">
+					<el-form-item
+					  v-if="showWordPhonemeMap"
+					  :label="t('processor.wordPhonemeMap')"
+					>
+					  <div class="word-phoneme-container">
+						<el-switch v-model="wordPhonemeMap" />
 
-            <!-- 单词音素映射：仅在英语单词级对齐开启 + 输出格式为 SVP/VSQX 时显示 -->
-            <el-form-item
-              v-if="englishWordAlign && processingMode === 'full' && (formData.outputFormat === 'sv' || formData.outputFormat === 'vsqx')"
-              :label="t('processor.wordPhonemeMap')"
-            >
-              <el-checkbox v-model="wordPhonemeMap" />
-              <span class="option-hint" style="margin-left:8px">
-                {{ formData.outputFormat === 'vsqx'
-                   ? t('processor.wordPhonemeMapHintVsqx')
-                   : t('processor.wordPhonemeMapHintSvp') }}
-              </span>
-            </el-form-item>
+					  </div>
+					</el-form-item>
+				  </el-col>
+				</el-row>
 
             <el-alert type="info" :closable="false" show-icon class="settings-info">
               <template #title>💡 {{ t('processor.advancedHelpTitle') }}</template>
@@ -975,6 +974,27 @@ const isReady = computed(() => {
 const isTextOptional = computed(() =>
   ['whisperx', 'qwen3_asr'].includes(alignerBackend.value)
 )
+
+// 控制整个表单项是否显示
+const showWordPhonemeMap = computed(() => {
+  const format = formData.value.outputFormat?.toLowerCase() || ''
+  const isSupportedFormat = format.includes('sv') || format.includes('vsqx')
+  
+  return englishWordAlign.value &&
+    processingMode.value === 'full' &&
+    isSupportedFormat
+})
+
+// 根据格式动态返回提示文本
+const wordPhonemeHint = computed(() => {
+  const format = formData.value.outputFormat?.toLowerCase() || ''
+  
+  if (format.includes('vsqx')) {
+    return t('processor.wordPhonemeMapHintVsqx')
+  }
+  
+  return t('processor.wordPhonemeMapHintSvp')
+})
 
 // alignerStatus 去掉 models_dir 字段，只保留后端对象供 v-for 使用
 const altBackends = computed(() => {
