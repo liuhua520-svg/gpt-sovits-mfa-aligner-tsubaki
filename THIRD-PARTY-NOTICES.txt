@@ -1,0 +1,234 @@
+THIRD-PARTY-NOTICES
+
+This repository includes third-party software and data packages in addition to the project source code.
+
+Project source code:
+- Repository: liuhua520-svg/gpt-sovits-mfa-aligner-tsubaki
+- Upstream project license: MIT
+
+Keep this notice together with the project LICENSE file in any distribution.
+
+--------------------------------------------------------------------
+
+1. Project License
+
+The project itself is licensed under the MIT License.
+
+Copyright (c) 2026 xiaohuang12345-ts
+
+See the repository LICENSE file for the full text of the MIT License.
+
+--------------------------------------------------------------------
+
+2. Third-party Dependencies
+
+Based on backend/requirements.txt
+
+=== 核心框架 ===
+- flask==2.3.3
+  Copyright 2010 Pallets
+  License: BSD-3-Clause
+  Link: https://github.com/pallets/flask
+
+- flask-cors==4.0.0
+  Copyright (c) 2013 Cory Dolphin
+  License: MIT
+  Link: https://github.com/corydolphin/flask-cors/blob/main/LICENSE
+
+=== MFA 对齐 ===
+- montreal-forced-aligner==3.3.9
+  Copyright (c) 2017 Montreal Corpus Tools
+  License: MIT
+  Link: https://github.com/MontrealCorpusTools/Montreal-Forced-Aligner/blob/main/LICENSE
+
+- textgrid==1.5
+  Copyright (c) 2011-2023 Kyle Gorman
+  License: MIT
+  Link: https://github.com/kylebgorman/textgrid
+
+=== 语言支持 ===
+- pypinyin==0.53.0
+  Copyright (c) 2014 mozillazg
+  License: MIT
+  Link: https://github.com/mozillazg/python-pinyin/blob/master/LICENSE
+
+- pycantonese>=0.1.0
+  Copyright (c) 2014-2024 Jackson Lee
+  License: MIT
+  Link: https://github.com/pycantonese/pycantonese
+
+- sudachipy==0.6.8
+  Copyright (c) 2017-2024 Works Applications
+  License: Apache-2.0
+  Link: https://github.com/WorksApplications/sudachi/blob/develop/LICENSE
+
+- sudachidict-core==20240409
+  Copyright (c) 2017-2024 Works Applications
+  License: Apache-2.0
+  Link: https://github.com/WorksApplications/SudachiDict
+
+- jamo==0.4.1
+  Copyright (c) 2015-2017 JDongian
+  License: MIT
+  Link: https://github.com/JDongian/python-jamo
+
+=== 音频处理 ===
+- soundfile==0.12.1
+  Copyright (c) 2013-2024 Bastian Bechtold
+  License: MIT / LGPL-2.1
+  Link: https://github.com/bastibe/python-soundfile
+
+- librosa>=0.10.0
+  Copyright (c) 2015-2024 librosa developers
+  License: ISC
+  Link: https://github.com/librosa/librosa/blob/main/LICENSE
+
+- numpy>=1.26.0,<2.0.0
+  Copyright (c) 2005-2023, NumPy Developers
+  License: BSD-3-Clause
+  Link: https://numpy.org/doc/stable/license.html
+
+=== F0 提取 ===
+- pyworld>=0.3.4
+  Copyright (c) 2016-2024 Jeremy C.H. Hsu
+  License: MIT
+  Link: https://github.com/JeremyCCHsu/Python-Wrapper-for-World-Vocoder
+
+- torchcrepe==0.0.24
+  Copyright (c) 2020 Descript
+  License: MIT
+  Link: https://github.com/descriptinc/torchcrepe/blob/main/LICENSE
+
+=== PyTorch ===
+- torch>=2.3.1
+  Copyright (c) 2016-2024, Facebook Inc.
+  License: BSD-3-Clause
+  Link: https://github.com/pytorch/pytorch
+
+- torchaudio>=2.0.0
+  Copyright (c) 2017-2024, Facebook Inc.
+  License: BSD-3-Clause
+  Link: https://github.com/pytorch/audio
+
+=== 替代对齐后端 ===
+- whisperx>=3.2.0
+  Copyright (c) 2023 Max Bain
+  License: BSD-2-Clause
+  Link: https://github.com/m-bain/whisperX
+
+  Note:
+  WhisperX source code is BSD-2-Clause.
+  Alignment models downloaded at runtime may use different
+  licenses depending on the selected language.
+
+- funasr>=1.1.0
+  Copyright (c) Alibaba Speech Lab
+  License: MIT
+  Link: https://github.com/modelscope/FunASR
+
+  Note:
+  FunASR source code is licensed under the MIT License.
+  Pretrained models downloaded at runtime may be subject to
+  separate model licenses.
+
+- modelscope>=1.9.0
+  Copyright (c) 2021-2024 ModelScope
+  License: Apache-2.0
+  Link: https://github.com/modelscope/modelscope
+
+- accelerate>=0.27.0
+  Copyright (c) 2022-2024 The Hugging Face team
+  License: Apache-2.0
+  Link: https://github.com/huggingface/accelerate
+
+- g2p_en>=0.3.1
+  Copyright (c) 2017 Kyubyong Park
+  License: MIT
+  Link: https://github.com/Kyubyong/g2p/blob/master/LICENSE
+
+=== MIDI ===
+- mido>=1.3.0
+  Copyright (c) 2013-2024 Ole Martin Bjørndalen
+  License: MIT
+  Link: https://github.com/SpotlightKid/mido/blob/main/LICENSE
+
+=== 其他 ===
+- requests
+  Copyright (c) 2014 Kenneth Reitz
+  License: Apache-2.0
+  Link: https://github.com/psf/requests
+
+- tqdm
+  Copyright (c) 2013-2024 Noam Yorav-Raphael
+  License: MIT
+  Link: https://github.com/tqdm/tqdm
+
+--------------------------------------------------------------------
+
+3. Frontend Dependencies (package.json)
+
+All under MIT License:
+- vue (^3.3.4)
+  Copyright (c) 2014-present Evan You
+  Link: https://github.com/vuejs/core
+
+- element-plus (^2.4.1)
+  Copyright (c) 2021-present Element Plus
+  Link: https://github.com/element-plus/element-plus
+
+- vite (^4.4.9)
+  Copyright (c) 2019-present, Yuxi (Evan) You and Vite contributors
+  Link: https://github.com/vitejs/vite
+
+--------------------------------------------------------------------
+
+4. Distribution Requirements
+
+When redistributing this project:
+
+- Include the project LICENSE file.
+- Include this THIRD-PARTY-NOTICES.txt file.
+- Preserve copyright notices contained in this repository.
+- Comply with the license terms of any bundled third-party software.
+- If redistributing bundled models, dictionaries, or other assets,
+  also comply with their respective licenses.
+
+--------------------------------------------------------------------
+
+5. Verification Note
+
+This notice was generated based on requirements.txt as of 2026-06-27.
+If dependencies are updated, review and update this file accordingly.
+
+The software licenses listed above are generally permissive
+(MIT, BSD, Apache-2.0, ISC, etc.) and generally allow commercial
+use and proprietary integration, provided that their respective
+license conditions (including attribution and license notice
+requirements) are satisfied.
+
+The commercial availability of downloaded models, dictionaries,
+or other runtime resources depends on the licenses of those
+individual resources.
+
+--------------------------------------------------------------------
+
+6. Downloaded Models
+
+This project may automatically download pretrained models
+required for speech recognition or forced alignment.
+
+These models are not included in this repository unless
+explicitly bundled.
+
+Examples include:
+
+- Montreal Forced Aligner acoustic models
+- Montreal Forced Aligner pronunciation dictionaries
+- WhisperX alignment models
+- Qwen3-ASR models
+- Qwen3-ForcedAligner models
+
+Each downloaded model remains subject to its own license.
+
+Users redistributing bundled models should also comply with
+the applicable model licenses.
