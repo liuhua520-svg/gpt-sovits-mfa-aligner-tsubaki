@@ -66,6 +66,46 @@ def get_job(job_id: str):
     with JOB_LOCK:
         return JOBS.get(job_id)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VSQX 声库自动选择
+# ─────────────────────────────────────────────────────────────────────────────
+_VSQX_SINGER_MAP = {
+    # 完整处理模式（mode="full"）——按语种选择
+    # 元组格式：(声库名, 声库ID, Bank Select编号)
+    # Bank Select 由 VOCALOID4 在安装时分配，与安装顺序有关，下列值为常见默认值
+    "en":  ("MIKU_V4_English",         "BMLTD846MLYP2MEK", 1),
+    "eng": ("MIKU_V4_English",         "BMLTD846MLYP2MEK", 1),
+    "ja":  ("MIKU_V4X_Original_EVEC",  "BCNFCY43LB2LZCD4", 0),
+    "jpn": ("MIKU_V4X_Original_EVEC",  "BCNFCY43LB2LZCD4", 0),
+    "ko":  ("SeeU_SV01_KOR",           "BX77CNBZLBPHZX97", 2),
+    "kor": ("SeeU_SV01_KOR",           "BX77CNBZLBPHZX97", 2),
+    # 中文 / 粤语 → 默认（回退值）
+}
+_VSQX_DEFAULT_FULL          = ("MIKU_V4_Chinese",        "BNGE7CP7EMTRSNC3", 4)  # cmn / yue / 其他
+_VSQX_DEFAULT_PROJECT_ONLY  = ("MIKU_V4X_Original_EVEC", "BCNFCY43LB2LZCD4", 0)  # 仅生成工程固定日语声库
+
+
+def _select_vsqx_singer(language: str, mode: str = "full"):
+    """
+    按语种（language）和处理模式（mode）返回 (vsqx_singer, vsqx_singer_id, vsqx_singer_bs)。
+
+    完整处理 (mode="full"):
+      en / eng  →  MIKU_V4_English        / BMLTD846MLYP2MEK / bs=1
+      ja / jpn  →  MIKU_V4X_Original_EVEC / BCNFCY43LB2LZCD4 / bs=0
+      ko / kor  →  SeeU_SV01_KOR          / BX77CNBZLBPHZX97 / bs=2
+      其他      →  MIKU_V4_Chinese         / BNGE7CP7EMTRSNC3 / bs=4
+
+    仅生成工程 (mode="project_only"):
+      固定       →  MIKU_V4X_Original_EVEC / BCNFCY43LB2LZCD4 / bs=0
+
+    注意：Bank Select (bs) 由 VOCALOID4 在安装声库时自动分配，与安装顺序相关。
+    上列 bs 值为常见默认值，若用户系统上声库 bs 编号不同，需在前端手动传入 vsqx_singer_bs 覆盖。
+    """
+    if mode == "project_only":
+        return _VSQX_DEFAULT_PROJECT_ONLY
+    return _VSQX_SINGER_MAP.get((language or "").lower(), _VSQX_DEFAULT_FULL)
+
 def abs_norm(path: str) -> str:
     return os.path.abspath(os.path.normpath(path))
 
@@ -354,15 +394,11 @@ def run_pipeline_job(
     aligner_backend: str = "mfa",
     whisperx_model: str = "large-v3",
     english_word_align: bool = False,
+    vsqx_singer: str = "MIKU_V4_Chinese",
+    vsqx_singer_id: str = "BNGE7CP7EMTRSNC3",
+    vsqx_singer_bs: int = 4,
 ):
-    try:
-        set_job(
-            job_id,
-            status="running",
-            started_at=datetime.now().isoformat(),
-        )
-
-        # === 【新增：伪造 FileStorage 包装器】 ===
+    try: # <--- Added the missing try block here
         class FileStorageWrapper:
             def __init__(self, local_path):
                 self.path = os.path.abspath(local_path)
@@ -403,6 +439,9 @@ def run_pipeline_job(
             aligner_backend=aligner_backend,
             whisperx_model=whisperx_model,
             english_word_align=english_word_align,
+            vsqx_singer=vsqx_singer,
+            vsqx_singer_id=vsqx_singer_id,
+            vsqx_singer_bs=vsqx_singer_bs,
         )
 
         if result.get("success"):
@@ -495,6 +534,18 @@ def pipeline_full_process():
 
         english_word_align = request.form.get("english_word_align", "false").lower() == "true"
 
+        vsqx_singer    = request.form.get("vsqx_singer",    "MIKU_V4_Chinese")
+        vsqx_singer_id = request.form.get("vsqx_singer_id", "BNGE7CP7EMTRSNC3")
+        vsqx_singer_bs = int(request.form.get("vsqx_singer_bs", 4))
+
+        # 输出格式为 vsqx 时，按语种自动覆盖声库（忽略前端传值，保证正确性）
+        if output_format == "vsqx":
+            vsqx_singer, vsqx_singer_id, vsqx_singer_bs = _select_vsqx_singer(language, "full")
+            logger.info(
+                "VSQX 声库自动选择 [language=%s]: %s / %s / bs=%d",
+                language, vsqx_singer, vsqx_singer_id, vsqx_singer_bs,
+            )
+
         stem, wav_path, lab_path = build_job_paths(audio_file.filename or "audio.wav")
 
         audio_file.save(str(wav_path))
@@ -537,6 +588,9 @@ def pipeline_full_process():
                 aligner_backend,
                 whisperx_model,
                 english_word_align,
+                vsqx_singer,
+                vsqx_singer_id,
+                vsqx_singer_bs,
             ),
         ).start()
 
@@ -700,6 +754,9 @@ def run_project_only_job(
     phoneme_mode: str,
     midi_path: str,           # MIDI 文件路径（空字符串 = 未导入）
     lyrics_text: str = "",
+    vsqx_singer: str = "MIKU_V4_Chinese",
+    vsqx_singer_id: str = "BNGE7CP7EMTRSNC3",
+    vsqx_singer_bs: int = 4,
 ):
     try:
         set_job(
@@ -727,6 +784,9 @@ def run_project_only_job(
             crepe_model=crepe_model,
             phoneme_mode=phoneme_mode,
             midi_path=midi_path or None,
+            vsqx_singer=vsqx_singer,
+            vsqx_singer_id=vsqx_singer_id,
+            vsqx_singer_bs=vsqx_singer_bs,
         )
 
         if result.get("success"):
@@ -789,6 +849,11 @@ def pipeline_project_only():
         export_pitch_line = request.form.get("export_pitch_line", "false").lower() == "true"
         phoneme_mode = request.form.get("phoneme_mode", "none")
         lyrics_text = request.form.get("lyrics_text", "").strip()
+        # 仅生成工程模式无语种上下文，固定使用日语声库；前端仍可显式覆盖
+        vsqx_singer, vsqx_singer_id, vsqx_singer_bs = _select_vsqx_singer("", "project_only")
+        vsqx_singer    = request.form.get("vsqx_singer",    vsqx_singer)
+        vsqx_singer_id = request.form.get("vsqx_singer_id", vsqx_singer_id)
+        vsqx_singer_bs = int(request.form.get("vsqx_singer_bs", vsqx_singer_bs))
 
         if phoneme_mode not in ("none", "merge", "hiragana", "katakana"):
             logger.warning(f"未知 phoneme_mode '{phoneme_mode}'，回退到 'none'")
@@ -897,6 +962,9 @@ def pipeline_project_only():
                 phoneme_mode,
                 midi_path,
                 lyrics_text,
+                vsqx_singer,
+                vsqx_singer_id,
+                vsqx_singer_bs,
             ),
         ).start()
 
@@ -1023,6 +1091,24 @@ def list_work_dir_files():
                 "size": project_file.stat().st_size,
                 "modified": project_file.stat().st_mtime
             })
+
+        for project_file in WORK_DIR.glob("**/*.svp"):
+            files.append({
+                "name": project_file.name,
+                "path": str(project_file),
+                "type": "project",
+                "size": project_file.stat().st_size,
+                "modified": project_file.stat().st_mtime
+            })
+
+        for project_file in WORK_DIR.glob("*.vsqx"):
+            files.append({
+                "name": project_file.name,
+                "path": str(project_file),
+                "type": "project",
+                "size": project_file.stat().st_size,
+                "modified": project_file.stat().st_mtime
+            })
         
         # 按修改时间排序
         files.sort(key=lambda x: x['modified'], reverse=True)
@@ -1091,7 +1177,7 @@ def clear_work_dir():
         import shutil
         
         # 只删除特定类型的文件
-        patterns = ["*.wav", "*.lab", "*.mid", "**/*.ustx", "**/*.svp", "*.txt", "*.TextGrid"]
+        patterns = ["*.wav", "*.lab", "*.mid", "**/*.ustx", "**/*.svp", "*.vsqx", "*.txt", "*.TextGrid"]
         
         deleted_count = 0
         for pattern in patterns:
@@ -1126,8 +1212,9 @@ def main(host: str = "127.0.0.1", port: int = 5000):
     print(f"⏹️  按 Ctrl+C 停止服务")
     print(f"{'=' * 60}\n")
     
-    # 【已注释】不再自动打开浏览器
-    #Thread(target=open_browser, args=(host, port), daemon=True).start()
+    # 【可注释】 Thread(target=open_browser, args=(host, port), daemon=True).start()
+    # 将不再自动打开浏览器
+    Thread(target=open_browser, args=(host, port), daemon=True).start()
     app.run(host=host, port=port, debug=True, threaded=True, use_reloader=False)
 
 

@@ -102,6 +102,8 @@ _BLICKS_PER_SECOND = 10_000_000      # 1 秒 = 10,000,000 blicks (100ns)
 _TICKS_PER_SECOND_DEFAULT = 480.0    # USTX default resolution per quarter note
 
 
+
+
 def _split_lyrics_to_words(text: str) -> List[str]:
     """
     将歌词文本拆分为按音符对应的字/词列表。
@@ -179,6 +181,7 @@ class TsubakiProcessor:
         "ustx": "OpenUtau Project (.ustx)",
         "utau": "OpenUtau Project (.ustx) [alias]",
         "midi": "MIDI 标准文件 (.mid)",
+        "vsqx": "VOCALOID 4 Project (.vsqx)",
     }
 
     OUTPUT_ALIASES = {
@@ -189,6 +192,9 @@ class TsubakiProcessor:
         "openutau":      "ustx",
         "utau":          "ustx",
         "mid":           "midi",
+        "vsq4":          "vsqx",
+        "vocaloid":      "vsqx",
+        "vocaloid4":     "vsqx",
     }
 
     # 真正的静音标签：跳过（不生成音符），但用 '-' 填充其占用的时间段
@@ -1178,6 +1184,9 @@ class TsubakiProcessor:
         phoneme_mode: str = "none",
         midi_path: Optional[str] = None,   # MIDI 文件路径（可选）
         lyrics_text: str = "",             # 纯 MIDI 模式下的用户歌词原文
+        vsqx_singer: str = "MIKU_V4_Chinese",       # VSQX 歌手名（由前端按语种/模式传入）
+        vsqx_singer_id: str = "BNGE7CP7EMTRSNC3",  # VSQX 歌手 ID
+        vsqx_singer_bs: int = 4,                    # VSQX 歌手 Bank Select（VOCALOID4 内部编号，系统相关）
     ) -> Dict:
         """完整工程文件生成入口。
 
@@ -1319,12 +1328,25 @@ class TsubakiProcessor:
                     midi_notes=midi_notes,
                 )
 
+            elif fmt == "vsqx":
+                project_text = self._build_vsqx_project_text(
+                    title=project_title, segments=segments,
+                    f0=f0, t=t, sr=sr, wav_path=wav_path,
+                    config=config, audio_duration_sec=audio_duration_sec,
+                    midi_notes=midi_notes,
+                    vsqx_singer=vsqx_singer,
+                    vsqx_singer_id=vsqx_singer_id,
+                    vsqx_singer_bs=vsqx_singer_bs,
+                )
+                out_path = self.work_dir / f"{Path(wav_path).stem}.vsqx"
+                out_path.write_text(project_text, encoding="utf-8")
+
             else:
                 return {
                     "success": False,
                     "error": (
                         f"不支持的格式: {output_format}。"
-                        "支持: sv / ustx / utau / midi"
+                        "支持: sv / ustx / utau / midi / vsqx"
                     ),
                 }
 
@@ -1403,6 +1425,258 @@ class TsubakiProcessor:
             )
 
         return out
+
+    # ----------------------------
+    # VSQX 生成
+    # ----------------------------
+    def _build_vsqx_project_text(
+        self,
+        title: str,
+        segments: List[LabelSegment],
+        f0: Optional[np.ndarray],
+        t: Optional[np.ndarray],
+        sr: Optional[int],
+        wav_path: str,
+        config: AudioProcessingConfig,
+        audio_duration_sec: Optional[float] = None,
+        midi_notes: Optional[List] = None,
+        vsqx_singer: str = "MIKU_V4_Chinese",
+        vsqx_singer_id: str = "BNGE7CP7EMTRSNC3",
+        vsqx_singer_bs: int = 4,           # VOCALOID4 内部声库 Bank Select 编号（系统相关）
+    ) -> str:
+        """
+        生成 VOCALOID4 VSQX 工程文件（XML 格式）。
+
+        格式要点
+        ────────
+        • resolution = 480 ticks/拍
+        • tempo 写法：<tempo><t>0</t><v>{BPM×100}</v></tempo>
+          例：120 BPM → v=12000；实际文件验证一致。
+        • vsPart 从 tick=1920 开始（preMeasure=1，4/4，480×4=1920）
+        • note 和 cc（音高曲线）的 <t> 均为相对于 vsPart 起点的偏移
+        • 音高曲线（P 控制器）范围 ±8190，对应 ±PBS 个半音
+          PBS 默认值 = 13（来自实际 vsqx 文件）
+        • 歌词 <y>：使用 segment label；<p> 音素字段留空，
+          由 VOCALOID 自带 G2P 处理（用户可在 VOCALOID Editor 中手动编辑）。
+        """
+        RESOLUTION  = 480        # ticks per quarter note
+        PBS         = 13         # pitch bend sensitivity (semitones)
+        PART_OFFSET = 1920       # vsPart start tick (preMeasure=1, 4/4)
+        VELOCITY    = 64
+        bpm = float(config.bpm)
+        tempo_v = int(round(bpm * 100))   # VSQX tempo value = BPM × 100
+
+        def sec_to_ticks(sec: float) -> int:
+            """秒 → vsPart 内部 tick（相对偏移）"""
+            return int(round(float(sec) * (bpm / 60.0) * RESOLUTION))
+
+        base_tone = int(config.base_pitch)
+
+        # ── ① 构建音符列表 ──────────────────────────────────────────────────
+        # voiced_refs 用于音高曲线中查找该 tick 对应的音符 tone
+        note_entries: List[Tuple[int, int, int, str]] = []  # (t_on, dur, tone, lyric)
+        voiced_refs:  List[Tuple[int, int, int]]      = []  # (t_on, t_off, tone)
+
+        for seg in segments:
+            if seg.end_time <= seg.start_time:
+                continue
+            if self._is_true_silence(seg.label):
+                continue
+
+            start_sec = self._lab_time_to_seconds(seg.start_time)
+            end_sec   = self._lab_time_to_seconds(seg.end_time)
+            t_on  = sec_to_ticks(start_sec)
+            t_off = max(t_on + 1, sec_to_ticks(end_sec))
+            dur   = t_off - t_on
+
+            # 音高：MIDI / F0细化 / base_pitch 三级优先
+            tone = base_tone
+            if midi_notes is not None:
+                from midi_processor import map_segment_to_midi_pitch
+                tone = map_segment_to_midi_pitch(
+                    start_sec, end_sec, midi_notes, base_pitch=base_tone)
+            elif config.refine_pitch and f0 is not None and t is not None and len(f0) > 0:
+                mask  = (t >= start_sec) & (t < end_sec)
+                seg_f0 = f0[mask]
+                voiced = seg_f0[seg_f0 > 0]
+                if len(voiced) > 0:
+                    midi_vals = 69.0 + 12.0 * np.log2(voiced / 440.0)
+                    tone      = int(round(float(np.median(midi_vals))))
+                    tone      = max(12, min(127, tone))
+
+            label = seg.label
+            # <p> 音素字段留空，由 VOCALOID 自带 G2P 处理
+            note_entries.append((t_on, dur, tone, label))
+            voiced_refs.append((t_on, t_off, tone))
+
+        # ── ② 音高曲线（P 控制器）───────────────────────────────────────────
+        pit_lines: List[str] = []
+        if config.export_pitch_line and f0 is not None and t is not None and len(f0) > 0:
+            prev_val: Optional[int] = None
+            # voiced_refs 已按时间顺序
+            vr_arr = np.array(voiced_refs, dtype=np.int64) if voiced_refs else None
+
+            for ti, f0i in zip(t, f0):
+                if not np.isfinite(f0i) or f0i <= 0:
+                    continue
+                tick    = sec_to_ticks(float(ti))
+                midi_f0 = 69.0 + 12.0 * np.log2(float(f0i) / 440.0)
+
+                # 二分查找当前 tick 所属音符的 tone
+                nominal = base_tone
+                if vr_arr is not None and len(vr_arr):
+                    idx = int(np.searchsorted(vr_arr[:, 0], tick, side="right")) - 1
+                    if 0 <= idx < len(vr_arr) and tick <= vr_arr[idx, 1]:
+                        nominal = int(vr_arr[idx, 2])
+
+                # 偏移量（半音）→ P 控制器值（范围 ±8190）
+                p_val = int(round((midi_f0 - nominal) / PBS * 8190))
+                p_val = max(-8190, min(8190, p_val))
+
+                # 压缩相邻重复值
+                if p_val != prev_val:
+                    pit_lines.append(
+                        f'\t\t\t<cc><t>{tick}</t><v id="P">{p_val}</v></cc>'
+                    )
+                    prev_val = p_val
+
+        # ── ③ 计算 vsPart 总长度 ─────────────────────────────────────────────
+        if note_entries:
+            play_time = max(t_on + dur for t_on, dur, *_ in note_entries) + RESOLUTION
+        else:
+            play_time = RESOLUTION * 4   # 至少一小节
+
+        # ── ④ 生成 XML ───────────────────────────────────────────────────────
+        # 首行：PBS 设置（必须在其他 cc 之前）
+        pit_block = f'\t\t\t<cc><t>0</t><v id="S">{PBS}</v></cc>\n'
+        if pit_lines:
+            pit_block += "\n".join(pit_lines) + "\n"
+
+        # 音符块
+        note_block = ""
+        for t_on, dur, tone, lyric in note_entries:
+            note_block += (
+                f'\t\t\t<note>\n'
+                f'\t\t\t\t<t>{t_on}</t>\n'
+                f'\t\t\t\t<dur>{dur}</dur>\n'
+                f'\t\t\t\t<n>{tone}</n>\n'
+                f'\t\t\t\t<v>{VELOCITY}</v>\n'
+                f'\t\t\t\t<y><![CDATA[{lyric}]]></y>\n'
+                f'\t\t\t\t<p></p>\n'
+                f'\t\t\t\t<nStyle>\n'
+                f'\t\t\t\t\t<v id="accent">50</v>\n'
+                f'\t\t\t\t</nStyle>\n'
+                f'\t\t\t</note>\n'
+            )
+
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n'
+            '<vsq4 xmlns="http://www.yamaha.co.jp/vocaloid/schema/vsq4/"\n'
+            '      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"\n'
+            '      xsi:schemaLocation="http://www.yamaha.co.jp/vocaloid/schema/vsq4/'
+            ' vsq4.xsd">\n'
+            '\t<vender><![CDATA[Yamaha corporation]]></vender>\n'
+            '\t<version><![CDATA[4.0.0.3]]></version>\n'
+            '\t<vVoiceTable>\n'
+            '\t\t<vVoice>\n'
+            f'\t\t\t<bs>{vsqx_singer_bs}</bs>\n'
+            '\t\t\t<pc>0</pc>\n'
+            f'\t\t\t<id><![CDATA[{vsqx_singer_id}]]></id>\n'
+            f'\t\t\t<name><![CDATA[{vsqx_singer}]]></name>\n'
+            '\t\t\t<vPrm>\n'
+            '\t\t\t\t<bre>0</bre>\n'
+            '\t\t\t\t<bri>0</bri>\n'
+            '\t\t\t\t<cle>0</cle>\n'
+            '\t\t\t\t<gen>0</gen>\n'
+            '\t\t\t\t<ope>0</ope>\n'
+            '\t\t\t</vPrm>\n'
+            '\t\t</vVoice>\n'
+            '\t</vVoiceTable>\n'
+            '\t<mixer>\n'
+            '\t\t<masterUnit>\n'
+            '\t\t\t<oDev>0</oDev>\n'
+            '\t\t\t<rLvl>0</rLvl>\n'
+            '\t\t\t<vol>0</vol>\n'
+            '\t\t</masterUnit>\n'
+            '\t\t<vsUnit>\n'
+            '\t\t\t<tNo>0</tNo>\n'
+            '\t\t\t<iGin>0</iGin>\n'
+            '\t\t\t<sLvl>-898</sLvl>\n'
+            '\t\t\t<sEnable>0</sEnable>\n'
+            '\t\t\t<m>0</m>\n'
+            '\t\t\t<s>0</s>\n'
+            '\t\t\t<pan>64</pan>\n'
+            '\t\t\t<vol>0</vol>\n'
+            '\t\t</vsUnit>\n'
+            '\t\t<monoUnit>\n'
+            '\t\t\t<iGin>0</iGin>\n'
+            '\t\t\t<sLvl>-898</sLvl>\n'
+            '\t\t\t<sEnable>0</sEnable>\n'
+            '\t\t\t<m>0</m>\n'
+            '\t\t\t<s>0</s>\n'
+            '\t\t\t<pan>64</pan>\n'
+            '\t\t\t<vol>0</vol>\n'
+            '\t\t</monoUnit>\n'
+            '\t\t<stUnit>\n'
+            '\t\t\t<iGin>0</iGin>\n'
+            '\t\t\t<m>0</m>\n'
+            '\t\t\t<s>0</s>\n'
+            '\t\t\t<vol>-129</vol>\n'
+            '\t\t</stUnit>\n'
+            '\t</mixer>\n'
+            '\t<masterTrack>\n'
+            f'\t\t<seqName><![CDATA[{title}]]></seqName>\n'
+            '\t\t<comment><![CDATA[New VSQ File]]></comment>\n'
+            '\t\t<resolution>480</resolution>\n'
+            '\t\t<preMeasure>1</preMeasure>\n'
+            '\t\t<timeSig><m>0</m><nu>4</nu><de>4</de></timeSig>\n'
+            f'\t\t<tempo><t>0</t><v>{tempo_v}</v></tempo>\n'
+            '\t</masterTrack>\n'
+            '\t<vsTrack>\n'
+            '\t\t<tNo>0</tNo>\n'
+            f'\t\t<name><![CDATA[{title}]]></name>\n'
+            '\t\t<comment><![CDATA[Track]]></comment>\n'
+            '\t\t<vsPart>\n'
+            f'\t\t\t<t>{PART_OFFSET}</t>\n'
+            f'\t\t\t<playTime>{play_time}</playTime>\n'
+            '\t\t\t<name><![CDATA[NewPart]]></name>\n'
+            '\t\t\t<comment><![CDATA[New Musical Part]]></comment>\n'
+            '\t\t\t<sPlug>\n'
+            '\t\t\t\t<id><![CDATA[ACA9C502-A04B-42b5-B2EB-5CEA36D16FCE]]></id>\n'
+            '\t\t\t\t<name><![CDATA[VOCALOID2 Compatible Style]]></name>\n'
+            '\t\t\t\t<version><![CDATA[3.0.0.1]]></version>\n'
+            '\t\t\t</sPlug>\n'
+            '\t\t\t<pStyle>\n'
+            '\t\t\t\t<v id="accent">50</v>\n'
+            '\t\t\t\t<v id="bendDep">8</v>\n'
+            '\t\t\t\t<v id="bendLen">0</v>\n'
+            '\t\t\t\t<v id="decay">50</v>\n'
+            '\t\t\t\t<v id="fallPort">0</v>\n'
+            '\t\t\t\t<v id="opening">127</v>\n'
+            '\t\t\t\t<v id="risePort">0</v>\n'
+            '\t\t\t</pStyle>\n'
+            '\t\t\t<singer>\n'
+            '\t\t\t\t<t>0</t>\n'
+            f'\t\t\t\t<bs>{vsqx_singer_bs}</bs>\n'
+            '\t\t\t\t<pc>0</pc>\n'
+            '\t\t\t</singer>\n'
+            + pit_block
+            + note_block
+            + '\t\t</vsPart>\n'
+            '\t</vsTrack>\n'
+            '\t<monoTrack>\n'
+            '\t</monoTrack>\n'
+            '\t<stTrack>\n'
+            '\t</stTrack>\n'
+            '\t<aux>\n'
+            '\t\t<id><![CDATA[AUX_VST_HOST_CHUNK_INFO]]></id>\n'
+            '\t\t<content>'
+            '<![CDATA[VlNDSwAAAAADAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=]]>'
+            '</content>\n'
+            '\t</aux>\n'
+            '</vsq4>\n'
+        )
+        return xml
 
     def _build_midi_output(
         self,

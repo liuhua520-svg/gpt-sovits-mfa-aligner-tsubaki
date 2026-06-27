@@ -181,6 +181,9 @@ class AudioProcessingPipeline:
         aligner_backend: str = "mfa",           # ← 新增
         whisperx_model: str = "large-v3",       # ← WhisperX 模型大小
         english_word_align: bool = False,        # ← 英语单词级对齐
+        vsqx_singer: str = "MIKU_V4_Chinese",           # ← VSQX 声库名（由 app.py 按语种注入）
+        vsqx_singer_id: str = "BNGE7CP7EMTRSNC3",       # ← VSQX 声库 ID
+        vsqx_singer_bs: int = 4,                         # ← VSQX 声库 Bank Select（VOCALOID4 内部编号）
     ) -> Dict:
         config = AudioProcessingConfig(
             bpm=bpm,
@@ -258,6 +261,9 @@ class AudioProcessingPipeline:
                 project_title=project_title,
                 config=config,
                 audio_f0_data=audio_data,
+                vsqx_singer=vsqx_singer,
+                vsqx_singer_id=vsqx_singer_id,
+                vsqx_singer_bs=vsqx_singer_bs,
             )
 
             if not project_result.get("success"):
@@ -371,6 +377,9 @@ class AudioProcessingPipeline:
         phoneme_mode: str = "none",
         midi_path: str = None,
         lyrics_text: str = "",
+        vsqx_singer: str = "MIKU_V4X_Original_EVEC",    # ← 仅生成工程默认日语声库
+        vsqx_singer_id: str = "BCNFCY43LB2LZCD4",       # ← 对应声库 ID
+        vsqx_singer_bs: int = 0,                          # ← 仅生成工程默认 bs（日语声库=0）
     ) -> Dict:
         """仅执行工程文件生成（已有 WAV 以及 LAB/MIDI 之一）"""
         import time
@@ -431,6 +440,9 @@ class AudioProcessingPipeline:
                 phoneme_mode=phoneme_mode,
                 midi_path=midi_path or None,
                 lyrics_text=lyrics_text,
+                vsqx_singer=vsqx_singer,
+                vsqx_singer_id=vsqx_singer_id,
+                vsqx_singer_bs=vsqx_singer_bs,
             )
 
             result["processing_time"] = int((time.time() - start_time) * 1000)
