@@ -103,7 +103,7 @@ Copyright (c) 2026 xiaohuang12345-ts
 - 保留项目 `LICENSE` 文件
 - 如有修改依赖，请同步更新本文件
 - 遵守许可证条款
-- 根据 Apache License 2.0 要求如果有 NOTICE 则必须保留
+- 根据 Apache License 2.0 要求，如果有 NOTICE 则必须保留
 
 **所有列出的依赖均允许商业使用和闭源集成。**
 
