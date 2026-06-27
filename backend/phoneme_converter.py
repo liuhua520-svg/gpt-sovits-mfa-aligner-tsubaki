@@ -680,6 +680,71 @@ def word_to_arpabet(word: str) -> Optional[list[str]]:
     return None
 
 
+def is_in_english_dict(word: str) -> bool:
+    """
+    判断 word 是否在 MFA 英语词典中（忽略大小写）。
+
+    用途：word_phoneme_map 功能的跨语种防误判守卫。
+    当处理语言不是英语时，用本函数先确认 label 确实是英语单词，
+    再调用 word_to_arpabet()，防止把中文拼音（hao/bu/rong/yi 等）、
+    日语罗马字（ka/shi/tsu）等纯 ASCII 音素误当作英语单词转换。
+
+    词典文件缺失时保守地返回 False（不映射，不报错）。
+    """
+    if not word:
+        return False
+    clean = _WORD_EDGE_STRIP_RE.sub("", word.strip().lower())
+    if not clean:
+        return False
+    table = _load_en_mfa_dictionary()
+    return bool(table) and clean in table
+
+
+def extract_native_english_words(text: str) -> set[str]:
+    """
+    从原始未转换文本中提取本来就是拉丁字母拼写的英语单词集合。
+
+    【调用时机】必须在文本被 pypinyin / jamo 等工具转换为罗马字之前调用。
+    此时文本中只有实际英文单词才含 ASCII 字母——汉字（如"让/望/心"）、
+    韩文字母均为 Unicode 非 ASCII 字符，不会被误匹配。
+
+    【解决的问题】
+    word_phoneme_map 功能通过 is_in_english_dict() 判断 LAB 里的 label
+    是否为英语单词。但 LAB 是在 pypinyin 转换后生成的：
+      "让" → "rang"（拼音）  "望" → "wang"（拼音）  "动" → "dong"（拼音）
+    这些拼音碰巧是英语词典里存在的词（rang = ring 的过去式，wang = 俚语，
+    dong = 俚语），导致 is_in_english_dict() 误返回 True，然后将它们错误地
+    转换成 ARPABET / VOCALOID4 英语音素写入 <p lock="1">。
+
+    【使用方式】
+    在构建 SVP / VSQX 之前，用原始汉字/韩文文本调用本函数，得到
+    native_english_words 集合，传给 _label_is_english_word()；后者对
+    非英语语种优先用本集合判断，而非词典查询。若集合为空（纯中文/韩文），
+    所有 label 均不会通过守卫；若含有真实英文词（如 "I love you"），
+    这些词在集合中，仍能被正确映射。
+
+    Parameters
+    ----------
+    text : str
+        原始用户输入文本，如 "好不容易心动一次！你却让我失望！"
+        或 "I love you 很多"
+
+    Returns
+    -------
+    set[str]
+        小写英语单词集合，如 {"love", "you"} 或 set()（纯 CJK 文本时为空集）
+    """
+    import re as _re
+    matches = _re.findall(r"[a-zA-Z][a-zA-Z']*", text)
+    result: set[str] = set()
+    for w in matches:
+        # 去掉首尾撇号（针对 'hello' 这类被引号包住的单词）
+        clean = w.strip("'").lower()
+        if clean:
+            result.add(clean)
+    return result
+
+
 def _expand_digits_to_phones(raw: str) -> Optional[list[str]]:
     """把含数字的 token（"2024" / "21st" / "3.5"）展开为英文拼写单词，
     对每个展开出的单词分别递归调用 word_to_arpabet()，再拼接为一个

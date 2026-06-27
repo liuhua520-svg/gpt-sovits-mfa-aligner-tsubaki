@@ -255,6 +255,46 @@ class TsubakiProcessor:
             return False
         return bool(TsubakiProcessor._ASCII_WORD_RE.match(label))
 
+    @staticmethod
+    def _label_is_english_word(
+        label: str,
+        language: str,
+        native_english_words: Optional[set] = None,
+    ) -> bool:
+        """
+        判断 label 在给定语言上下文中是否应作为英语单词进行音素映射。
+
+        逻辑
+        ────
+        · 语言为英语 (en/eng)：信任 _is_ascii_word_label，走完整 G2P 流程
+          （MFA 词典 + g2p_en OOV 兜底），与旧行为完全一致。
+        · 非英语语言（zh/ja/ko/yue/…）：
+          a. 若 native_english_words 不为 None（由调用方从原始汉字/韩文文本
+             预提取），则以该集合为唯一判断依据：
+               - 原始文本里没有拉丁字母 → 集合为空 → 所有 label 均不命中
+               - 混入了 "love/hello" 等真实英文词 → 只有这些词命中
+             优势：彻底消除"拼音碰巧是英语词"的误判（rang/wang/dong/shi 等）。
+          b. native_english_words 为 None（兼容旧调用路径，如 project-only 模式
+             未传原始文本）：回退到词典查询（is_in_english_dict），保持向后兼容。
+        · 词典文件缺失时，非英语语言一律返回 False（保守策略）。
+        """
+        lang = (language or "").lower().strip().rstrip("-")
+        if lang in ("en", "eng", "english"):
+            return True          # English: full G2P pipeline
+
+        # ── 非英语语言 ────────────────────────────────────────────────────
+        if native_english_words is not None:
+            # 优先路径：用从原始文本预提取的集合判断（最准确）
+            clean = (label or "").strip().lower()
+            return bool(clean) and clean in native_english_words
+
+        # 兼容回退：词典查询（旧行为）
+        try:
+            from phoneme_converter import is_in_english_dict
+            return is_in_english_dict(label)
+        except Exception:
+            return False
+
     def _read_audio_duration_sec(self, wav_path: str) -> float:
         try:
             info = sf.info(wav_path)
@@ -783,6 +823,8 @@ class TsubakiProcessor:
         audio_duration_sec: Optional[float] = None,
         midi_notes: Optional[List] = None,   # MIDI 导入：(start_sec, end_sec, pitch) 列表
         word_phoneme_map: bool = False,       # 英语单词 → ARPABET 音素写入 phonemes 字段
+        language: str = "",                   # 语种（用于 word_phoneme_map 防误判）
+        native_english_words: Optional[set] = None,  # 从原始文本预提取的英语单词集合（防拼音误判）
     ) -> str:
         """
         生成可被 Synthesizer V 正确识别的 SVP JSON 文本。
@@ -860,7 +902,14 @@ class TsubakiProcessor:
 
             # ── word_phoneme_map：英语单词 → ARPABET 音素写入 phonemes 字段 ──
             # 条件：功能开关已开启 + label 是英语单词（非静音/非辅音占位符）
-            if word_phoneme_map and self._is_ascii_word_label(seg.label):
+            # + 语言守卫：优先用 native_english_words（从原始文本预提取）判断；
+            # 若未提供则回退到词典查询。防止中文拼音 rang/wang/dong 等
+            # 被 g2p_en 误当英语词转换成 ARPABET。
+            if (
+                word_phoneme_map
+                and self._is_ascii_word_label(seg.label)
+                and self._label_is_english_word(seg.label, language, native_english_words)
+            ):
                 try:
                     from phoneme_converter import word_to_arpabet
                     arpabet_phones = word_to_arpabet(seg.label)
@@ -1230,6 +1279,9 @@ class TsubakiProcessor:
         vsqx_singer_id: str = "BNGE7CP7EMTRSNC3",  # VSQX 歌手 ID
         vsqx_singer_bs: int = 4,                    # VSQX 歌手 Bank Select（VOCALOID4 内部编号，系统相关）
         word_phoneme_map: bool = False,             # 英语单词 → 音素写入 SVP phonemes / VSQX <p lock="1">
+        language: str = "",                         # 语种，传给 SVP/VSQX 构建器防误判
+        original_text: str = "",                    # 原始歌词文本（pypinyin 转换前的汉字/韩文原文）
+                                                    # 用于预提取真实英语单词集合，防止拼音被误判
     ) -> Dict:
         """完整工程文件生成入口。
 
@@ -1251,6 +1303,25 @@ class TsubakiProcessor:
         try:
             config   = config or AudioProcessingConfig()
             wav_path = str(wav_path)
+
+            # ── 预提取原始文本中的真实英语单词集合（word_phoneme_map 防误判）──
+            # 必须在 pypinyin 等转换之前，从原始汉字/韩文文本提取。
+            # 纯中文/韩文时集合为空，所有 label 均不会被当作英语词处理；
+            # 混入真实英语时（如 "I love you 很多"），只有这些词命中。
+            native_english_words: Optional[set] = None
+            _lang_norm = (language or "").lower().strip().rstrip("-")
+            if word_phoneme_map and _lang_norm not in ("en", "eng", "english") and original_text:
+                try:
+                    from phoneme_converter import extract_native_english_words
+                    native_english_words = extract_native_english_words(original_text)
+                    logger.info(
+                        "[word_phoneme_map] 原始文本预提取英语单词 %d 个: %s",
+                        len(native_english_words),
+                        sorted(native_english_words)[:10] if native_english_words else "（无）",
+                    )
+                except Exception as _nee_err:
+                    logger.warning("[word_phoneme_map] 预提取英语单词失败: %s，回退词典查询", _nee_err)
+                    # native_english_words 保持 None → 兼容旧行为
 
             # ── 文件检查 ───────────────────────────────────────────────────────
             if not Path(wav_path).exists():
@@ -1348,6 +1419,8 @@ class TsubakiProcessor:
                     config=config, audio_duration_sec=audio_duration_sec,
                     midi_notes=midi_notes,
                     word_phoneme_map=word_phoneme_map,
+                    language=language,
+                    native_english_words=native_english_words,
                 )
                 out_path = self.work_dir / f"{Path(wav_path).stem}.svp"
                 out_path.write_text(project_text, encoding="utf-8")
@@ -1382,6 +1455,8 @@ class TsubakiProcessor:
                     vsqx_singer_id=vsqx_singer_id,
                     vsqx_singer_bs=vsqx_singer_bs,
                     word_phoneme_map=word_phoneme_map,
+                    language=language,
+                    native_english_words=native_english_words,
                 )
                 out_path = self.work_dir / f"{Path(wav_path).stem}.vsqx"
                 out_path.write_text(project_text, encoding="utf-8")
@@ -1489,6 +1564,8 @@ class TsubakiProcessor:
         vsqx_singer_id: str = "BNGE7CP7EMTRSNC3",
         vsqx_singer_bs: int = 4,           # VOCALOID4 内部声库 Bank Select 编号（系统相关）
         word_phoneme_map: bool = False,    # 英语单词 → VOCALOID4 音素写入 <p lock="1">
+        language: str = "",                # 语种（用于 word_phoneme_map 防误判）
+        native_english_words: Optional[set] = None,  # 从原始文本预提取的英语单词集合（防拼音误判）
     ) -> str:
         """
         生成 VOCALOID4 VSQX 工程文件（XML 格式）。
@@ -1566,11 +1643,15 @@ class TsubakiProcessor:
             # ── word_phoneme_map：英语单词 → VOCALOID4 音素 + 锁定 ───────────
             # <p></p>                    → VOCALOID 自带 G2P（默认）
             # <p lock="1"><![CDATA[…]]></p>  → 手工音素 + 锁定（phoneme lock）
+            # 语言守卫：优先用 native_english_words（从原始文本预提取的集合）
+            # 判断，彻底消除"拼音碰巧是英语词"的误判（rang/wang/dong/shi 等）。
+            # 若未提供集合则回退词典查询（兼容旧调用路径）。
             p_tag = '<p></p>'
             if (
                 word_phoneme_map
                 and _word_to_arpabet is not None
                 and self._is_ascii_word_label(label)
+                and self._label_is_english_word(label, language, native_english_words)
             ):
                 try:
                     arpabet_phones = _word_to_arpabet(label)

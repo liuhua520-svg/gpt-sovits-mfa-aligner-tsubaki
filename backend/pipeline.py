@@ -266,6 +266,8 @@ class AudioProcessingPipeline:
                 vsqx_singer_id=vsqx_singer_id,
                 vsqx_singer_bs=vsqx_singer_bs,
                 word_phoneme_map=word_phoneme_map,
+                language=language,
+                original_text=text,        # ← 原始汉字/韩文文本，用于预提取真实英语单词
             )
 
             if not project_result.get("success"):
@@ -383,6 +385,8 @@ class AudioProcessingPipeline:
         vsqx_singer_id: str = "BCNFCY43LB2LZCD4",       # ← 对应声库 ID
         vsqx_singer_bs: int = 0,                          # ← 仅生成工程默认 bs（日语声库=0）
         word_phoneme_map: bool = False,                   # ← 英语单词 → 音素写入（SVP/VSQX）
+        language: str = "",                               # ← 语种，传给构建器防误判
+        original_text: str = "",                          # ← 原始歌词文本（汉字/韩文），用于预提取英语单词
     ) -> Dict:
         """仅执行工程文件生成（已有 WAV 以及 LAB/MIDI 之一）"""
         import time
@@ -447,6 +451,8 @@ class AudioProcessingPipeline:
                 vsqx_singer_id=vsqx_singer_id,
                 vsqx_singer_bs=vsqx_singer_bs,
                 word_phoneme_map=word_phoneme_map,
+                language=language,
+                original_text=original_text,   # ← 透传原始文本（仅生成工程模式下可选提供）
             )
 
             result["processing_time"] = int((time.time() - start_time) * 1000)
