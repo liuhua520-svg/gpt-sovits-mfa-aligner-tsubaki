@@ -34,8 +34,9 @@ Copyright (c) 2026 xiaohuang12345-ts
 | torchcrepe                 | 0.0.24        | [GitHub](https://github.com/descriptinc/torchcrepe) |
 | g2p_en                     | >=0.3.1       | [GitHub](https://github.com/Kyubyong/g2p) |
 | mido                       | >=1.3.0       | [GitHub](https://github.com/SpotlightKid/mido) |
-| requests                   | -             | [GitHub](https://github.com/psf/requests) |
+| ctranslate2                | >=4.3.0       | [GitHub](https://github.com/OpenNMT/CTranslate2) |
 | tqdm                       | -             | [GitHub](https://github.com/tqdm/tqdm) |
+
 
 #### BSD 3-Clause
 | 包名           | 版本            | 链接 |
@@ -59,6 +60,9 @@ Copyright (c) 2026 xiaohuang12345-ts
 | funasr             | >=1.1.0       | [GitHub](https://github.com/modelscope/FunASR) |
 | modelscope         | >=1.9.0       | [GitHub](https://github.com/modelscope/modelscope) |
 | accelerate         | >=0.27.0      | [GitHub](https://github.com/huggingface/accelerate) |
+| qwen-asr         | >=1.0.0      | [GitHub](https://github.com/QwenLM/Qwen3-ASR) |
+| nltk         | >=1.0.0      | [GitHub](https://github.com/nltk/nltk) |
+| requests     | -             | [GitHub](https://github.com/psf/requests) |
 
 #### LGPL 2.1 License
 | 包名     | 版本       | 链接 |
