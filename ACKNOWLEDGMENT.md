@@ -89,9 +89,11 @@ Copyright (c) 2026 xiaohuang12345-ts
 | vue-i18n                   | ^11.4.6       | [GitHub](https://github.com/intlify/vue-i18n) |
 | @vitejs/plugin-vue         | ^4.3.4        | [GitHub](https://github.com/vitejs/vite-plugin-vue) |
 | @vue/tsconfig              | ^0.4.0        | [GitHub](https://github.com/vuejs/tsconfig) |
-| terser                     | ^5.29.1       | [GitHub](https://github.com/terser/terser) |
 | vite                       | ^4.4.9        | [GitHub](https://github.com/vitejs/vite) |
 | vue-tsc                    | ^1.8.13       | [GitHub](https://github.com/vuejs/language-tools) |
+
+#### BSD 2-Clause
+| terser                     | ^5.29.1       | [GitHub](https://github.com/terser/terser) |
 
 #### Apache License 2.0
 | 包名                        | 版本          | 链接 |
