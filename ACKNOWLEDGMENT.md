@@ -60,10 +60,16 @@ Copyright (c) 2026 xiaohuang12345-ts
 | modelscope         | >=1.9.0       | [GitHub](https://github.com/modelscope/modelscope) |
 | accelerate         | >=0.27.0      | [GitHub](https://github.com/huggingface/accelerate) |
 
+#### LGPL 2.1 License
+| 包名     | 版本       | 链接 |
+|---------|------------|------|
+| num2words | >=0.5.13  | [GitHub](https://github.com/savoirfairelinux/num2words) |
+
 #### ISC License
 | 包名     | 版本       | 链接 |
 |---------|------------|------|
 | librosa | >=0.10.0   | [GitHub](https://github.com/librosa/librosa) |
+| resampy | >=0.4.2    | [GitHub](https://github.com/bmcfee/resampy) |
 
 ---
 
