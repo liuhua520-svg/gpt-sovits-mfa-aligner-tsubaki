@@ -107,7 +107,7 @@ Based on backend/requirements.txt
 
 - torchaudio>=2.0.0
   Copyright (c) 2017-2024, Facebook Inc.
-  License: BSD-3-Clause
+  License: BSD-2-Clause
   Link: https://github.com/pytorch/audio
 
 === 替代对齐后端 ===
