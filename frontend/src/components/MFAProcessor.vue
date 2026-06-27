@@ -283,6 +283,7 @@
           <el-select v-model="formData.outputFormat" :placeholder="t('processor.outputFormat')">
             <el-option :label="t('processor.outputFormatSv')" value="sv" />
             <el-option :label="t('processor.outputFormatUtau')" value="utau" />
+            <el-option :label="t('processor.outputFormatVsqx')" value="vsqx" />
           </el-select>
         </el-form-item>
 
@@ -586,7 +587,13 @@
                   <code>{{ result.projectPath }}</code>
                 </el-col>
                 <el-col :xs="24">
-                  <p><strong>{{ t('processor.outputFormat') }}:</strong> {{ result.projectFormat === 'sv' ? t('processor.outputFormatSv') : t('processor.outputFormatUtau') }}</p>
+                  <p><strong>{{ t('processor.outputFormat') }}:</strong>
+                    {{
+                      result.projectFormat === 'sv'   ? t('processor.outputFormatSv')   :
+                      result.projectFormat === 'vsqx' ? t('processor.outputFormatVsqx') :
+                                                        t('processor.outputFormatUtau')
+                    }}
+                  </p>
                   <p v-if="result.segments"><strong>{{ t('processor.segmentCount') }}:</strong> {{ result.segments }}</p>
                   <p v-if="result.config"><strong>{{ t('processor.processingConfig') }}:</strong></p>
                   <ul v-if="result.config">
@@ -917,6 +924,21 @@ const labMidiUploadKey = ref(0)
 
 const midiLoaded = computed(() => processingMode.value === 'project-only' && !!formData.value.midiFile)
 const selectedNotationFile = computed(() => formData.value.labFile || formData.value.midiFile)
+
+// VSQX 歌手名 / ID：按处理模式 + 语种自动切换
+// project-only 无语种选择，固定使用日语歌手声库
+const vsqxSingerConfig = computed((): { name: string; id: string } => {
+  if (processingMode.value === 'project-only') {
+    return { name: 'MIKU_V4X_Original_EVEC', id: 'BCNFCY43LB2LZCD4' }
+  }
+  // full 模式：按语种映射
+  switch (formData.value.language) {
+    case 'eng': return { name: 'MIKU_V4_English',         id: 'BMLTD846MLYP2MEK' }
+    case 'jpn': return { name: 'MIKU_V4X_Original_EVEC', id: 'BCNFCY43LB2LZCD4' }
+    case 'kor': return { name: 'SeeU_SV01_KOR',           id: 'BX77CNBZLBPHZX97' }
+    default:    return { name: 'MIKU_V4_Chinese',         id: 'BNGE7CP7EMTRSNC3' }  // cmn / yue
+  }
+})
 
 // 计算属性
 const normalizedModels = computed(() => {
@@ -1278,6 +1300,10 @@ if (processingMode.value === 'project-only') {
     const formDataObj = new FormData()
     formDataObj.append('wav_file', formData.value.audioFile)
     formDataObj.append('format', formData.value.outputFormat)
+    if (formData.value.outputFormat === 'vsqx') {
+      formDataObj.append('vsqx_singer',    vsqxSingerConfig.value.name)
+      formDataObj.append('vsqx_singer_id', vsqxSingerConfig.value.id)
+    }
     formDataObj.append('title', formData.value.projectTitle)
     formDataObj.append('phoneme_mode', formData.value.phonemeMode)
     formDataObj.append('bpm', advancedConfig.value.bpm.toString())
@@ -1392,6 +1418,10 @@ if (processingMode.value === 'project-only') {
 
     if (processingMode.value === 'full') {
       formDataObj.append('format', formData.value.outputFormat)
+      if (formData.value.outputFormat === 'vsqx') {
+        formDataObj.append('vsqx_singer',    vsqxSingerConfig.value.name)
+        formDataObj.append('vsqx_singer_id', vsqxSingerConfig.value.id)
+      }
       formDataObj.append('title', formData.value.projectTitle)
       formDataObj.append('bpm', advancedConfig.value.bpm.toString())
       formDataObj.append('base_pitch', advancedConfig.value.base_pitch.toString())
@@ -1502,7 +1532,7 @@ const downloadLab = () => {
 
   if (result.value.projectPath) {
     const projName = getFileName(result.value.projectPath)
-    stem = projName.replace(/\.(svp|ustx|sv)$/, '')   // 去掉扩展名
+    stem = projName.replace(/\.(svp|ustx|sv|vsqx)$/, '')   // 去掉扩展名
   } else if (result.value.labPath) {
     const labName = getFileName(result.value.labPath)
     stem = labName.replace(/\.lab$/, '')
