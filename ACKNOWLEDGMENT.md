@@ -44,12 +44,12 @@ Copyright (c) 2026 xiaohuang12345-ts
 | soundfile     | 0.12.1          | [GitHub](https://github.com/bastibe/python-soundfile) |
 | numpy         | >=1.26.0,<2.0.0 | [GitHub](https://github.com/numpy/numpy) |
 | torch         | >=2.3.1         | [GitHub](https://github.com/pytorch/pytorch) |
-| torchaudio    | >=2.0.0         | [GitHub](https://github.com/pytorch/audio) |
 
 #### BSD 2-Clause
 | 包名           | 版本            | 链接 |
 |---------------|-----------------|------|
 | WhisperX         | >=3.2.0           | [GitHub](https://github.com/m-bain/whisperx) |
+| torchaudio    | >=2.0.0         | [GitHub](https://github.com/pytorch/audio) |
 
 #### Apache License 2.0
 | 包名                | 版本          | 链接 |
