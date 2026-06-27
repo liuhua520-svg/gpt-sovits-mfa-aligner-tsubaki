@@ -721,6 +721,130 @@ def _expand_digits_to_phones(raw: str) -> Optional[list[str]]:
     return all_phones or None
 
 
+# ══════════════════════════════════════════════════════════════
+# ARPABET → VOCALOID4 标准英语音素符号
+#
+#   背景：word_to_arpabet() 返回的是小写、无重音数字的 ARPABET 序列
+#   （如 hello → ["hh","ah","l","ow"]），这对 SVP 的 phonemes 字段直接
+#   够用（SynthV 自己认 ARPABET）。但 VOCALOID4 的 <p lock="1"> 手工
+#   音素字段使用的是 Yamaha 自己定义的一套符号（参见官方 Appendix
+#   Phoneme Table），与 ARPABET 并不是同一套记号，必须再做一次转换，
+#   否则写进 <p> 的内容 VOCALOID Editor 根本不认。
+#
+#   规则参照官方 English Phonetic Symbol Table：
+#     1. 元音直接查表（V/e/I/i:/{/O:/Q/U/u:/@r/eI/aI/OI/@U/aU 等）。
+#     2. 浊塞音 b/d/g、清塞音 p/t/k、边音 l 在"音节起始"位置使用送气/
+#        强发音符号（bh/dh/gh/ph/th/kh/l0），其余位置使用普通形式。
+#        —— 简化近似：本项目把一个英语单词整体写在同一个 VOCALOID
+#        音符上（<y> 是整词，不按音节拆分多个音符），因此用"该单词
+#        ARPABET 序列的第 0 个音素"近似"词首音节起始"，不做完整音节
+#        切分。该近似与真实英语连音规则也基本吻合：/s/ 之后或词中部
+#        的塞音本就趋向不送气（如 "street" 的 t、"starry" 的 t）。
+#     3. ARPABET 里 vowel+R 两个独立音素（美式发音，如 "beer"→iy r、
+#        "star"→aa r）在 VOCALOID4 表里对应卷舌复合符号（I@/e@/U@/
+#        O@/Q@）。仅当该 R 不是后接元音的连读 R（如 "starry" 中
+#        R 后接 iy，属于下一音节声母）时才合并，否则保留独立 r。
+#     4. 查不到的音素原样小写直通，避免产出空白音素段。
+# ══════════════════════════════════════════════════════════════
+
+# 元音 + @ schwa（schwa 官方注释为"仅在手工直接输入音素符号时使用"——
+# 本函数正是手工写入 <p lock="1"> 的场景，因此也收录 ax→@，用于兼容
+# MFA 词典路径可能产出的真 schwa 标注；g2p_en 路径下重音数字统一被
+# 去除，AH0（弱读）和 AH1/AH2（重读 STRUT）一样会落到 "ah"→V，
+# 这与本模块给出的范例（hello → h V l @U）保持一致。
+_ARPABET_TO_V4_VOWELS: dict[str, str] = {
+    "aa": "Q", "ae": "{", "ah": "V", "ax": "@", "ao": "O:",
+    "aw": "aU", "ay": "aI",
+    "eh": "e", "er": "@r", "ey": "eI",
+    "ih": "I", "iy": "i:",
+    "ow": "@U", "oy": "OI",
+    "uh": "U", "uw": "u:",
+}
+
+# 辅音普通（非词首送气）形式
+_ARPABET_TO_V4_CONSONANTS: dict[str, str] = {
+    "b": "b", "ch": "tS", "d": "d", "dh": "D",
+    "dx": "d",       # 闪音 flap，VOCALOID4 无独立符号，近似为 d
+    "f": "f", "g": "g", "hh": "h", "jh": "dZ",
+    "k": "k", "l": "l", "m": "m", "n": "n", "ng": "N",
+    "p": "p", "r": "r", "s": "s", "sh": "S", "t": "t",
+    "th": "T", "v": "v", "w": "w", "y": "j", "z": "z", "zh": "Z",
+}
+
+_ARPABET_TO_V4_BASE: dict[str, str] = {**_ARPABET_TO_V4_VOWELS, **_ARPABET_TO_V4_CONSONANTS}
+
+# 词首送气/强发音形式：仅用于该单词 ARPABET 序列的第 0 个音素
+_ARPABET_TO_V4_WORD_INITIAL: dict[str, str] = {
+    "b": "bh", "d": "dh", "g": "gh",
+    "p": "ph", "t": "th", "k": "kh",
+    "l": "l0",
+}
+
+# 元音 + 音节尾 R → VOCALOID4 卷舌复合符号
+# （对应官方表中 Beer/Bear/Poor/Pour/Star 四个示例词）
+_VOWEL_R_MERGE: dict[str, str] = {
+    "ih": "I@", "iy": "I@", "eh": "e@", "uh": "U@", "ao": "O@", "aa": "Q@",
+}
+
+_ARPABET_VOWEL_SET = frozenset(_ARPABET_TO_V4_VOWELS) | {"ax"}
+
+
+def arpabet_to_vocaloid4(arpabet_phones: list[str]) -> str:
+    """
+    ARPABET 音素序列 → VOCALOID4 标准音素符号字符串（空格分隔）。
+
+    Parameters
+    ----------
+    arpabet_phones : list[str]
+        通常即 word_to_arpabet() 的返回值（小写、无重音数字，如
+        ["hh", "ah", "l", "ow"]）。也兼容带重音数字 / 大写的输入。
+
+    Returns
+    -------
+    str
+        空格分隔的 VOCALOID4 音素符号串，可直接写入
+        <p lock="1"><![CDATA[...]]></p>。
+        例：arpabet_to_vocaloid4(["hh","ah","l","ow"]) == "h V l @U"
+        （对应 VOCALOID4 工程里 hello 这个单词的标准写法）。
+        输入为空时返回 ""。
+    """
+    if not arpabet_phones:
+        return ""
+
+    # 1) 去重音数字、转小写、丢弃空 token
+    clean = [_TRAILING_STRESS_RE.sub("", (p or "").strip().lower()) for p in arpabet_phones]
+    clean = [p for p in clean if p]
+    if not clean:
+        return ""
+
+    # 2) 元音 + 音节尾 R 合并（R 后紧跟元音说明是连读声母，不合并）
+    merged: list[str] = []
+    i, n = 0, len(clean)
+    while i < n:
+        cur = clean[i]
+        if (
+            cur in _VOWEL_R_MERGE
+            and i + 1 < n
+            and clean[i + 1] == "r"
+            and not (i + 2 < n and clean[i + 2] in _ARPABET_VOWEL_SET)
+        ):
+            merged.append(_VOWEL_R_MERGE[cur])
+            i += 2
+        else:
+            merged.append(cur)
+            i += 1
+
+    # 3) 逐音素查表；第 0 个音素若为 b/d/g/p/t/k/l，使用词首送气/强形式
+    out: list[str] = []
+    for idx, ph in enumerate(merged):
+        if idx == 0 and ph in _ARPABET_TO_V4_WORD_INITIAL:
+            out.append(_ARPABET_TO_V4_WORD_INITIAL[ph])
+            continue
+        out.append(_ARPABET_TO_V4_BASE.get(ph, ph))
+
+    return " ".join(out)
+
+
 # ── 音素时长权重（用于把一个词的时间跨度按音素类型比例分配）─────────
 # 依据：元音/双元音在自然发音中明显长于塞音（塞音有闭塞+爆破，天然
 # 短促）；摩擦音/鼻音/流音/半元音介于两者之间。权重为相对值，分配时

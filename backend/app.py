@@ -397,6 +397,7 @@ def run_pipeline_job(
     vsqx_singer: str = "MIKU_V4_Chinese",
     vsqx_singer_id: str = "BNGE7CP7EMTRSNC3",
     vsqx_singer_bs: int = 4,
+    word_phoneme_map: bool = False,
 ):
     try: # <--- Added the missing try block here
         class FileStorageWrapper:
@@ -442,6 +443,7 @@ def run_pipeline_job(
             vsqx_singer=vsqx_singer,
             vsqx_singer_id=vsqx_singer_id,
             vsqx_singer_bs=vsqx_singer_bs,
+            word_phoneme_map=word_phoneme_map,
         )
 
         if result.get("success"):
@@ -533,6 +535,7 @@ def pipeline_full_process():
             whisperx_model = "large-v3"
 
         english_word_align = request.form.get("english_word_align", "false").lower() == "true"
+        word_phoneme_map   = request.form.get("word_phoneme_map",   "false").lower() == "true"
 
         vsqx_singer    = request.form.get("vsqx_singer",    "MIKU_V4_Chinese")
         vsqx_singer_id = request.form.get("vsqx_singer_id", "BNGE7CP7EMTRSNC3")
@@ -591,6 +594,7 @@ def pipeline_full_process():
                 vsqx_singer,
                 vsqx_singer_id,
                 vsqx_singer_bs,
+                word_phoneme_map,
             ),
         ).start()
 
@@ -757,6 +761,7 @@ def run_project_only_job(
     vsqx_singer: str = "MIKU_V4_Chinese",
     vsqx_singer_id: str = "BNGE7CP7EMTRSNC3",
     vsqx_singer_bs: int = 4,
+    word_phoneme_map: bool = False,
 ):
     try:
         set_job(
@@ -787,6 +792,7 @@ def run_project_only_job(
             vsqx_singer=vsqx_singer,
             vsqx_singer_id=vsqx_singer_id,
             vsqx_singer_bs=vsqx_singer_bs,
+            word_phoneme_map=word_phoneme_map,
         )
 
         if result.get("success"):
@@ -854,6 +860,7 @@ def pipeline_project_only():
         vsqx_singer    = request.form.get("vsqx_singer",    vsqx_singer)
         vsqx_singer_id = request.form.get("vsqx_singer_id", vsqx_singer_id)
         vsqx_singer_bs = int(request.form.get("vsqx_singer_bs", vsqx_singer_bs))
+        word_phoneme_map = request.form.get("word_phoneme_map", "false").lower() == "true"
 
         if phoneme_mode not in ("none", "merge", "hiragana", "katakana"):
             logger.warning(f"未知 phoneme_mode '{phoneme_mode}'，回退到 'none'")
@@ -965,6 +972,7 @@ def pipeline_project_only():
                 vsqx_singer,
                 vsqx_singer_id,
                 vsqx_singer_bs,
+                word_phoneme_map,
             ),
         ).start()
 

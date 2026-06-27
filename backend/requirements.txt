@@ -1,28 +1,60 @@
+# ====================== 核心框架 ======================
 flask==2.3.3
 flask-cors==4.0.0
+
+# ====================== MFA 对齐 ======================
 montreal-forced-aligner==3.3.9
-pypinyin==0.53.0
 textgrid==1.5
-sudachipy==0.6.8
-sudachidict-core==20240409
-jamo==0.4.1
+
+# ====================== 工程文件导出 ======================
+ruamel.yaml>=0.18.0         # USTX 工程生成必备 (tsubaki_processor.py)
+mido>=1.3.0                 # MIDI 文件处理 (midi_processor.py)
+
+# ====================== 语言与文本支持 ======================
+pypinyin==0.53.0
+pycantonese>=0.1.0          # 粤语 Jyutping 支持
+sudachipy==0.6.8            # 日语分词
+sudachidict-core==20240409  # 日语词典
+jamo==0.4.1                 # 韩语 Jamo 分解
+nltk>=3.8.1                 # g2p_en 词性标注依赖 (phoneme_converter.py)
+num2words>=0.5.13           # 数字转英文发音单词展开 (phoneme_converter.py)
+
+# ====================== 音频处理 ======================
 soundfile==0.12.1
-
-# PyWORLD 使用支持新版 numpy 的版本
-pyworld>=0.3.4
-
-# F0 提取器
-torch>=2.3.1
-torchcrepe==0.0.24
 librosa>=0.10.0
-torchaudio>=2.0.0
+numpy>=1.26.0,<2.0.0        # 避免 PyWORLD 与新版 numpy 冲突
+resampy>=0.4.2              # 音频重采样 Fallback 库 (f0_extractors.py)
 
-# 替代对齐后端
+# ====================== F0 提取 ======================
+pyworld>=0.3.4
+torchcrepe==0.0.24
+
+# ====================== 替代对齐后端 ======================
 whisperx>=3.2.0
+ctranslate2>=4.3.0          # WhisperX GPU 计算精度查询 (alt_aligners.py)
 funasr>=1.1.0
 modelscope>=1.9.0
 accelerate>=0.27.0
-g2p_en>=0.3.1
+g2p_en>=0.3.1               # 英文 OOV 词汇发音推导
+qwen-asr>=1.0.0             # Qwen3-ForcedAligner 官方依赖 (alt_aligners.py)
 
-# MIDI
-mido>=1.3.0
+# ====================== 网络与其他基础库 ======================
+requests
+tqdm
+
+# ====================== PyTorch (根据硬件三选一) ======================
+
+# CUDA 12.1（用于 RTX 30/40 系等现代显卡）
+# torch==2.3.1+cu121
+# torchaudio==2.3.1+cu121
+--index-url https://download.pytorch.org/whl/cu121
+
+# CUDA 11.8 (旧版显卡保留选项)
+# torch==2.3.1+cu118
+# torchaudio==2.3.1+cu118
+# --index-url https://download.pytorch.org/whl/cu118
+
+# CPU Only（推荐，无显卡）
+torch==2.3.1+cpu
+torchaudio==2.3.1+cpu
+--index-url https://download.pytorch.org/whl/cpu

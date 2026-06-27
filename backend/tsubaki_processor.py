@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import numpy as np
 import multiprocessing as mp
 import traceback
@@ -231,6 +232,28 @@ class TsubakiProcessor:
         注意：'-' 本身不是静音，它是 consonant phoneme onset 标记，应保留为音符。
         """
         return label.strip().lower() in TsubakiProcessor._TRUE_SILENCE
+
+    # 匹配纯 ASCII 字母 + 撇号组成的英语单词（'t, I'm 等缩写）
+    _ASCII_WORD_RE = re.compile(r"^[a-zA-Z][a-zA-Z']*$")
+
+    @staticmethod
+    def _is_ascii_word_label(label: str) -> bool:
+        """
+        判断 label 是否为可能的英语单词（非静音、非辅音占位符、纯 ASCII 字母）。
+
+        用于 word_phoneme_map 开关：只对英语单词调用 word_to_arpabet()，
+        跳过 '-' 占位符、CJK 字符段、pinyin/jyutping/hangul 音素段。
+
+        注意：单纯的 ASCII 字母检查无法完全区分 "en 模式下的音素 hh/sh"
+        和 "英语词 hello"——但 word_phoneme_map 只在 english_word_align=True
+        时才启用，后者保证了 LAB 中的英语词以完整词（而非音素序列）形式存在，
+        因此在实际场景中误判概率极低。
+        """
+        if not label or label == "-":
+            return False
+        if label.strip().lower() in TsubakiProcessor._TRUE_SILENCE:
+            return False
+        return bool(TsubakiProcessor._ASCII_WORD_RE.match(label))
 
     def _read_audio_duration_sec(self, wav_path: str) -> float:
         try:
@@ -759,6 +782,7 @@ class TsubakiProcessor:
         config: AudioProcessingConfig,
         audio_duration_sec: Optional[float] = None,
         midi_notes: Optional[List] = None,   # MIDI 导入：(start_sec, end_sec, pitch) 列表
+        word_phoneme_map: bool = False,       # 英语单词 → ARPABET 音素写入 phonemes 字段
     ) -> str:
         """
         生成可被 Synthesizer V 正确识别的 SVP JSON 文本。
@@ -833,6 +857,24 @@ class TsubakiProcessor:
 
             # 原本就有的 "-" 标签由于不属于 _is_true_silence，会顺利走到这里，被正确保留为 "-" 音符
             note = self._default_svp_note(seg.label, tone, onset, dur)
+
+            # ── word_phoneme_map：英语单词 → ARPABET 音素写入 phonemes 字段 ──
+            # 条件：功能开关已开启 + label 是英语单词（非静音/非辅音占位符）
+            if word_phoneme_map and self._is_ascii_word_label(seg.label):
+                try:
+                    from phoneme_converter import word_to_arpabet
+                    arpabet_phones = word_to_arpabet(seg.label)
+                    if arpabet_phones:
+                        note["phonemes"] = " ".join(arpabet_phones)
+                        logger.debug(
+                            "[SVP word_phoneme_map] %r → %s",
+                            seg.label, note["phonemes"],
+                        )
+                except Exception as _wp_err:
+                    logger.warning(
+                        "[SVP word_phoneme_map] 转换失败 %r: %s", seg.label, _wp_err
+                    )
+
             all_notes.append(note)
             if seg.label != "-":
                 voiced_refs.append(note)
@@ -1187,6 +1229,7 @@ class TsubakiProcessor:
         vsqx_singer: str = "MIKU_V4_Chinese",       # VSQX 歌手名（由前端按语种/模式传入）
         vsqx_singer_id: str = "BNGE7CP7EMTRSNC3",  # VSQX 歌手 ID
         vsqx_singer_bs: int = 4,                    # VSQX 歌手 Bank Select（VOCALOID4 内部编号，系统相关）
+        word_phoneme_map: bool = False,             # 英语单词 → 音素写入 SVP phonemes / VSQX <p lock="1">
     ) -> Dict:
         """完整工程文件生成入口。
 
@@ -1304,6 +1347,7 @@ class TsubakiProcessor:
                     f0=f0, t=t, sr=sr, wav_path=wav_path,
                     config=config, audio_duration_sec=audio_duration_sec,
                     midi_notes=midi_notes,
+                    word_phoneme_map=word_phoneme_map,
                 )
                 out_path = self.work_dir / f"{Path(wav_path).stem}.svp"
                 out_path.write_text(project_text, encoding="utf-8")
@@ -1337,6 +1381,7 @@ class TsubakiProcessor:
                     vsqx_singer=vsqx_singer,
                     vsqx_singer_id=vsqx_singer_id,
                     vsqx_singer_bs=vsqx_singer_bs,
+                    word_phoneme_map=word_phoneme_map,
                 )
                 out_path = self.work_dir / f"{Path(wav_path).stem}.vsqx"
                 out_path.write_text(project_text, encoding="utf-8")
@@ -1346,7 +1391,7 @@ class TsubakiProcessor:
                     "success": False,
                     "error": (
                         f"不支持的格式: {output_format}。"
-                        "支持: sv / ustx / utau / midi / vsqx"
+                        "支持: sv / ustx / vsqx"
                     ),
                 }
 
@@ -1443,6 +1488,7 @@ class TsubakiProcessor:
         vsqx_singer: str = "MIKU_V4_Chinese",
         vsqx_singer_id: str = "BNGE7CP7EMTRSNC3",
         vsqx_singer_bs: int = 4,           # VOCALOID4 内部声库 Bank Select 编号（系统相关）
+        word_phoneme_map: bool = False,    # 英语单词 → VOCALOID4 音素写入 <p lock="1">
     ) -> str:
         """
         生成 VOCALOID4 VSQX 工程文件（XML 格式）。
@@ -1474,8 +1520,19 @@ class TsubakiProcessor:
 
         # ── ① 构建音符列表 ──────────────────────────────────────────────────
         # voiced_refs 用于音高曲线中查找该 tick 对应的音符 tone
-        note_entries: List[Tuple[int, int, int, str]] = []  # (t_on, dur, tone, lyric)
-        voiced_refs:  List[Tuple[int, int, int]]      = []  # (t_on, t_off, tone)
+        note_entries: List[Tuple[int, int, int, str, str]] = []  # (t_on, dur, tone, lyric, p_tag)
+        voiced_refs:  List[Tuple[int, int, int]]           = []  # (t_on, t_off, tone)
+
+        # 预加载 word_phoneme_map 所需函数（惰性导入，只在功能开启时触发）
+        _word_to_arpabet   = None
+        _arpabet_to_vocaloid4 = None
+        if word_phoneme_map:
+            try:
+                from phoneme_converter import word_to_arpabet as _wta, arpabet_to_vocaloid4 as _atv4
+                _word_to_arpabet      = _wta
+                _arpabet_to_vocaloid4 = _atv4
+            except Exception as _imp_err:
+                logger.warning("[VSQX word_phoneme_map] 导入失败: %s，功能已禁用", _imp_err)
 
         for seg in segments:
             if seg.end_time <= seg.start_time:
@@ -1505,8 +1562,31 @@ class TsubakiProcessor:
                     tone      = max(12, min(127, tone))
 
             label = seg.label
-            # <p> 音素字段留空，由 VOCALOID 自带 G2P 处理
-            note_entries.append((t_on, dur, tone, label))
+
+            # ── word_phoneme_map：英语单词 → VOCALOID4 音素 + 锁定 ───────────
+            # <p></p>                    → VOCALOID 自带 G2P（默认）
+            # <p lock="1"><![CDATA[…]]></p>  → 手工音素 + 锁定（phoneme lock）
+            p_tag = '<p></p>'
+            if (
+                word_phoneme_map
+                and _word_to_arpabet is not None
+                and self._is_ascii_word_label(label)
+            ):
+                try:
+                    arpabet_phones = _word_to_arpabet(label)
+                    if arpabet_phones and _arpabet_to_vocaloid4 is not None:
+                        v4_phones = _arpabet_to_vocaloid4(arpabet_phones)
+                        p_tag = f'<p lock="1"><![CDATA[{v4_phones}]]></p>'
+                        logger.debug(
+                            "[VSQX word_phoneme_map] %r → ARPABET %s → V4 %s",
+                            label, " ".join(arpabet_phones), v4_phones,
+                        )
+                except Exception as _wp_err:
+                    logger.warning(
+                        "[VSQX word_phoneme_map] 转换失败 %r: %s", label, _wp_err
+                    )
+
+            note_entries.append((t_on, dur, tone, label, p_tag))
             voiced_refs.append((t_on, t_off, tone))
 
         # ── ② 音高曲线（P 控制器）───────────────────────────────────────────
@@ -1554,7 +1634,7 @@ class TsubakiProcessor:
 
         # 音符块
         note_block = ""
-        for t_on, dur, tone, lyric in note_entries:
+        for t_on, dur, tone, lyric, p_tag in note_entries:
             note_block += (
                 f'\t\t\t<note>\n'
                 f'\t\t\t\t<t>{t_on}</t>\n'
@@ -1562,7 +1642,7 @@ class TsubakiProcessor:
                 f'\t\t\t\t<n>{tone}</n>\n'
                 f'\t\t\t\t<v>{VELOCITY}</v>\n'
                 f'\t\t\t\t<y><![CDATA[{lyric}]]></y>\n'
-                f'\t\t\t\t<p></p>\n'
+                f'\t\t\t\t{p_tag}\n'
                 f'\t\t\t\t<nStyle>\n'
                 f'\t\t\t\t\t<v id="accent">50</v>\n'
                 f'\t\t\t\t</nStyle>\n'
