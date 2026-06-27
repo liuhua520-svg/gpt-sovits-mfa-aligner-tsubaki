@@ -146,48 +146,11 @@ Based on backend/requirements.txt
   License: MIT
   Link: https://github.com/Kyubyong/g2p
 
-- ctranslate2>=4.3.0
-  Copyright (c) OpenNMT
-  License: MIT
-  Link: https://github.com/OpenNMT/CTranslate2
-
-- qwen-asr>=1.0.0
-  Copyright (c) Alibaba Qwen Team
-  License: Apache-2.0
-  Link: https://github.com/QwenLM/Qwen3-ASR
-
-  Note:
-  The Python package is licensed under Apache License 2.0.
-  Official pretrained models are also released under Apache-2.0.
-
-=== 工程文件导出 ===
-- ruamel.yaml>=0.18.0
-  Copyright (c) ruamel
-  License: MIT
-  Link: https://sourceforge.net/p/ruamel-yaml
-
 === MIDI ===
 - mido>=1.3.0
   Copyright (c) 2013-2024 Ole Martin Bjørndalen
   License: MIT
   Link: https://github.com/SpotlightKid/mido
-
-=== 语言支持补充 ===
-- nltk>=3.8.1
-  Copyright (c) NLTK Project
-  License: Apache-2.0
-  Link: https://github.com/nltk/nltk
-
-- num2words>=0.5.13
-  Copyright (c) Virgil Dupras and contributors
-  License: LGPL-2.1
-  Link: https://github.com/savoirfairelinux/num2words
-
-=== 音频处理补充 ===
-- resampy>=0.4.2
-  Copyright (c) librosa developers
-  License: ISC
-  Link: https://github.com/bmcfee/resampy
 
 === 其他 ===
 - requests
@@ -241,6 +204,11 @@ Based on backend/requirements.txt
   License: MIT
   Link: https://github.com/vuejs/tsconfig
 
+- terser (^5.29.1)
+  Copyright (c) Mihai Bazon and contributors
+  License: BSD-2-Clause
+  Link: https://github.com/terser/terser
+
 - vite (^4.4.9)
   Copyright (c) Vite contributors
   License: MIT
@@ -250,13 +218,6 @@ Based on backend/requirements.txt
   Copyright (c) Vue Language Tools contributors
   License: MIT
   Link: https://github.com/vuejs/language-tools
-
-=== BSD-2-Clause ===
-
-- terser (^5.29.1)
-  Copyright (c) Mihai Bazon and contributors
-  License: BSD-2-Clause
-  Link: https://github.com/terser/terser
 
 === Apache License 2.0 ===
 
@@ -273,8 +234,7 @@ When redistributing this project:
 
 - Include the project LICENSE file.
 - Include this THIRD-PARTY-NOTICES.txt file.
-- Preserve applicable copyright notices.
-- Preserve bundled third-party LICENSE and NOTICE files where required.
+- Preserve copyright notices contained in this repository.
 - Comply with the license terms of any bundled third-party software.
 - If redistributing bundled models, dictionaries, or other assets,
   also comply with their respective licenses.
@@ -296,17 +256,12 @@ The commercial availability of downloaded models, dictionaries,
 or other runtime resources depends on the licenses of those
 individual resources.
 
-This notice is provided for informational purposes only and does
-not replace the original license terms of any third-party software,
-models, dictionaries, or other bundled assets.
-
 --------------------------------------------------------------------
 
 6. Downloaded Models
 
-This project may automatically download pretrained models,
-alignment models, pronunciation dictionaries, and other runtime
-resources required for speech recognition or forced alignment.
+This project may automatically download pretrained models
+required for speech recognition or forced alignment.
 
 These models are not included in this repository unless
 explicitly bundled.
@@ -318,7 +273,6 @@ Examples include:
 - WhisperX alignment models
 - Qwen3-ASR models
 - Qwen3-ForcedAligner models
-- FunASR pretrained models
 
 Each downloaded model remains subject to its own license.
 
