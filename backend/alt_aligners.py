@@ -128,6 +128,9 @@ os.environ.setdefault("TRANSFORMERS_CACHE",            str(_HF_HUB))
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")   # 消除 Windows 警告
 os.environ["TORCH_HOME"] = str(_TORCH_CACHE)
 
+# 👇 新增这一行，强制 Hugging Face 进入完全离线模式
+os.environ["HF_HUB_OFFLINE"] = "1"
+
 logger.info(
     f"[alt_aligners] 模型目录: {_MODELS_DIR}\n"
     f"  HF 缓存   → {_HF_HUB}\n"

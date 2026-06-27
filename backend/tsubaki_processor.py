@@ -1455,12 +1455,12 @@ class TsubakiProcessor:
         • vsPart 从 tick=1920 开始（preMeasure=1，4/4，480×4=1920）
         • note 和 cc（音高曲线）的 <t> 均为相对于 vsPart 起点的偏移
         • 音高曲线（P 控制器）范围 ±8190，对应 ±PBS 个半音
-          PBS 默认值 = 13（来自实际 vsqx 文件）
+          PBS 默认值 = 12（来自实际 vsqx 文件）
         • 歌词 <y>：使用 segment label；<p> 音素字段留空，
           由 VOCALOID 自带 G2P 处理（用户可在 VOCALOID Editor 中手动编辑）。
         """
         RESOLUTION  = 480        # ticks per quarter note
-        PBS         = 13         # pitch bend sensitivity (semitones)
+        PBS         = 12         # pitch bend sensitivity (semitones)
         PART_OFFSET = 1920       # vsPart start tick (preMeasure=1, 4/4)
         VELOCITY    = 64
         bpm = float(config.bpm)
