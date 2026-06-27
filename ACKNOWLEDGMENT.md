@@ -80,9 +80,11 @@ Copyright (c) 2026 xiaohuang12345-ts
 | @vitejs/plugin-vue         | ^4.3.4        | [GitHub](https://github.com/vitejs/vite-plugin-vue) |
 | @vue/tsconfig              | ^0.4.0        | [GitHub](https://github.com/vuejs/tsconfig) |
 | terser                     | ^5.29.1       | [GitHub](https://github.com/terser/terser) |
-| typescript                 | ^5.1.6        | [GitHub](https://github.com/microsoft/TypeScript) |
 | vite                       | ^4.4.9        | [GitHub](https://github.com/vitejs/vite) |
 | vue-tsc                    | ^1.8.13       | [GitHub](https://github.com/vuejs/language-tools) |
+
+#### Apache License 2.0
+| typescript                 | ^5.1.6        | [GitHub](https://github.com/microsoft/TypeScript) |
 
 ---
 
@@ -100,6 +102,8 @@ Copyright (c) 2026 xiaohuang12345-ts
 - 保留本 `THIRD_PARTY_NOTICES.txt` 文件
 - 保留项目 `LICENSE` 文件
 - 如有修改依赖，请同步更新本文件
+- 遵守许可证条款
+- 根据 Apache License 2.0 要求如果有 NOTICE 则必须保留
 
 **所有列出的依赖均允许商业使用和闭源集成。**
 
