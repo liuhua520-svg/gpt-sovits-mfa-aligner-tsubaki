@@ -204,11 +204,6 @@ Based on backend/requirements.txt
   License: MIT
   Link: https://github.com/vuejs/tsconfig
 
-- terser (^5.29.1)
-  Copyright (c) Mihai Bazon and contributors
-  License: BSD-2-Clause
-  Link: https://github.com/terser/terser
-
 - vite (^4.4.9)
   Copyright (c) Vite contributors
   License: MIT
@@ -218,6 +213,13 @@ Based on backend/requirements.txt
   Copyright (c) Vue Language Tools contributors
   License: MIT
   Link: https://github.com/vuejs/language-tools
+
+=== BSD-2-Clause ===
+
+- terser (^5.29.1)
+  Copyright (c) Mihai Bazon and contributors
+  License: BSD-2-Clause
+  Link: https://github.com/terser/terser
 
 === Apache License 2.0 ===
 
