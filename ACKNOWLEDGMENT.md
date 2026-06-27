@@ -84,6 +84,8 @@ Copyright (c) 2026 xiaohuang12345-ts
 | vue-tsc                    | ^1.8.13       | [GitHub](https://github.com/vuejs/language-tools) |
 
 #### Apache License 2.0
+| 包名                        | 版本          | 链接 |
+|----------------------------|---------------|------|
 | typescript                 | ^5.1.6        | [GitHub](https://github.com/microsoft/TypeScript) |
 
 ---
