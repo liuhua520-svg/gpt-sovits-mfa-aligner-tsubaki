@@ -501,6 +501,19 @@
               </el-col>
             </el-row>
 
+            <!-- 单词音素映射：仅在英语单词级对齐开启 + 输出格式为 SVP/VSQX 时显示 -->
+            <el-form-item
+              v-if="englishWordAlign && processingMode === 'full' && (formData.outputFormat === 'sv' || formData.outputFormat === 'vsqx')"
+              :label="t('processor.wordPhonemeMap')"
+            >
+              <el-checkbox v-model="wordPhonemeMap" />
+              <span class="option-hint" style="margin-left:8px">
+                {{ formData.outputFormat === 'vsqx'
+                   ? t('processor.wordPhonemeMapHintVsqx')
+                   : t('processor.wordPhonemeMapHintSvp') }}
+              </span>
+            </el-form-item>
+
             <el-alert type="info" :closable="false" show-icon class="settings-info">
               <template #title>💡 {{ t('processor.advancedHelpTitle') }}</template>
               <p><strong>BPM:</strong> {{ t('processor.advancedHelpBpm') }}</p>
@@ -848,6 +861,7 @@ interface SystemStatus {
 // 核心表单与模式状态（合并唯一声明）
 const processingMode = ref<ProcessingMode>('mfa-only')
 const englishWordAlign = ref<boolean>(false)  // 英语单词级对齐（不做 ARPABET 音素拆分）
+const wordPhonemeMap   = ref<boolean>(false)  // 英语单词 → 音素映射（SVP phonemes / VSQX <p lock="1">）
 const alignerBackend = ref<string>('mfa')   // 对齐后端选择
 const alignerStatus = ref<Record<string, any>>({
   whisperx:      { available: false, message: t('processor.backendStatusChecking') },
@@ -1318,6 +1332,7 @@ if (processingMode.value === 'project-only') {
     formDataObj.append('f0_ceil', advancedConfig.value.f0_ceil.toString())
     formDataObj.append('auto_note_pitch', advancedConfig.value.auto_note_pitch.toString())
     formDataObj.append('export_pitch_line', advancedConfig.value.export_pitch_line.toString())
+    formDataObj.append('word_phoneme_map', 'false')  // project-only 模式不依赖 englishWordAlign，默认关闭
 
     // 只传一个标注文件：LAB 或 MIDI 二选一
     if (notationExt === 'lab') {
@@ -1435,6 +1450,11 @@ if (processingMode.value === 'project-only') {
       formDataObj.append('f0_ceil', advancedConfig.value.f0_ceil.toString())
       formDataObj.append('auto_note_pitch', advancedConfig.value.auto_note_pitch.toString())
       formDataObj.append('export_pitch_line', advancedConfig.value.export_pitch_line.toString())
+      formDataObj.append('word_phoneme_map', (
+        wordPhonemeMap.value &&
+        englishWordAlign.value &&
+        (formData.value.outputFormat === 'sv' || formData.value.outputFormat === 'vsqx')
+      ).toString())
     }
 
     progressTimer = window.setInterval(() => {
