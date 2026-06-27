@@ -26,6 +26,9 @@ HUB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 os.environ["HF_HOME"] = str(CACHE_DIR)
 os.environ["HF_HUB_CACHE"] = str(HUB_CACHE_DIR)
 
+# 👇 新增这一行
+# os.environ["HF_HUB_OFFLINE"] = "1"
+
 logger.info(f"HF_HOME = {os.environ['HF_HOME']}")
 logger.info(f"HF_HUB_CACHE = {os.environ['HF_HUB_CACHE']}")
 
