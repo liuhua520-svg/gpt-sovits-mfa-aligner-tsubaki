@@ -32,7 +32,6 @@ Copyright (c) 2026 xiaohuang12345-ts
 | pycantonese                | >=0.1.0       | [GitHub](https://github.com/pycantonese/pycantonese) |
 | pyworld                    | >=0.3.4       | [GitHub](https://github.com/JeremyCCHsu/Python-Wrapper-for-World-Vocoder) |
 | torchcrepe                 | 0.0.24        | [GitHub](https://github.com/descriptinc/torchcrepe) |
-| g2p_en                     | >=0.3.1       | [GitHub](https://github.com/Kyubyong/g2p) |
 | mido                       | >=1.3.0       | [GitHub](https://github.com/SpotlightKid/mido) |
 | ctranslate2                | >=4.3.0       | [GitHub](https://github.com/OpenNMT/CTranslate2) |
 | tqdm                       | -             | [GitHub](https://github.com/tqdm/tqdm) |
@@ -60,6 +59,7 @@ Copyright (c) 2026 xiaohuang12345-ts
 | funasr             | >=1.1.0       | [GitHub](https://github.com/modelscope/FunASR) |
 | modelscope         | >=1.9.0       | [GitHub](https://github.com/modelscope/modelscope) |
 | accelerate         | >=0.27.0      | [GitHub](https://github.com/huggingface/accelerate) |
+| g2p_en                     | >=0.3.1       | [GitHub](https://github.com/Kyubyong/g2p) |
 | qwen-asr         | >=1.0.0      | [GitHub](https://github.com/QwenLM/Qwen3-ASR) |
 | nltk         | >=1.0.0      | [GitHub](https://github.com/nltk/nltk) |
 | requests     | -             | [GitHub](https://github.com/psf/requests) |
