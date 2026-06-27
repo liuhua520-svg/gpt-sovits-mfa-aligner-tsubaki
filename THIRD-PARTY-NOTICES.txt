@@ -167,18 +167,64 @@ Based on backend/requirements.txt
 
 3. Frontend Dependencies (package.json)
 
-All under MIT License:
+=== MIT License ===
+
 - vue (^3.3.4)
-  Copyright (c) 2014-present Evan You
+  Copyright (c) Vue.js contributors
+  License: MIT
   Link: https://github.com/vuejs/core
 
 - element-plus (^2.4.1)
-  Copyright (c) 2021-present Element Plus
+  Copyright (c) Element Plus contributors
+  License: MIT
   Link: https://github.com/element-plus/element-plus
 
+- @element-plus/icons-vue (^2.1.0)
+  Copyright (c) Element Plus contributors
+  License: MIT
+  Link: https://github.com/element-plus/element-plus
+
+- axios (^1.5.0)
+  Copyright (c) Matt Zabriskie and contributors
+  License: MIT
+  Link: https://github.com/axios/axios
+
+- vue-i18n (^11.4.6)
+  Copyright (c) Kazuya Kawaguchi and contributors
+  License: MIT
+  Link: https://github.com/intlify/vue-i18n
+
+- @vitejs/plugin-vue (^4.3.4)
+  Copyright (c) Vite contributors
+  License: MIT
+  Link: https://github.com/vitejs/vite-plugin-vue
+
+- @vue/tsconfig (^0.4.0)
+  Copyright (c) Vue.js contributors
+  License: MIT
+  Link: https://github.com/vuejs/tsconfig
+
+- terser (^5.29.1)
+  Copyright (c) Mihai Bazon and contributors
+  License: BSD-2-Clause
+  Link: https://github.com/terser/terser
+
 - vite (^4.4.9)
-  Copyright (c) 2019-present, Yuxi (Evan) You and Vite contributors
+  Copyright (c) Vite contributors
+  License: MIT
   Link: https://github.com/vitejs/vite
+
+- vue-tsc (^1.8.13)
+  Copyright (c) Vue Language Tools contributors
+  License: MIT
+  Link: https://github.com/vuejs/language-tools
+
+=== Apache License 2.0 ===
+
+- typescript (^5.1.6)
+  Copyright (c) Microsoft Corporation
+  License: Apache-2.0
+  Link: https://github.com/microsoft/TypeScript
 
 --------------------------------------------------------------------
 
