@@ -1,6 +1,7 @@
 # ====================== 核心框架 ======================
 flask==2.3.3
 flask-cors==4.0.0
+kalpy
 
 # ====================== MFA 对齐 ======================
 montreal-forced-aligner==3.3.9
@@ -45,6 +46,7 @@ modelscope>=1.9.0
 accelerate>=0.27.0
 g2p_en>=0.3.1               # 英文 OOV 词汇发音推导
 qwen-asr>=1.0.0             # Qwen3-ForcedAligner 官方依赖 (alt_aligners.py)
+k2
 
 # NeMo Forced Aligner 后端 (nemo_server.py，由 alt_aligners.py 的
 # NeMoForcedAligner 通过 HTTP 调用，端口 127.0.0.1:5002)

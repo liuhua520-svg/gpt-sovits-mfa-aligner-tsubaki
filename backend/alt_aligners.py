@@ -26,6 +26,33 @@ import requests
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# 【修复】必须在本文件任何地方 import speechbrain / qwen_asr 之前，
+# 先强制真正执行 librosa/core/audio.py 这个子模块（而不是只 import librosa）。
+#
+# 原因（很绕，但确认过）：librosa/core/audio.py 在被真正执行的瞬间会跑
+#     samplerate = lazy.load("samplerate")
+# lazy_loader.load() 内部用 inspect.stack() 检查调用者所在的模块——这一步
+# 会触发 Python 标准库 inspect.getmodule()，它会遍历 sys.modules 里的*所有*
+# 模块，对每一个都做 hasattr(module, "__file__")。
+#
+# 而 qwen_asr 在加载 Qwen3-ForcedAligner 模型时会连带 import speechbrain；
+# speechbrain 会把一些可选子模块（如 speechbrain.integrations.nlp，用于
+# flair 词向量，本项目完全用不到）注册成"懒加载占位对象"塞进 sys.modules。
+# 这个占位对象只要被 hasattr() 摸一下 __file__，就会触发它真正尝试
+# import（最终因为没装 flair 而失败），从而把上面那次纯粹为了内部记账
+# 用途的 inspect.getmodule() 调用搞炸，报错信息看起来跟 librosa/Qwen3-FA
+# 本身毫无关系（"Lazy import of LazyModule(...integrations.nlp...) failed"）。
+#
+# 【关键】librosa 顶层包自己也用 lazy_loader 做"包级别懒加载"：单纯
+# `import librosa` 并不会真的执行 core/audio.py，只是注册了一个代理，
+# 真正执行要等到第一次有人调用 librosa.load(...) 才触发——而那次往往
+# 已经在 speechbrain 被 import 之后了，雷照样会踩中。必须用下面这种
+# 显式到子模块的 import 写法，绕开 librosa 自己的包级懒加载代理，
+# 强制 Python 的 import 机制立刻、真实地执行 core/audio.py。
+#
+# 不要删除这一行，也不要把它移到文件后面或挪进某个函数里。
+import librosa.core.audio  # noqa: F401
+
 logger = logging.getLogger(__name__)
 
 # 屏蔽 pyannote.audio 在 torchcodec DLL 找不到时输出的 UserWarning
