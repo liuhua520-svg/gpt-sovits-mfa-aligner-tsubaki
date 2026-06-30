@@ -1,191 +1,73 @@
 #!/bin/bash
-# 启动 GPT-SOVITS MFA Aligner (Linux/Mac)
-# 支持: 开发模式、调试模式、环境配置
 
-set -e
+# 设置终端编码为 UTF-8
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BACKEND_DIR="$SCRIPT_DIR/backend"
-FRONTEND_DIR="$SCRIPT_DIR/frontend"
+# 切换到当前脚本所在的绝对路径
+cd "$(dirname "$(readlink -f "$0")")"
 
-# 颜色定义
-BLUE='\033[0;34m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
+echo "================================================"
+echo "    SVS Lab Aligner + Qwen3-ASR + NeMo-FA 服务启动器"
+echo "================================================"
 
-# 日志函数
-log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
-log_ok() { echo -e "${GREEN}[OK]${NC} $1"; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+# Linux 环境下虚拟环境的 Python 路径在 bin 目录下
+MFA_PY="$(pwd)/.mfa_env/bin/python"
+QWEN_PY="$(pwd)/.qwen3_env/bin/python"
+NEMO_PY="$(pwd)/.nemo_env/bin/python"
 
-# 默认配置
-MODE="production"
-PYTHON_CMD="python3"
-PORT="5000"
-HOST="127.0.0.1"
-DEBUG=false
-
-# 解析命令行参数
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --dev)
-            MODE="development"
-            DEBUG=true
-            log_info "开发模式已启用"
-            shift
-            ;;
-        --debug)
-            DEBUG=true
-            log_info "调试模式已启用"
-            shift
-            ;;
-        --host)
-            HOST="$2"
-            log_info "主机设置为: $HOST"
-            shift 2
-            ;;
-        --port)
-            PORT="$2"
-            log_info "端口设置为: $PORT"
-            shift 2
-            ;;
-        --help)
-            echo "用法: $0 [选项]"
-            echo ""
-            echo "选项:"
-            echo "  --dev              开发模式（热重载、更详细日志）"
-            echo "  --debug            调试模式（Flask 调试器）"
-            echo "  --host HOST        监听地址（默认: 127.0.0.1）"
-            echo "  --port PORT        监听端口（默认: 5000）"
-            echo "  --help             显示此帮助信息"
-            echo ""
-            echo "示例:"
-            echo "  $0                 # 生产模式"
-            echo "  $0 --dev           # 开发模式"
-            echo "  $0 --host 0.0.0.0 --port 8080  # 公网访问、8080 端口"
-            echo ""
-            exit 0
-            ;;
-        *)
-            log_warn "未知选项: $1"
-            shift
-            ;;
-    esac
-done
-
-echo ""
-echo "========================================"
-echo "  GPT-SOVITS MFA Aligner"
-echo "========================================"
-echo ""
-
-# 检查必要的目录和文件
-log_info "检查项目结构..."
-
-if [ ! -d "$BACKEND_DIR" ]; then
-    log_error "未找到后端目录: $BACKEND_DIR"
-    exit 1
-fi
-
-if [ ! -f "$BACKEND_DIR/app.py" ]; then
-    log_error "未找到后端主文件: $BACKEND_DIR/app.py"
-    exit 1
-fi
-
-if [ ! -d "$FRONTEND_DIR" ]; then
-    log_error "未找到前端目录: $FRONTEND_DIR"
-    exit 1
-fi
-
-log_ok "项目结构验证成功"
-
-# 检查Python环境
-log_info "检查 Python 环境..."
-
-# 优先使用项目虚拟环境
-if [ -f "$BACKEND_DIR/venv/bin/python" ]; then
-    PYTHON_CMD="$BACKEND_DIR/venv/bin/python"
-    log_ok "使用项目虚拟环境"
-elif [ -f "$BACKEND_DIR/venv/bin/python3" ]; then
-    PYTHON_CMD="$BACKEND_DIR/venv/bin/python3"
-    log_ok "使用项目虚拟环境"
-else
-    log_warn "未找到项目虚拟环境，使用系统 Python"
-fi
-
-# 验证Python版本
-PYTHON_VERSION=$("$PYTHON_CMD" --version 2>&1 | awk '{print $2}')
-log_ok "Python 版本: $PYTHON_VERSION"
-
-# 检查依赖
-log_info "验证依赖..."
-if ! "$PYTHON_CMD" -c "import flask, flask_cors" 2>/dev/null; then
-    log_error "缺少必要的 Python 依赖，请先运行 setup.sh"
-    exit 1
-fi
-log_ok "依赖检查完成"
-
-# 创建日志目录
-if [ ! -d "$BACKEND_DIR/logs" ]; then
-    mkdir -p "$BACKEND_DIR/logs"
-    log_ok "日志目录已创建"
-fi
-
-echo ""
-echo "========================================"
-echo "  启动配置"
-echo "========================================"
-echo "模式:         $MODE"
-echo "主机:         $HOST"
-echo "端口:         $PORT"
-echo "调试:         $([ "$DEBUG" = true ] && echo '启用' || echo '禁用')"
-echo ""
-
-# 设置环境变量
-export FLASK_APP="$BACKEND_DIR/app.py"
-export FLASK_ENV="$( [ "$MODE" = "development" ] && echo "development" || echo "production" )"
-export FLASK_DEBUG=$([ "$DEBUG" = true ] && echo "1" || echo "0")
-export MFA_FRONT_HOST="$HOST"
-export MFA_FRONT_PORT="$PORT"
-
-# 检查GitHub Token
-if [ -n "$MFA_GITHUB_TOKEN" ]; then
-    log_ok "GitHub Token 已配置（用于 API 速率限制）"
-    export MFA_GITHUB_TOKEN
-fi
-
-log_info "启动后端服务..."
-echo ""
-
-# 启动Flask应用
-cd "$BACKEND_DIR"
-
-if [ "$DEBUG" = true ]; then
-    # 调试模式：使用Flask开发服务器
-    "$PYTHON_CMD" app.py \
-        --host "$HOST" \
-        --port "$PORT" \
-        --debug
-else
-    # 生产模式：使用gunicorn（如果可用）或Flask服务器
-    if "$PYTHON_CMD" -c "import gunicorn" 2>/dev/null; then
-        log_info "使用 gunicorn 运行（推荐用于生产环境）"
-        gunicorn \
-            --bind "$HOST:$PORT" \
-            --workers 4 \
-            --timeout 120 \
-            --access-logfile "$BACKEND_DIR/logs/access.log" \
-            --error-logfile "$BACKEND_DIR/logs/error.log" \
-            --log-level info \
-            app:app
-    else
-        log_warn "未安装 gunicorn，使用 Flask 开发服务器"
-        log_warn "生产环境建议: pip install gunicorn"
-        "$PYTHON_CMD" app.py \
-            --host "$HOST" \
-            --port "$PORT"
+# 记录后台服务的 PID，主服务退出时统一清理，避免留下孤儿进程
+BG_PIDS=()
+cleanup() {
+    if [ ${#BG_PIDS[@]} -gt 0 ]; then
+        echo ""
+        echo "[清理] 正在停止后台服务 (PID: ${BG_PIDS[*]})..."
+        kill "${BG_PIDS[@]}" 2>/dev/null
     fi
+}
+trap cleanup EXIT INT TERM
+
+# 检查主后端环境
+if [ ! -f "$MFA_PY" ]; then
+    echo "[错误] .mfa_env/bin/python 未找到！"
+    read -p "按回车键退出..."
+    exit 1
 fi
+
+STEP=1
+TOTAL_STEPS=1
+[ -f "$QWEN_PY" ] && TOTAL_STEPS=$((TOTAL_STEPS + 1))
+[ -f "$NEMO_PY" ] && TOTAL_STEPS=$((TOTAL_STEPS + 1))
+
+# 检查并启动 Qwen3 后端
+if [ -f "$QWEN_PY" ]; then
+    echo "[$STEP/$TOTAL_STEPS] 启动 Qwen3-ASR 推理服务（端口 5001）..."
+    # 使用 & 让服务在后台运行，并将日志重定向到文件，避免干扰主控制台
+    "$QWEN_PY" "$(pwd)/qwen3_server.py" > qwen3_server.log 2>&1 &
+    BG_PIDS+=($!)
+    STEP=$((STEP + 1))
+else
+    echo "[警告] .qwen3_env/bin/python 未找到，将跳过 Qwen3-ASR（该后端不可用）"
+fi
+
+# 检查并启动 NeMo Forced Aligner 后端
+if [ -f "$NEMO_PY" ]; then
+    echo "[$STEP/$TOTAL_STEPS] 启动 NeMo Forced Aligner 服务（端口 5002）..."
+    "$NEMO_PY" "$(pwd)/nemo_server.py" > nemo_server.log 2>&1 &
+    BG_PIDS+=($!)
+    STEP=$((STEP + 1))
+else
+    echo "[警告] .nemo_env/bin/python 未找到，将跳过 NeMo Forced Aligner（该后端不可用）"
+fi
+
+if [ ${#BG_PIDS[@]} -gt 0 ]; then
+    echo "[等待 5 秒让后台服务完全启动...]"
+    sleep 5
+fi
+
+echo "[$STEP/$TOTAL_STEPS] 启动主后端服务（端口 5000）..."
+# 前台运行主服务；Ctrl+C 或主服务退出都会触发上面注册的 cleanup
+"$MFA_PY" backend/app.py
+
+# 主服务退出后的提示
+read -p "服务已停止，按回车键退出..."

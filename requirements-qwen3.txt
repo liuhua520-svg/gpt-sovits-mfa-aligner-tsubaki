@@ -1,0 +1,42 @@
+# requirements-qwen3.txt
+# qwen3_server.py 独立服务依赖（不要装进主 .mfa_env，也不要和 nemo_env 共用！）
+#
+# 用法：
+#   conda create --prefix ./.qwen3_env python=3.10 -y
+#   conda activate ./.qwen3_env
+#   pip install -r requirements-qwen3.txt
+#   python qwen3_server.py
+#
+# 说明：
+#   这是 Qwen3-ASR-1.7B / Qwen3-ForcedAligner-0.6B 跑在独立进程里所需的
+#   全部依赖。主 Flask 应用（app.py 所在的 .mfa_env）只通过 HTTP 调用
+#   127.0.0.1:5001，完全不需要装 qwen-asr / transformers 这一套。
+
+# ====================== 服务框架 ======================
+flask==2.3.3
+
+# ====================== Qwen3-ASR / ForcedAligner ======================
+qwen-asr>=1.0.0
+transformers>=4.40.0
+accelerate>=0.27.0
+
+# ====================== 音频处理 ======================
+soundfile==0.12.1
+
+# ====================== 网络与其他基础库 ======================
+requests
+tqdm
+
+# ====================== PyTorch (根据硬件三选一，与主项目一致) ======================
+
+# CUDA 12.1（用于 RTX 30/40 系等现代显卡）
+# torch==2.3.1+cu121
+# --index-url https://download.pytorch.org/whl/cu121
+
+# CUDA 11.8（旧版显卡保留选项，如 P106-100 等 Pascal 架构）
+# torch==2.3.1+cu118
+# --index-url https://download.pytorch.org/whl/cu118
+
+# CPU Only（推荐，无显卡）
+torch==2.3.1+cpu
+#⚠️ 注意：这里千万不要再写任何 --index-url 了！(--index-url https://download.pytorch.org/whl/cpu)

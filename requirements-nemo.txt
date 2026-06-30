@@ -1,0 +1,54 @@
+# requirements-nemo.txt
+# nemo_server.py 独立服务依赖（不要装进主 .mfa_env，也不要和 qwen3_env 共用！）
+#
+# 用法：
+#   conda create --prefix ./.nemo_env python=3.10 -y
+#   conda activate ./.nemo_env
+#   pip install -r requirements-nemo.txt
+#   python nemo_server.py
+#
+# 说明：
+#   nemo_toolkit[asr] 对 packaging / fsspec / omegaconf / hydra-core /
+#   lightning 等核心依赖有严格的版本上限，装进任何已有环境都容易把这些
+#   公共依赖"降级"，与其它工具产生冲突（例如 pip 报
+#   "pipdeptree requires packaging>=26, but you have packaging 24.2"）。
+#   因此这里单独建一个干净环境，只为 nemo_server.py 服务，主 Flask 应用
+#   只通过 HTTP 调用 127.0.0.1:5002，不需要装下面任何一个包。
+#
+#   截至本文件更新时 PyPI 最新稳定版为 2.7.x（NeMo 仓库正在拆分为聚焦
+#   语音的 NVIDIA-NeMo/Speech 独立仓库，2.8.x 暂为预发布版，故不锁定到
+#   该版本）。
+
+# 告诉 pip 优先使用官方源，同时允许去 PyTorch 官方寻找 CPU 版本的专属包
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# ====================== 服务框架 ======================
+flask==2.3.3
+
+# ====================== NeMo Forced Aligner ======================
+nemo_toolkit[asr]>=2.7.0,<2.8.0
+
+# ====================== 音频处理 ======================
+soundfile==0.12.1
+
+# ====================== 网络与其他基础库 ======================
+requests
+tqdm
+
+# ====================== PyTorch + torchaudio (根据硬件三选一) ======================
+# 需要 torchaudio>=2.1 且 torch>=2.6.0 以满足 nemo-toolkit 2.7.3 的要求。
+
+# 选项 A：CUDA 12.1（用于 RTX 30/40/50 系等现代独立显卡）
+# torch==2.6.0+cu121
+# torchaudio==2.6.0+cu121
+# --index-url https://download.pytorch.org/whl/cu121
+
+# 选项 B：CUDA 11.8（用于旧版显卡，如 GTX 10系 / P106 等）
+# torch==2.6.0+cu118
+# torchaudio==2.6.0+cu118
+# --index-url https://download.pytorch.org/whl/cu118
+
+# 选项 C：CPU Only（无独立显卡，纯靠 CPU 跑。你当前使用的是这个）
+torch==2.6.0+cpu
+torchaudio==2.6.0+cpu
+#⚠️ 注意：这里千万不要再写任何 --index-url 了！(--index-url https://download.pytorch.org/whl/cpu)
