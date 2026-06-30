@@ -26,13 +26,14 @@
       <el-form :model="formData" label-position="top" class="processor-form">
         <el-form-item :label="t('processor.audioFile')">
           <el-upload
+            :key="audioUploadKey"
             drag
             action="#"
             :auto-upload="false"
             :limit="1"
             :on-exceed="handleExceed"
             @change="handleAudioSelect"
-            accept=".wav,.mp3,.flac,.m4a,.aac"
+            accept=".wav,.mp3,.flac,.m4a,.aac,.ogg"
           >
             <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
             <div class="el-upload__text">
@@ -80,6 +81,13 @@
                 size="small" style="margin-left:4px"
               >{{ alignerStatus['qwen3_aligner']?.available ? '✓' : t('processor.backendStatusNeedInstall') }}</el-tag>
             </el-radio>
+            <el-radio value="nemo_aligner">
+              <span>{{ t('processor.backendNemoAligner') }}</span>
+              <el-tag
+                :type="alignerStatus['nemo_aligner']?.available ? 'success' : 'info'"
+                size="small" style="margin-left:4px"
+              >{{ alignerStatus['nemo_aligner']?.available ? '✓' : t('processor.backendStatusNeedInstall') }}</el-tag>
+            </el-radio>
           </el-radio-group>
           <div class="help-text" style="margin-top:6px">
             <small v-if="alignerBackend === 'mfa'">
@@ -94,6 +102,9 @@
             <small v-else-if="alignerBackend === 'qwen3_aligner'">
               📌 {{ t('processor.backendQwen3AlignerHelp') }}
             </small>
+            <small v-else-if="alignerBackend === 'nemo_aligner'">
+              🟩 {{ t('processor.backendNemoAlignerHelp') }}
+            </small>
             <div v-if="alignerBackend !== 'mfa' && alignerStatus.models_dir"
                  style="margin-top:4px;color:#67c23a;font-size:12px">
               📁 {{ t('processor.modelCacheDir') }}：<code>{{ alignerStatus.models_dir }}</code>
@@ -106,6 +117,9 @@
             <template #title>{{ alignerStatus[alignerBackend]?.message || t('processor.backendInstallHint') }}</template>
             <div style="font-size:12px;margin-top:4px">
               <span v-if="alignerBackend === 'whisperx'">{{ t('processor.packageHintWhisperx') }}</span>
+              <span v-else-if="alignerBackend === 'nemo_aligner'">{{ t('processor.packageHintNemo') }}</span>
+              <span v-else-if="alignerBackend === 'qwen3_aligner'">{{ t('processor.packageHintQwen3Aligner') }}</span>
+              <span v-else-if="alignerBackend === 'qwen3_asr'">{{ t('processor.packageHintQwen3Asr') }}</span>
               <span v-else>{{ t('processor.packageHintTransformers') }} torchaudio accelerate</span>
             </div>
           </el-alert>
@@ -127,6 +141,9 @@
             </small>
             <small v-else-if="advancedConfig.aligner_device === 'cuda' && alignerBackend.startsWith('qwen3')">
               💡 {{ t('processor.deviceQwen3Gpu') }}
+            </small>
+            <small v-else-if="advancedConfig.aligner_device === 'cuda' && alignerBackend === 'nemo_aligner'">
+              💡 {{ t('processor.deviceNemoGpu') }}
             </small>
             <small v-else-if="advancedConfig.aligner_device === 'cpu'">
               ⚠️ {{ t('processor.deviceCpuHelp') }}
@@ -752,11 +769,19 @@
             <div class="model-list">
               <div v-for="(info, key) in altBackends" :key="key" class="model-item">
                 <el-tag :type="info.available ? 'success' : 'info'" size="small">
-                  {{ key === 'whisperx' ? t('processor.backendWhisperx') : key === 'qwen3_asr' ? 'Qwen3-ASR-1.7B' : 'Qwen3-FA-0.6B' }}:
+                  {{ key === 'whisperx' ? t('processor.backendWhisperx')
+                     : key === 'qwen3_asr' ? 'Qwen3-ASR-1.7B'
+                     : key === 'qwen3_aligner' ? 'Qwen3-FA-0.6B'
+                     : key === 'nemo_aligner' ? t('processor.backendNemoAligner')
+                     : key }}:
                   {{ info.available ? `✓ ${t('processor.available')}` : `✗ ${t('processor.notInstalled')}` }}
                 </el-tag>
                 <span v-if="!info.available" class="help-text" style="font-size:11px;margin-left:6px">
-                  {{ key === 'whisperx' ? t('processor.packageHintWhisperx') : t('processor.packageHintTransformers') }}
+                  {{ key === 'whisperx' ? t('processor.packageHintWhisperx')
+                     : key === 'nemo_aligner' ? t('processor.packageHintNemo')
+                     : key === 'qwen3_aligner' ? t('processor.packageHintQwen3Aligner')
+                     : key === 'qwen3_asr' ? t('processor.packageHintQwen3Asr')
+                     : t('processor.packageHintTransformers') }}
                 </span>
               </div>
             </div>
@@ -866,6 +891,7 @@ const alignerStatus = ref<Record<string, any>>({
   whisperx:      { available: false, message: t('processor.backendStatusChecking') },
   qwen3_asr:     { available: false, message: t('processor.backendStatusChecking') },
   qwen3_aligner: { available: false, message: t('processor.backendStatusChecking') },
+  nemo_aligner:  { available: false, message: t('processor.backendStatusChecking') },
 })
 
 const formData = ref<FormData>({
@@ -934,6 +960,7 @@ let jobPollTimer: number | null = null
 // MIDI 导入状态
 const midiInfo = ref<{ bpm: number; loaded: boolean }>({ bpm: 120, loaded: false })
 const labMidiUploadKey = ref(0)
+const audioUploadKey = ref(0)
 
 const midiLoaded = computed(() => processingMode.value === 'project-only' && !!formData.value.midiFile)
 const selectedNotationFile = computed(() => formData.value.labFile || formData.value.midiFile)
@@ -1009,12 +1036,13 @@ const alignerBackendLabel = computed(() => {
     whisperx: t('processor.backendWhisperx'),
     qwen3_asr: t('processor.backendQwen3Asr'),
     qwen3_aligner: t('processor.backendQwen3Aligner'),
+    nemo_aligner: t('processor.backendNemoAligner'),
   }
   return labels[alignerBackend.value] || alignerBackend.value
 })
 
 watch(alignerBackend, (backend) => {
-  if (processingMode.value === 'project-only' && ['whisperx', 'qwen3_asr', 'qwen3_aligner'].includes(backend)) {
+  if (processingMode.value === 'project-only' && ['whisperx', 'qwen3_asr', 'qwen3_aligner', 'nemo_aligner'].includes(backend)) {
     processingMode.value = 'mfa-only'
   }
 })
@@ -1102,10 +1130,7 @@ const clearJobPolling = () => {
 }
 
 const resetProcessingSteps = () => {
-  const stageLabel = alignerBackend.value === 'mfa' ? t('processor.backendMfa')
-    : alignerBackend.value === 'whisperx' ? t('processor.backendWhisperx')
-    : alignerBackend.value === 'qwen3_asr' ? t('processor.backendQwen3Asr')
-    : t('processor.backendQwen3Aligner')
+  const stageLabel = alignerBackendLabel.value
   processingDetails.value = [
     { stage: `1. ${stageLabel}`, status: '等待', message: t('processor.stagePrepareAlign') },
     { stage: t('processor.stageF0'), status: '等待', message: t('processor.stageExtractF0') },
@@ -1642,6 +1667,7 @@ const reset = () => {
   }
   midiInfo.value = { bpm: 120, loaded: false }
   labMidiUploadKey.value += 1
+  audioUploadKey.value += 1
   result.value = null
   error.value = ''
   progressPercent.value = 0
