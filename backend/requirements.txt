@@ -29,6 +29,9 @@ resampy>=0.4.2              # 音频重采样 Fallback 库 (f0_extractors.py)
 pyworld>=0.3.4
 torchcrepe==0.0.24
 
+# RMVPE 模型权重 (rmvpe.pt, ~180MB) 不随依赖分发，需手动下载并放置到
+# <项目根>/models/rmvpe/rmvpe.pt，或设置环境变量 RMVPE_MODEL_PATH 指向该文件：
+#   https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.pt
 # ====================== 替代对齐后端 ======================
 # 【关键】setuptools>=82.0.0（2026-02 起）彻底移除了 pkg_resources 模块，
 # 而 ctranslate2（whisperx 的依赖）在 import 时仍硬依赖 pkg_resources，
