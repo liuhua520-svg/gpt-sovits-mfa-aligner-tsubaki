@@ -393,6 +393,7 @@ def run_pipeline_job(
     crepe_model: str = "full",
     aligner_backend: str = "mfa",
     whisperx_model: str = "large-v3",
+    nemo_model: str = "",
     english_word_align: bool = False,
     vsqx_singer: str = "MIKU_V4_Chinese",
     vsqx_singer_id: str = "BNGE7CP7EMTRSNC3",
@@ -439,6 +440,7 @@ def run_pipeline_job(
             crepe_model=crepe_model,
             aligner_backend=aligner_backend,
             whisperx_model=whisperx_model,
+            nemo_model=(nemo_model or None),
             english_word_align=english_word_align,
             vsqx_singer=vsqx_singer,
             vsqx_singer_id=vsqx_singer_id,
@@ -527,12 +529,16 @@ def pipeline_full_process():
         )
 
         aligner_backend = request.form.get("aligner_backend", "mfa")
-        if aligner_backend not in ("mfa", "whisperx", "qwen3_asr", "qwen3_aligner"):
+        if aligner_backend not in ("mfa", "whisperx", "qwen3_asr", "qwen3_aligner", "nemo_aligner"):
             aligner_backend = "mfa"
 
         whisperx_model = request.form.get("whisperx_model", "large-v3")
         if whisperx_model not in ("large-v3", "large-v3-turbo", "large-v2", "medium", "small", "base", "tiny"):
             whisperx_model = "large-v3"
+
+        # NeMo Forced Aligner 模型覆盖（可选）：留空则由 NeMoForcedAligner
+        # 按语言使用内置默认模型（见 alt_aligners.NeMoForcedAligner.LANGUAGE_MODELS）
+        nemo_model = request.form.get("nemo_model", "").strip()
 
         english_word_align = request.form.get("english_word_align", "false").lower() == "true"
         word_phoneme_map   = request.form.get("word_phoneme_map",   "false").lower() == "true"
@@ -590,6 +596,7 @@ def pipeline_full_process():
                 crepe_model,
                 aligner_backend,
                 whisperx_model,
+                nemo_model,
                 english_word_align,
                 vsqx_singer,
                 vsqx_singer_id,
@@ -618,6 +625,7 @@ def pipeline_full_process():
 def run_mfa_only_job(job_id: str, wav_path: str, text: str, language: str,
                      aligner_backend: str = "mfa", f0_device: str = "auto",
                      whisperx_model: str = "large-v3",
+                     nemo_model: str = "",
                      english_word_align: bool = False):
     try:
         set_job(
@@ -647,6 +655,7 @@ def run_mfa_only_job(job_id: str, wav_path: str, text: str, language: str,
                                            aligner_backend=aligner_backend,
                                            f0_device=f0_device,
                                            whisperx_model=whisperx_model,
+                                           nemo_model=(nemo_model or None),
                                            english_word_align=english_word_align)
 
         if result.get("success"):
@@ -687,7 +696,7 @@ def pipeline_mfa_only():
         language = request.form.get("language", "cmn")
 
         aligner_backend = request.form.get("aligner_backend", "mfa")
-        if aligner_backend not in ("mfa", "whisperx", "qwen3_asr", "qwen3_aligner"):
+        if aligner_backend not in ("mfa", "whisperx", "qwen3_asr", "qwen3_aligner", "nemo_aligner"):
             aligner_backend = "mfa"
         f0_device = request.form.get("f0_device", "auto")
 
@@ -695,12 +704,17 @@ def pipeline_mfa_only():
         if whisperx_model not in ("large-v3", "large-v3-turbo", "large-v2", "medium", "small", "base", "tiny"):
             whisperx_model = "large-v3"
 
+        # NeMo Forced Aligner 模型覆盖（可选）：留空则由 NeMoForcedAligner
+        # 按语言使用内置默认模型
+        nemo_model = request.form.get("nemo_model", "").strip()
+
         english_word_align = request.form.get("english_word_align", "false").lower() == "true"
 
-        # WhisperX / Qwen3-ASR 支持纯 ASR 模式，文本可选
+        # WhisperX / Qwen3-ASR 支持纯 ASR 模式，文本可选；
+        # Qwen3-ForcedAligner / NeMo Forced Aligner 都是强制对齐，必须提供参考文本
         text_optional = aligner_backend in ("whisperx", "qwen3_asr")
         if not audio_file or (not text and not text_optional):
-            return jsonify({"error": "输入无效（MFA / Qwen3-ForcedAligner 模式需要文本）"}), 400
+            return jsonify({"error": "输入无效（MFA / Qwen3-ForcedAligner / NeMo Forced Aligner 模式需要文本）"}), 400
 
         # 1. 马上保存文件，生成路径
         stem, wav_path, lab_path = build_job_paths(audio_file.filename or "audio.wav")
@@ -721,7 +735,7 @@ def pipeline_mfa_only():
             target=run_mfa_only_job,
             daemon=True,
             args=(job_id, str(wav_path), text, language, aligner_backend, f0_device,
-                  whisperx_model, english_word_align),
+                  whisperx_model, nemo_model, english_word_align),
         ).start()
 
         # 4. 立即返回 job_id 供前端轮询
@@ -1223,7 +1237,7 @@ def main(host: str = "127.0.0.1", port: int = 5000):
     # 【可注释】 Thread(target=open_browser, args=(host, port), daemon=True).start()
     # 将不再自动打开浏览器
     Thread(target=open_browser, args=(host, port), daemon=True).start()
-    app.run(host=host, port=port, debug=True, threaded=True, use_reloader=False)
+    app.run(host=host, port=port, debug=False, threaded=True, use_reloader=False)
 
 
 if __name__ == "__main__":

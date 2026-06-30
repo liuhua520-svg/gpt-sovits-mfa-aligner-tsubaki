@@ -134,7 +134,9 @@ os.environ["HF_HUB_OFFLINE"] = "1"
 logger.info(
     f"[alt_aligners] 模型目录: {_MODELS_DIR}\n"
     f"  HF 缓存   → {_HF_HUB}\n"
-    f"  Whisper缓存 → {_WHISPER_CACHE}"
+    f"  Whisper缓存 → {_WHISPER_CACHE}\n"
+    f"  (NeMo Forced Aligner 模型缓存由独立的 nemo_server.py 进程管理，"
+    f"详见 backend/models/nemo_cache 与 nemo_hf_cache)"
 )
 
 
@@ -2519,7 +2521,208 @@ class Qwen3ForcedAligner(AltAlignerBase):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 8. 单例缓存与工厂函数
+# 8. NeMoForcedAligner
+#    https://github.com/NVIDIA-NeMo/Speech/tree/main/tools/nemo_forced_aligner
+#
+#    与 Qwen3ASRAligner 同样的理由和同样的做法：nemo_toolkit[asr] 对
+#    packaging / fsspec / omegaconf / hydra-core / lightning 等核心依赖
+#    有严格的版本限制，装进主进程所在的 .mfa_env 会跟其它包发生版本冲突
+#    （实测会把 packaging 降级到 24.x，导致 pipdeptree 等工具报错）。
+#
+#    因此本类不在当前进程内 import nemo，而是作为 HTTP 客户端调用一个
+#    独立的 nemo_server.py 微服务（运行在独立 conda/venv 环境里，默认端口
+#    127.0.0.1:5002），真正的模型加载、CTC log-probs 计算、
+#    torchaudio.functional.forced_align Viterbi 强制对齐全部在那个独立
+#    进程里完成，这边只负责发请求、拿 token_entries、合并成 LAB。
+#
+#    官方 NFA 本身是一个基于 manifest + Hydra config 的批处理 CLI 工具
+#    (align.py)，内部原理与 nemo_server.py 里实现的完全一致：
+#      1. 加载一个 NeMo CTC / Hybrid-CTC-Transducer（CTC 模式）ASR 模型
+#      2. 对音频做一次前向传播，取每帧 log-softmax 输出（log-probs）
+#      3. 用 Viterbi 算法在 log-probs 上对参考文本的 token 序列做强制对齐
+#      4. 输出 token 级时间戳
+#    只是省去了 manifest/CTM 文件落盘与 Hydra 配置这一层。
+#
+#    部署方式（与 qwen3_server.py 完全一致的模式）：
+#      conda create -n nemo_env python=3.10 -y
+#      conda activate nemo_env
+#      pip install "nemo_toolkit[asr]>=2.7.0,<2.8.0"
+#      python nemo_server.py     # 默认监听 127.0.0.1:5002
+#    然后正常启动主 Flask 应用（.mfa_env），选择 nemo_aligner 后端即可。
+# ═════════════════════════════════════════════════════════════════════════════
+
+class NeMoForcedAligner(AltAlignerBase):
+    """
+    NeMo Forced Aligner (NFA) 独立服务客户端
+    ────────────────────────────────────────
+    只通过 HTTP 调用 nemo_server.py，不在当前进程内加载 NeMo / import nemo。
+    与 Qwen3ASRAligner 是同一种部署形态：模型推理在独立环境的另一个
+    Flask 微服务里完成，这里只是个轻客户端。
+
+    支持语言（与 nemo_server.py 的 LANGUAGE_MODELS 保持一致，仅供前端展示，
+    真正生效的模型表在服务端）：
+      en  stt_en_fastconformer_hybrid_large_pc   (Hybrid, NGC, 走 CTC 模式)
+      zh  nvidia/stt_zh_citrinet_1024_gamma_0_25  (纯 CTC, HuggingFace Hub)
+      ja  nvidia/parakeet-tdt_ctc-0.6b-ja          (Hybrid TDT+CTC, 走 CTC 模式)
+    韩语 / 粤语目前没有 NVIDIA 官方发布的 CTC 或 Hybrid-CTC checkpoint，
+    服务端会在 /align 接口返回 400 + 清晰错误信息，而不是套用不兼容的
+    模型类型硬跑。
+    """
+
+    DEFAULT_ENDPOINT = "http://127.0.0.1:5002/align"
+
+    # 仅用于前端展示 / 状态接口，不影响实际对齐逻辑（真正的模型选择逻辑在
+    # nemo_server.py 里，因为模型必须在那个独立进程里加载）。
+    LANGUAGE_MODELS: Dict[str, str] = {
+        "en": "stt_en_fastconformer_hybrid_large_pc",
+        "zh": "nvidia/stt_zh_citrinet_1024_gamma_0_25",
+        "ja": "nvidia/parakeet-tdt_ctc-0.6b-ja",
+    }
+
+    def __init__(
+        self,
+        device: str = "auto",
+        nemo_model: Optional[str] = None,
+        endpoint: str = DEFAULT_ENDPOINT,
+    ):
+        super().__init__()
+        self._device = device
+        self._model_override = nemo_model
+        self.endpoint = endpoint.rstrip("/")
+        self._session = None
+
+    @staticmethod
+    def check_available() -> Tuple[bool, str]:
+        try:
+            import requests  # noqa: F401
+        except ImportError as e:
+            return False, f"未安装 requests: pip install requests ({e})"
+
+        try:
+            r = requests.get("http://127.0.0.1:5002/", timeout=2)
+            return True, "NeMo Forced Aligner 独立服务已可访问"
+        except Exception as e:
+            return False, f"NeMo Forced Aligner 独立服务不可访问: {e}"
+
+    def _load_model(self):
+        """独立服务模式下不加载本地模型，只做轻量级连接初始化。"""
+        if self._session is None:
+            self._session = requests.Session()
+
+    def _call_nemo_service(self, audio_path: str, text: str, language: str) -> Dict:
+        self._load_model()
+
+        payload = {
+            "audio": audio_path,
+            "text": text,
+            "language": language,
+            "device": self._device if self._device in ("auto", "cpu", "cuda") else "auto",
+        }
+        if self._model_override:
+            payload["model"] = self._model_override
+
+        resp = self._session.post(self.endpoint, json=payload, timeout=1800)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if not data.get("success", False):
+            raise RuntimeError(data.get("error", "NeMo Forced Aligner 服务返回失败"))
+
+        return data
+
+    # ── 主对齐入口 ────────────────────────────────────────────────────────
+    def align(self, audio_path: str, text: Optional[str], language: str,
+              english_word_align: bool = False) -> Dict:
+        """
+        执行 NeMo Forced Aligner 对齐，返回与 MFAProcessor.process()
+        格式兼容的字典。NFA 必须提供参考文本（requires_text=True）。
+        """
+        t0 = time.time()
+
+        if not text or not text.strip():
+            return {
+                "success": False,
+                "error": "NeMo Forced Aligner 需要提供参考文本（requires_text=True）",
+                "processing_time": 0,
+            }
+
+        try:
+            int_lang = _normalize_lang(language)
+            clean_text = _clean_align_text(text)
+
+            logger.info(f"[NeMo-FA] 调用独立服务: {self.endpoint}")
+            result = self._call_nemo_service(audio_path, clean_text, int_lang)
+
+            raw_entries = result.get("token_entries") or []
+            token_entries: List[Tuple[float, float, str]] = [
+                (float(s), float(e), str(tok))
+                for s, e, tok in raw_entries
+                if e is not None and s is not None and e > s and str(tok).strip()
+            ]
+
+            if not token_entries:
+                return {
+                    "success": False,
+                    "error": "[NeMo-FA] 强制对齐未产生任何时间戳条目",
+                    "processing_time": int((time.time() - t0) * 1000),
+                }
+
+            model_used = result.get("model", "unknown")
+            logger.info(
+                f"[NeMo-FA] ✓ 服务端返回 {len(token_entries)} 个 token spans，"
+                f"使用模型: {model_used}"
+            )
+
+            # 【停顿策略修正】不同 NeMo 模型的帧时长差异很大（citrinet 约
+            # 79ms/frame，fastconformer/parakeet 量级 ~20–40ms/frame）。
+            # fill_silences=True 用的是 _fill_silences_lab() 里固定写死的
+            # 50ms 阈值——citrinet 单帧时长本身就已经超过这个阈值，于是
+            # 几乎每两个相邻字符之间正常的帧量化间隙（nemo_server.py 已
+            # 把真正的 blank 帧时长向左合并进了前一个字符，不再产生游离
+            # 空隙），只要因为浮点取整等原因残留一点点间隙，也会被一刀切
+            # 误判成"真实停顿"，在 SVP 里表现为几乎每个字都被强行隔开
+            # （参见用户截图：单字之间出现明显空拍）。
+            #
+            # 改为与 WhisperX 完全一致的停顿策略：不依赖时间间隙启发式，
+            # 而是直接按参考文本里的标点位置确定性地插入停顿
+            # （_inject_sentence_pauses，句末标点 80ms / 句内标点 40ms），
+            # 再用 _fix_ctc_stretch 兜底截断任何异常超长的单字（防止合并
+            # 后某个字因为吸收了过长的停顿帧而变成一个不合理的长音），
+            # 最后做一次音素时长守护（PDG）避免出现过短音标。
+            # fill_silences 改为 False，因为停顿已经由上面几步显式写入，
+            # 不需要再做一次基于时间间隙的全局扫描（也不应该再做，否则
+            # 又会回到"逐字插入 SIL"的老问题）。
+            token_entries = _inject_sentence_pauses(token_entries, text)
+            token_entries = _fix_ctc_stretch(token_entries, int_lang)
+            token_entries = WhisperXAligner._apply_duration_guard(token_entries)
+
+            lab = self._word_entries_to_lab(
+                token_entries, text, language,
+                fill_silences=False,
+                english_word_align=english_word_align,
+            )
+
+            return {
+                "success": True,
+                "lab_content": lab,
+                "raw_text": text,
+                "phoneme_text": clean_text,
+                "audio_duration": self._get_audio_duration_100ns(audio_path),
+                "processing_time": int((time.time() - t0) * 1000),
+                "backend": "nemo_aligner",
+            }
+
+        except Exception as e:
+            logger.error(f"[NeMo-FA] 失败: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e),
+                "processing_time": int((time.time() - t0) * 1000),
+            }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 9. 单例缓存与工厂函数
 # ═════════════════════════════════════════════════════════════════════════════
 
 _SINGLETON: Dict[str, AltAlignerBase] = {}
@@ -2528,9 +2731,13 @@ _SINGLETON: Dict[str, AltAlignerBase] = {}
 def get_aligner(backend: str, device: str = "auto", **kwargs) -> AltAlignerBase:
     """
     工厂函数：按 backend 名称创建或复用对齐器单例。
-    backend: "whisperx" | "qwen3_asr" | "qwen3_aligner"
+    backend: "whisperx" | "qwen3_asr" | "qwen3_aligner" | "nemo_aligner"
 
     对于 "whisperx"，额外识别 whisper_model 关键字参数（默认 "large-v3"）。
+    对于 "nemo_aligner"，额外识别 nemo_model 关键字参数（默认 None →
+    由 nemo_server.py 按语言使用内置默认模型）；device 会原样转发给
+    nemo_server.py 的 /align 接口，由该独立进程决定实际运行设备
+    （nemo_aligner 本身不在当前进程内加载任何模型）。
     不同 model 使用独立缓存键，切换模型会创建新实例（旧实例保留在内存中，
     避免重复初始化开销）。
     """
@@ -2541,6 +2748,15 @@ def get_aligner(backend: str, device: str = "auto", **kwargs) -> AltAlignerBase:
         if cache_key not in _SINGLETON:
             _SINGLETON[cache_key] = WhisperXAligner(
                 whisper_model=whisper_model, device=device, **kwargs
+            )
+        return _SINGLETON[cache_key]
+
+    if backend == "nemo_aligner":
+        nemo_model = kwargs.pop("nemo_model", None)
+        cache_key = f"nemo_aligner:{nemo_model or 'default'}"
+        if cache_key not in _SINGLETON:
+            _SINGLETON[cache_key] = NeMoForcedAligner(
+                device=device, nemo_model=nemo_model, **kwargs
             )
         return _SINGLETON[cache_key]
 
@@ -2559,6 +2775,7 @@ def get_alt_aligner_status() -> Dict:
     wx_ok, wx_msg = WhisperXAligner.check_available()
     qa_ok, qa_msg = Qwen3ASRAligner.check_available()
     qf_ok, qf_msg = Qwen3ForcedAligner.check_available()
+    nm_ok, nm_msg = NeMoForcedAligner.check_available()
 
     return {
         "models_dir": str(_MODELS_DIR),        # ← 前端可展示此路径
@@ -2587,5 +2804,13 @@ def get_alt_aligner_status() -> Dict:
             "model_paths": {
                 "hf_cache": str(_HF_HUB),
             },
+        },
+        "nemo_aligner": {
+            "available":       nm_ok,
+            "message":         nm_msg,
+            "requires_text":   True,
+            "description":     "NeMo Forced Aligner (独立服务，需先启动 nemo_server.py)",
+            "language_models": NeMoForcedAligner.LANGUAGE_MODELS,
+            "endpoint":        NeMoForcedAligner.DEFAULT_ENDPOINT,
         },
     }

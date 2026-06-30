@@ -30,6 +30,11 @@ pyworld>=0.3.4
 torchcrepe==0.0.24
 
 # ====================== 替代对齐后端 ======================
+# 【关键】setuptools>=82.0.0（2026-02 起）彻底移除了 pkg_resources 模块，
+# 而 ctranslate2（whisperx 的依赖）在 import 时仍硬依赖 pkg_resources，
+# 否则会报 "ModuleNotFoundError: No module named 'pkg_resources'"。
+# 在该问题被上游（ctranslate2 / setuptools 生态）修复之前，必须锁定版本。
+setuptools<82
 whisperx>=3.2.0
 ctranslate2>=4.3.0          # WhisperX GPU 计算精度查询 (alt_aligners.py)
 funasr>=1.1.0
@@ -37,6 +42,19 @@ modelscope>=1.9.0
 accelerate>=0.27.0
 g2p_en>=0.3.1               # 英文 OOV 词汇发音推导
 qwen-asr>=1.0.0             # Qwen3-ForcedAligner 官方依赖 (alt_aligners.py)
+
+# NeMo Forced Aligner 后端 (nemo_server.py，由 alt_aligners.py 的
+# NeMoForcedAligner 通过 HTTP 调用，端口 127.0.0.1:5002)
+# 与上面的 qwen-asr 一样：这一行描述的是 nemo_server.py 自己独立环境
+# (nemo_env) 的依赖，不要装进运行 app.py 的那个环境，否则会触发依赖冲突
+# （NeMo 对 packaging/fsspec/omegaconf/hydra-core/lightning 等核心依赖
+# 有严格版本限制，会把 .mfa_env 里这些包"降级"，与其它工具产生冲突，
+# 例如 pip 会报 "pipdeptree requires packaging>=26, but you have 24.2"）。
+# 详见 NEMO_ALIGNER_INTEGRATION.md。
+# 需要 torchaudio>=2.1（forced_align / merge_tokens 接口）。
+# 截至本文件更新时 PyPI 最新稳定版为 2.7.x（NeMo 仓库正在拆分为聚焦语音的
+# NVIDIA-NeMo/Speech 独立仓库，2.8.x 暂为预发布版，故不锁定到该版本）。
+# nemo_toolkit[asr]>=2.7.0,<2.8.0
 
 # ====================== 网络与其他基础库 ======================
 requests
@@ -47,7 +65,7 @@ tqdm
 # CUDA 12.1（用于 RTX 30/40 系等现代显卡）
 # torch==2.3.1+cu121
 # torchaudio==2.3.1+cu121
---index-url https://download.pytorch.org/whl/cu121
+# --index-url https://download.pytorch.org/whl/cu121
 
 # CUDA 11.8 (旧版显卡保留选项)
 # torch==2.3.1+cu118

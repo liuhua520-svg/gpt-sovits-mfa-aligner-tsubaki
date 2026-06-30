@@ -1059,6 +1059,16 @@ def build_ja_hiragana_lab(
             i += 1
             continue
 
+        # ── Geminate consonant  cl → っ (MFA 促音标记) ───────────
+        # MFA japanese_mfa 把促音（っ/ッ）的时间段标注为 "cl"。
+        # 它不是真正的辅音起始，不应进入 pending 等待元音，
+        # 而应直接输出平假名 "っ" 并保持独立音符。
+        if ph == "cl":
+            flush_pending_as_dash()
+            result.append((start, end, "っ"))
+            i += 1
+            continue
+
         # ── Other consonant ────────────────────────────────────
         flush_pending_as_dash()
         pending = (start, end, ph)
@@ -1423,6 +1433,19 @@ def build_ja_merged_lab(
                 if pending is not None:
                     result.append((pending[0], pending[1], "-"))
                 pending = (start, end, ph)
+            i += 1
+            continue
+
+        # ── Geminate consonant  cl → っ / ッ (MFA 促音标记) ──────
+        # MFA japanese_mfa 把促音（っ/ッ）的时间段标注为 "cl"。
+        # 它不是辅音起始，应直接映射为促音字符并单独成音符，
+        # 而非与后续元音合并（避免输出错误的音节，如 "cchi" 等）。
+        if ph == "cl":
+            if pending is not None:
+                result.append((pending[0], pending[1], "-"))
+                pending = None
+            cl_char = "ッ" if output == "katakana" else "っ"
+            result.append((start, end, cl_char))
             i += 1
             continue
 

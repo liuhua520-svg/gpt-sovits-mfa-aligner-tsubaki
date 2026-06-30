@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-完整处理流程管道（v2.1 — 多后端对齐支持）
-整合 MFA / Qwen3-ASR / Qwen3-ForcedAligner + 音高处理 + 工程文件生成
+完整处理流程管道（v2.2 — 多后端对齐支持）
+整合 MFA / Qwen3-ASR / Qwen3-ForcedAligner / NeMo Forced Aligner + 音高处理 + 工程文件生成
 
 新增参数: aligner_backend
   "mfa"           — Montreal Forced Aligner（默认）
   "qwen3_asr"     — Qwen3-ASR-1.7B (自动语音识别，文本可选)
   "qwen3_aligner" — Qwen3-ForcedAligner-0.6B (强制对齐，需要参考文本)
+  "nemo_aligner"  — NeMo Forced Aligner (NVIDIA CTC 强制对齐，需要参考文本)
 """
 from __future__ import annotations
 
@@ -104,14 +105,15 @@ def _run_alignment(
     f0_device: str = "auto",
     whisperx_model: str = "large-v3",
     english_word_align: bool = False,
+    nemo_model: Optional[str] = None,
 ) -> Dict:
     """
     统一调度对齐后端，返回与 MFAProcessor.process() 格式兼容的字典。
     audio_file.save(path) 和 audio_file.filename 必须可用。
     """
     # 数字 → 读法文字转换，放在四个后端分支之前统一处理一次：
-    # MFA / WhisperX / Qwen3-ASR / Qwen3-FA 都从这里拿到转换后的文本，
-    # 不需要各自重复实现。text 为空（如 Qwen3-ASR 纯识别模式不提供
+    # MFA / WhisperX / Qwen3-ASR / Qwen3-FA / NeMo-FA 都从这里拿到转换后的
+    # 文本，不需要各自重复实现。text 为空（如 Qwen3-ASR 纯识别模式不提供
     # 参考文本）时 _convert_digits_to_words 内部直接原样返回，不受影响。
     text = _convert_digits_to_words(text, language)
 
@@ -134,6 +136,8 @@ def _run_alignment(
         extra = {}
         if backend == "whisperx":
             extra["whisper_model"] = whisperx_model
+        elif backend == "nemo_aligner" and nemo_model:
+            extra["nemo_model"] = nemo_model
         aligner = get_aligner(backend, device=f0_device, **extra)
         return aligner.align(tmp_wav, text or None, language,
                              english_word_align=english_word_align)
@@ -180,6 +184,7 @@ class AudioProcessingPipeline:
         crepe_model: str = "full",
         aligner_backend: str = "mfa",           # ← 新增
         whisperx_model: str = "large-v3",       # ← WhisperX 模型大小
+        nemo_model: Optional[str] = None,        # ← NeMo Forced Aligner 模型覆盖（可选）
         english_word_align: bool = False,        # ← 英语单词级对齐
         vsqx_singer: str = "MIKU_V4_Chinese",           # ← VSQX 声库名（由 app.py 按语种注入）
         vsqx_singer_id: str = "BNGE7CP7EMTRSNC3",       # ← VSQX 声库 ID
@@ -223,7 +228,8 @@ class AudioProcessingPipeline:
             logger.info(f"[ 步骤 1/3 ] 对齐标注 (backend={aligner_backend})...")
             align_result = _run_alignment(audio_file, text, language, aligner_backend,
                                            f0_device, whisperx_model,
-                                           english_word_align=english_word_align)
+                                           english_word_align=english_word_align,
+                                           nemo_model=nemo_model)
             if not align_result.get("success"):
                 error = align_result.get("error", "对齐处理失败")
                 logger.error(f"✗ 对齐失败: {error}")
@@ -318,6 +324,7 @@ class AudioProcessingPipeline:
         aligner_backend: str = "mfa",           # ← 新增
         f0_device: str = "auto",
         whisperx_model: str = "large-v3",       # ← WhisperX 模型大小
+        nemo_model: Optional[str] = None,        # ← NeMo Forced Aligner 模型覆盖（可选）
         english_word_align: bool = False,        # ← 英语单词级对齐
     ) -> Dict:
         """仅执行对齐标注（不生成工程文件）"""
@@ -329,7 +336,8 @@ class AudioProcessingPipeline:
 
             result = _run_alignment(audio_file, text, language, aligner_backend,
                                     f0_device, whisperx_model,
-                                    english_word_align=english_word_align)
+                                    english_word_align=english_word_align,
+                                    nemo_model=nemo_model)
 
             if result.get("success"):
                 lab_content = result.get("lab_content", "")

@@ -1134,11 +1134,18 @@ class TsubakiProcessor:
                     tone      = int(round(float(np.median(midi_vals))))
                     tone      = max(0, min(127, tone))
 
+            # ── OpenUTAU lyric 规范化 ───────────────────────────────────
+            # OpenUTAU 使用 "+" 作为延音符（音符延续/Tie）：
+            #   "ー"（U+30FC 長音符）→ "+"：日语长音在 USTX 中应写作 "+"
+            #   "-"（辅音起始占位符）→ "+"：OpenUTAU 用 "+" 表示 consonant tie
+            # 此替换仅影响 USTX 输出，SVP/VSQX 格式保持原有语义。
+            utau_lyric = "+" if label in ("ー", "-") else label
+
             notes.append({
                 "position": pos,
                 "duration": dur_tick,
                 "tone":     tone,
-                "lyric":    label,
+                "lyric":    utau_lyric,
                 # pitch.data = 默认两端锚点，不存 F0（F0 走 voice_part curves）
                 "pitch":    make_default_pitch(),
                 "vibrato":  make_default_vibrato(),
