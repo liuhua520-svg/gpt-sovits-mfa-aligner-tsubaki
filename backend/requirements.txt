@@ -28,7 +28,7 @@ setuptools<82.0.0           # 解决 ctranslate2 / whisperx 对 pkg_resources �
 # torch==2.3.1+cu118
 # torchaudio==2.3.1+cu118
 
-# CPU Only（推荐，无显卡）
+# CPU Only（无显卡）
 torch==2.3.1+cpu
 torchaudio==2.3.1+cpu
 
