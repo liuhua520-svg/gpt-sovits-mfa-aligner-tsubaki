@@ -5,8 +5,37 @@
       <el-header class="app-header">
         <div class="header-content">
           <div class="header-left">
-            <h1>{{ t('app.title') }}</h1>
-            <p class="subtitle">{{ t('app.subtitle') }}</p>
+            <!-- 左上角功能菜单：对齐处理 / 词典管理 / 设置 / 对话文本框 -->
+            <el-dropdown trigger="click" placement="bottom-start" @command="onMenuCommand">
+              <button class="menu-trigger" :aria-label="t('menu.title')" type="button">
+                <el-icon :size="22"><Menu /></el-icon>
+              </button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item command="aligner" :class="{ 'is-active-route': currentRouteName === 'aligner' }">
+                    <el-icon><House /></el-icon>
+                    <span>{{ t('menu.aligner') }}</span>
+                  </el-dropdown-item>
+                  <el-dropdown-item command="dictionary" divided :class="{ 'is-active-route': currentRouteName === 'dictionary' }">
+                    <el-icon><Notebook /></el-icon>
+                    <span>{{ t('menu.dictionary') }}</span>
+                  </el-dropdown-item>
+                  <el-dropdown-item command="dialogue" :class="{ 'is-active-route': currentRouteName === 'dialogue' }">
+                    <el-icon><ChatDotRound /></el-icon>
+                    <span>{{ t('menu.dialogue') }}</span>
+                  </el-dropdown-item>
+                  <el-dropdown-item command="settings" divided :class="{ 'is-active-route': currentRouteName === 'settings' }">
+                    <el-icon><Setting /></el-icon>
+                    <span>{{ t('menu.settings') }}</span>
+                  </el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
+
+            <div class="header-titles">
+              <h1>{{ t('app.title') }}</h1>
+              <p class="subtitle">{{ t('app.subtitle') }}</p>
+            </div>
           </div>
           <div class="header-right">
             <el-select v-model="localeModel" size="small" style="width: 120px">
@@ -26,7 +55,9 @@
 
       <!-- 主体 -->
       <el-main class="app-main">
-        <AudioProcessor @status-changed="onSystemStatusChanged" />
+        <router-view v-slot="{ Component }">
+          <component :is="Component" @status-changed="onSystemStatusChanged" />
+        </router-view>
       </el-main>
 
       <!-- 页脚 -->
@@ -50,13 +81,24 @@
 
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import AudioProcessor from './components/MFAProcessor.vue'
+import { useRoute, useRouter } from 'vue-router'
+import { Menu, House, Notebook, Setting, ChatDotRound } from '@element-plus/icons-vue'
 import { getElementPlusLocale, useAppLocale } from './i18n'
 import { useI18n } from 'vue-i18n'
 
 const systemReady = ref(false)
 const { t, currentLocale, setLocale } = useAppLocale()
 const { locale } = useI18n()
+const route = useRoute()
+const router = useRouter()
+
+const currentRouteName = computed(() => route.name as string | undefined)
+
+const onMenuCommand = (command: string) => {
+  if (command !== currentRouteName.value) {
+    router.push({ name: command })
+  }
+}
 
 const localeModel = computed({
   get: () => currentLocale.value,
@@ -78,6 +120,8 @@ const elementPlusLocale = computed(() => getElementPlusLocale(currentLocale.valu
 //   2. 避免"先看到底部面板更新，过一会儿右上角才更新"的不同步现象——
 //      两边现在用的是同一份响应，而不是分别独立 fetch 的两份，
 //      也就不会出现两边状态对不上的情况。
+// 注意：该事件只由"对齐处理"页面（MFAProcessor.vue）发出；词典管理 / 设置 /
+// 对话文本框三个新页面不涉及 MFA 状态，不会发出此事件，监听器闲置即可，无副作用。
 const onSystemStatusChanged = (status?: { mfa?: { installed?: boolean } }) => {
   systemReady.value = status?.mfa?.installed ?? false
 }
@@ -121,9 +165,40 @@ const onSystemStatusChanged = (status?: { mfa?: { installed?: boolean } }) => {
 
 .header-left {
   flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
 }
 
-.header-left h1 {
+.menu-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  border: 1px solid rgba(79, 70, 229, 0.18);
+  background: rgba(79, 70, 229, 0.08);
+  color: #4f46e5;
+  cursor: pointer;
+  transition: background 0.2s, transform 0.15s;
+}
+
+.menu-trigger:hover {
+  background: rgba(79, 70, 229, 0.16);
+}
+
+.menu-trigger:active {
+  transform: scale(0.94);
+}
+
+.header-titles {
+  min-width: 0;
+}
+
+.header-titles h1 {
   margin: 0;
   font-size: 26px;
   font-weight: 700;
@@ -131,6 +206,9 @@ const onSystemStatusChanged = (status?: { mfa?: { installed?: boolean } }) => {
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .subtitle {
@@ -192,7 +270,7 @@ const onSystemStatusChanged = (status?: { mfa?: { installed?: boolean } }) => {
     gap: 15px;
   }
 
-  .header-left h1 {
+  .header-titles h1 {
     font-size: 20px;
   }
 
@@ -201,3 +279,4 @@ const onSystemStatusChanged = (status?: { mfa?: { installed?: boolean } }) => {
   }
 }
 </style>
+
