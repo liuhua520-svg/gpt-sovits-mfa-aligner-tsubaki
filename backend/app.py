@@ -1205,6 +1205,213 @@ def pipeline_f0_only():
         return jsonify({"error": str(e)}), 500
 
 
+# =====================================================================
+# 对话文本框批量处理（功能 3）
+# 每个对话框：左侧文本/LAB 导入，右侧音频导入；顶部"高级设置"与单文件
+# 处理页面共用同一套后端对齐参数。处理结果合并写入*同一个*多音轨工程
+# 文件（每个对话框对应一条独立音轨），而不是分别导出多个独立工程文件。
+# =====================================================================
+
+def run_dialogue_batch_job(job_id: str, boxes, **kwargs):
+    try:
+        set_job(
+            job_id,
+            status="running",
+            started_at=datetime.now().isoformat(),
+            progress={"done": 0, "total": len(boxes)},
+        )
+
+        def _progress_cb(done, total, box_result):
+            set_job(
+                job_id,
+                status="running",
+                progress={"done": done, "total": total},
+                last_box=box_result,
+            )
+
+        result = pipeline.process_dialogue_batch(boxes, progress_cb=_progress_cb, **kwargs)
+
+        if result.get("success"):
+            set_job(
+                job_id,
+                status="done",
+                finished_at=datetime.now().isoformat(),
+                result=result,
+            )
+        else:
+            set_job(
+                job_id,
+                status="failed",
+                finished_at=datetime.now().isoformat(),
+                error=result.get("error"),
+                result=result,
+            )
+
+    except Exception as e:
+        logger.exception("对话文本框批量处理后台任务异常")
+        set_job(
+            job_id,
+            status="failed",
+            finished_at=datetime.now().isoformat(),
+            error=str(e),
+        )
+
+
+@app.route("/api/dialogue/process", methods=["POST"])
+def dialogue_process():
+    """
+    对话文本框批量处理（异步后台任务版，与其他 pipeline 路由共用
+    /api/pipeline/job/<job_id> 轮询进度）。
+
+    请求为 multipart/form-data：
+      - box_count : 对话框总数
+      - text_{i}  : 第 i 个对话框的台词文本（可选）
+      - audio_{i} : 第 i 个对话框的音频文件（可选，缺失则该对话框跳过）
+      - lab_{i}   : 第 i 个对话框的 LAB 标注文件（可选；提供时跳过对齐，
+                    直接使用该 LAB 生成对应音轨——即"左边 lab 导入"模式）
+      - 其余参数与 /api/pipeline/full 完全一致（language / format / title /
+        bpm / f0_* / aligner_backend / word_phoneme_map / dict_source 等），
+        对全部对话框统一生效。
+    """
+    try:
+        box_count = int(request.form.get("box_count", 0))
+        if box_count <= 0:
+            return jsonify({"error": "box_count 必须大于 0"}), 400
+        if box_count > 64:
+            return jsonify({"error": "对话框数量过多（上限 64）"}), 400
+
+        language = request.form.get("language", "cmn")
+        output_format = request.form.get("format", "sv")
+        if output_format not in ("sv", "vsqx"):
+            return jsonify({
+                "error": f"对话文本框批量处理暂不支持输出格式: {output_format}（仅支持 sv / vsqx，多音轨概念不适用于 MIDI / USTX）"
+            }), 400
+
+        project_title = request.form.get("title", "Dialogue Project")
+
+        bpm = float(request.form.get("bpm", 120))
+        base_pitch = int(request.form.get("base_pitch", 60))
+        f0_method = request.form.get("f0_method", "dio")
+        f0_smooth = request.form.get("f0_smooth", "true").lower() == "true"
+        f0_device = request.form.get("f0_device", "auto")
+        crepe_model = request.form.get("crepe_model", "full")
+        f0_smooth_window = int(request.form.get("f0_smooth_window", 5))
+        use_double_precision = request.form.get("precision", "single").lower() == "double"
+        f0_floor = float(request.form.get("f0_floor", 71.0))
+        f0_ceil = float(request.form.get("f0_ceil", 800.0))
+        refine_pitch = request.form.get("auto_note_pitch", "false").lower() == "true"
+        export_pitch_line = request.form.get("export_pitch_line", "true").lower() == "true"
+
+        aligner_backend = request.form.get("aligner_backend", "mfa")
+        if aligner_backend not in ("mfa", "whisperx", "qwen3_asr", "qwen3_aligner", "nemo_aligner"):
+            aligner_backend = "mfa"
+
+        whisperx_model = request.form.get("whisperx_model", "large-v3")
+        if whisperx_model not in ("large-v3", "large-v3-turbo", "large-v2", "medium", "small", "base", "tiny"):
+            whisperx_model = "large-v3"
+
+        nemo_model = request.form.get("nemo_model", "").strip()
+        english_word_align = request.form.get("english_word_align", "false").lower() == "true"
+        word_phoneme_map   = request.form.get("word_phoneme_map",   "false").lower() == "true"
+
+        dict_source = request.form.get("dict_source", "default").strip().lower()
+        if dict_source not in ("default", "synthesizerv", "vocaloid"):
+            dict_source = "default"
+
+        vsqx_singer    = request.form.get("vsqx_singer",    "MIKU_V4_Chinese")
+        vsqx_singer_id = request.form.get("vsqx_singer_id", "BNGE7CP7EMTRSNC3")
+        vsqx_singer_bs = int(request.form.get("vsqx_singer_bs", 4))
+        if output_format == "vsqx":
+            vsqx_singer, vsqx_singer_id, vsqx_singer_bs = _select_vsqx_singer(language, "full")
+
+        # ── 逐个对话框保存音频 / LAB 文件到工作目录 ──────────────────────
+        boxes = []
+        for i in range(box_count):
+            text = request.form.get(f"text_{i}", "").strip()
+            audio_file = request.files.get(f"audio_{i}")
+            lab_file = request.files.get(f"lab_{i}")
+
+            audio_path = None
+            lab_path = None
+
+            if audio_file is not None and audio_file.filename:
+                _stem, wav_path_obj, _lab_path_obj = build_job_paths(
+                    audio_file.filename or f"dialogue_{i}.wav"
+                )
+                audio_file.save(str(wav_path_obj))
+                audio_path = str(wav_path_obj)
+
+            if lab_file is not None and lab_file.filename:
+                lab_stem = sanitize_stem(lab_file.filename)
+                lab_stem = fit_stem_to_limit(str(WORK_DIR), f"{lab_stem}_{uuid.uuid4().hex[:6]}")
+                lab_path_obj = WORK_DIR / f"{lab_stem}.lab"
+                lab_file.save(str(lab_path_obj))
+                lab_path = str(lab_path_obj)
+
+            boxes.append({
+                "index": i,
+                "text": text,
+                "audio_path": audio_path,
+                "lab_path": lab_path,
+            })
+
+        if not any(b["audio_path"] for b in boxes):
+            return jsonify({"error": "请至少为一个对话框提供音频文件后再开始处理"}), 400
+
+        job_id = uuid.uuid4().hex
+        set_job(
+            job_id,
+            status="queued",
+            created_at=datetime.now().isoformat(),
+        )
+
+        logger.info(f"对话文本框批量处理启动 (backend={aligner_backend}, boxes={box_count})，投递后台任务: {job_id}")
+
+        Thread(
+            target=run_dialogue_batch_job,
+            daemon=True,
+            kwargs=dict(
+                job_id=job_id,
+                boxes=boxes,
+                language=language,
+                output_format=output_format,
+                project_title=project_title,
+                bpm=bpm,
+                base_pitch=base_pitch,
+                f0_method=f0_method,
+                f0_smooth=f0_smooth,
+                f0_smooth_window=f0_smooth_window,
+                use_double_precision=use_double_precision,
+                f0_floor=f0_floor,
+                f0_ceil=f0_ceil,
+                refine_pitch=refine_pitch,
+                export_pitch_line=export_pitch_line,
+                f0_device=f0_device,
+                crepe_model=crepe_model,
+                aligner_backend=aligner_backend,
+                whisperx_model=whisperx_model,
+                nemo_model=(nemo_model or None),
+                english_word_align=english_word_align,
+                vsqx_singer=vsqx_singer,
+                vsqx_singer_id=vsqx_singer_id,
+                vsqx_singer_bs=vsqx_singer_bs,
+                word_phoneme_map=word_phoneme_map,
+                dict_source=dict_source,
+            ),
+        ).start()
+
+        return jsonify({
+            "success": True,
+            "job_id": job_id,
+            "status": "queued",
+            "box_count": box_count,
+        }), 202
+
+    except Exception as e:
+        logger.exception("对话文本框批量处理启动失败")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/mfa/download-model/<language>", methods=["POST"])
 def download_mfa_model(language: str):
     """下载 MFA 模型"""

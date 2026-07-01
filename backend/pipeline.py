@@ -12,14 +12,38 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+import shutil
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Callable, Dict, List, Optional
 
 from mfa_processor import MFAProcessor
 from tsubaki_processor import TsubakiProcessor, AudioProcessingConfig
 
 logger = logging.getLogger(__name__)
+
+
+class _LocalFileAdapter:
+    """
+    把磁盘上已存在的文件包装成 audio_file 风格的对象（.filename / .save() / .seek()），
+    兼容 MFAProcessor.process() / alt_aligners 各 aligner.align() 内部对
+    Flask FileStorage 接口的依赖。
+
+    对话文本框批量处理功能（process_dialogue_batch）中，每个对话框的音频
+    在路由层已经落盘，这里只需要包一层适配器复用现有的 _run_alignment()，
+    不需要重新实现一遍对齐调度逻辑。
+    """
+    def __init__(self, local_path: str):
+        self.path = os.path.abspath(local_path)
+        self.filename = os.path.basename(local_path)
+
+    def save(self, dst: str) -> None:
+        if os.path.abspath(dst) != self.path:
+            shutil.copy(self.path, dst)
+
+    def seek(self, *args, **kwargs) -> None:
+        pass
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -476,6 +500,241 @@ class AudioProcessingPipeline:
                 "success": False, "error": str(e),
                 "processing_time": int((time.time() - start_time) * 1000),
             }
+
+    # ═════════════════════════════════════════════════════════════════════
+    # 对话文本框批量处理（功能 3）
+    # ═════════════════════════════════════════════════════════════════════
+
+    def process_dialogue_batch(
+        self,
+        boxes: List[Dict],
+        language: str = "cmn",
+        output_format: str = "sv",
+        project_title: str = "Dialogue Project",
+        bpm: float = 120.0,
+        base_pitch: int = 60,
+        f0_method: str = "dio",
+        f0_smooth: bool = True,
+        f0_smooth_window: int = 5,
+        use_double_precision: bool = False,
+        f0_floor: float = 71.0,
+        f0_ceil: float = 800.0,
+        refine_pitch: bool = False,
+        export_pitch_line: bool = True,
+        f0_device: str = "auto",
+        crepe_model: str = "full",
+        aligner_backend: str = "mfa",
+        whisperx_model: str = "large-v3",
+        nemo_model: Optional[str] = None,
+        english_word_align: bool = False,
+        vsqx_singer: str = "MIKU_V4_Chinese",
+        vsqx_singer_id: str = "BNGE7CP7EMTRSNC3",
+        vsqx_singer_bs: int = 4,
+        word_phoneme_map: bool = False,
+        dict_source: str = "default",
+        progress_cb: Optional[Callable[[int, int, Dict], None]] = None,
+    ) -> Dict:
+        """
+        对话文本框批量处理入口：逐个对话框顺序处理（对齐/LAB 导入 + 音高提取），
+        最终把全部成功的对话框合并写入*同一个*多音轨工程文件（每个对话框
+        对应一条独立音轨），而不是分别导出多个独立工程文件。
+
+        顶部"高级设置"（对齐后端 / 语种 / BPM / F0 参数 / word_phoneme_map /
+        dict_source 等）对全部对话框统一生效，与单文件处理页面语义一致。
+
+        Parameters
+        ----------
+        boxes : 每个元素描述一个对话框，按前端展示顺序排列（决定最终音轨顺序）：
+            {
+                "index": int,                  # 对话框序号（用于结果回填，从 0 开始）
+                "text": str,                    # 台词文本（可选；MFA/Qwen3-FA/NeMo-FA 需要）
+                "audio_path": Optional[str],    # 已保存到磁盘的音频路径；缺失则整框跳过
+                "lab_path": Optional[str],      # 已保存到磁盘的 LAB 路径；提供时跳过对齐，直接使用
+            }
+        progress_cb : 可选回调 (done_count, total_count, box_result)，
+            每处理完一个对话框调用一次，供路由层更新任务进度供前端轮询。
+
+        Returns
+        -------
+        Dict : {
+            "success": bool,
+            "project_path": str,        # 仅在至少一个对话框成功时存在
+            "project_format": str,
+            "boxes": List[Dict],        # 每个对话框的处理结果（status: done/failed/skipped_empty）
+            "processed_count": int,     # status == "done"
+            "failed_count": int,
+            "skipped_count": int,
+            "processing_time": int,     # 毫秒
+        }
+        """
+        import time
+        start_time = time.time()
+
+        config = AudioProcessingConfig(
+            bpm=bpm,
+            base_pitch=base_pitch,
+            f0_method=f0_method,
+            f0_smooth=f0_smooth,
+            f0_smooth_window=f0_smooth_window,
+            refine_pitch=refine_pitch,
+            export_pitch_line=export_pitch_line,
+            use_double_precision=use_double_precision,
+            f0_floor=f0_floor,
+            f0_ceil=f0_ceil,
+            f0_device=f0_device,
+            crepe_model=crepe_model,
+        )
+
+        total = len(boxes)
+        results: List[Dict] = []
+        track_inputs: List[Dict] = []
+
+        logger.info("=" * 60)
+        logger.info(f"开始对话文本框批量处理 [共 {total} 个对话框, backend={aligner_backend}]")
+        logger.info("=" * 60)
+
+        for i, box in enumerate(boxes):
+            idx = box.get("index", i)
+            audio_path = box.get("audio_path")
+            lab_path_in = box.get("lab_path")
+            text = (box.get("text") or "").strip()
+
+            box_result: Dict = {"index": idx}
+
+            if not audio_path or not Path(str(audio_path)).exists():
+                box_result.update(status="skipped_empty", message="未提供音频")
+                results.append(box_result)
+                if progress_cb:
+                    progress_cb(i + 1, total, box_result)
+                continue
+
+            try:
+                stem = f"dlg_{idx:03d}_{Path(str(audio_path)).stem}"
+                wav_dst = self.work_dir / f"{stem}.wav"
+                if os.path.abspath(str(wav_dst)) != os.path.abspath(str(audio_path)):
+                    shutil.copy(str(audio_path), str(wav_dst))
+                wav_path_final = str(wav_dst)
+
+                if lab_path_in and Path(str(lab_path_in)).exists():
+                    # ── LAB 导入模式：跳过对齐，直接使用现成 LAB ──────────
+                    lab_dst = self.work_dir / f"{stem}.lab"
+                    shutil.copy(str(lab_path_in), str(lab_dst))
+                    lab_path_final = str(lab_dst)
+                else:
+                    text_optional = aligner_backend in ("whisperx", "qwen3_asr")
+                    if not text and not text_optional:
+                        box_result.update(
+                            status="failed",
+                            error="该对齐后端需要参考文本（MFA / Qwen3-ForcedAligner / NeMo Forced Aligner）",
+                        )
+                        results.append(box_result)
+                        if progress_cb:
+                            progress_cb(i + 1, total, box_result)
+                        continue
+
+                    audio_adapter = _LocalFileAdapter(wav_path_final)
+                    align_result = _run_alignment(
+                        audio_adapter, text, language, aligner_backend,
+                        f0_device, whisperx_model,
+                        english_word_align=english_word_align,
+                        nemo_model=nemo_model,
+                    )
+                    if not align_result.get("success"):
+                        box_result.update(
+                            status="failed",
+                            error=align_result.get("error", "对齐处理失败"),
+                        )
+                        results.append(box_result)
+                        if progress_cb:
+                            progress_cb(i + 1, total, box_result)
+                        continue
+
+                    lab_content = align_result.get("lab_content", "")
+                    lab_dst = self.work_dir / f"{stem}.lab"
+                    lab_dst.write_text(lab_content, encoding="utf-8")
+                    lab_path_final = str(lab_dst)
+
+                track_title = (text[:24].strip() if text else "") or Path(str(audio_path)).stem or f"Track {idx + 1}"
+
+                track_inputs.append({
+                    "title": track_title,
+                    "wav_path": wav_path_final,
+                    "lab_path": lab_path_final,
+                    "original_text": text,
+                })
+
+                box_result.update(status="done", wav_path=wav_path_final, lab_path=lab_path_final)
+                results.append(box_result)
+
+            except Exception as e:
+                logger.error(f"✗ 对话框 #{idx} 处理异常: {e}", exc_info=True)
+                box_result.update(status="failed", error=str(e))
+                results.append(box_result)
+
+            if progress_cb:
+                progress_cb(i + 1, total, box_result)
+
+        processed_count = sum(1 for r in results if r.get("status") == "done")
+        failed_count    = sum(1 for r in results if r.get("status") == "failed")
+        skipped_count   = sum(1 for r in results if r.get("status") == "skipped_empty")
+
+        if not track_inputs:
+            return {
+                "success": False,
+                "error": "没有任何对话框成功处理，无法生成工程文件",
+                "boxes": results,
+                "processed_count": processed_count,
+                "failed_count": failed_count,
+                "skipped_count": skipped_count,
+                "processing_time": int((time.time() - start_time) * 1000),
+            }
+
+        project_result = self.tsubaki_processor.build_multitrack_project(
+            project_title=project_title,
+            track_inputs=track_inputs,
+            output_format=output_format,
+            config=config,
+            word_phoneme_map=word_phoneme_map,
+            language=language,
+            dict_source=dict_source,
+            vsqx_singer=vsqx_singer,
+            vsqx_singer_id=vsqx_singer_id,
+            vsqx_singer_bs=vsqx_singer_bs,
+        )
+
+        processing_time = int((time.time() - start_time) * 1000)
+
+        if not project_result.get("success"):
+            return {
+                "success": False,
+                "error": project_result.get("error", "多音轨工程文件生成失败"),
+                "boxes": results,
+                "processed_count": processed_count,
+                "failed_count": failed_count,
+                "skipped_count": skipped_count,
+                "processing_time": processing_time,
+            }
+
+        logger.info("=" * 60)
+        logger.info("✓ 对话文本框批量处理完成")
+        logger.info(f" 工程文件: {project_result.get('output_path')}")
+        logger.info(f" 成功/失败/跳过: {processed_count}/{failed_count}/{skipped_count}")
+        logger.info(f" 耗时: {processing_time}ms")
+        logger.info("=" * 60)
+
+        return {
+            "success":         True,
+            "project_path":    project_result.get("output_path"),
+            "project_format":  project_result.get("format", output_format),
+            "requested_format": output_format,
+            "track_count":     project_result.get("track_count", len(track_inputs)),
+            "boxes":           results,
+            "processed_count": processed_count,
+            "failed_count":    failed_count,
+            "skipped_count":   skipped_count,
+            "processing_time": processing_time,
+            "message": f"对话文本框批量处理完成: {processed_count} 个音轨已合并写入工程文件",
+        }
 
     def process_f0_only(
         self,

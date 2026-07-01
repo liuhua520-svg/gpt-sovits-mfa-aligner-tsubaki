@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import json
-import uuid
 import logging
 import re
 import numpy as np
@@ -812,9 +811,8 @@ class TsubakiProcessor:
     # ----------------------------
     # SVP 生成（完整修复版）
     # ----------------------------
-    def _build_svp_track_group(
+    def _build_svp_track_payload(
         self,
-        title: str,
         segments: List[LabelSegment],
         f0: Optional[np.ndarray],
         t: Optional[np.ndarray],
@@ -824,21 +822,26 @@ class TsubakiProcessor:
         language: str = "",
         native_english_words: Optional[set] = None,
         dict_source: str = "default",
-        disp_order: int = 0,
-        disp_color: str = "ff7db235",
-    ) -> Tuple[Dict, Dict]:
+    ) -> Tuple[List[Dict], List[float]]:
         """
-        构建单条 SVP 音轨所需的 (library_group, track) 结构对。
+        构建单条音轨的 notes 列表 + pitchDelta points（float cents）。
 
-        这是从 _build_svp_project_text 中抽取出的"单轨"计算逻辑，供
-        单轨（_build_svp_project_text）与多轨（_build_svp_multi_track_project_text，
-        对话文本框批量处理用）两个上层函数共用，避免核心音符/音高/词典查询
-        逻辑维护两份。抽取过程未改动任何计算细节，单轨调用方输出与抽取前
-        完全一致。
+        供单音轨 (_build_svp_project_text) 与多音轨
+        (build_svp_project_text_multitrack，对话文本框批量处理功能) 共用，
+        避免逻辑重复导致行为不一致。
+
+        Returns
+        -------
+        (all_notes, pitch_data)
         """
         base_tone = int(config.base_pitch)
 
         # ── 步骤 1：从 LAB segments 构建时间轴音符列表 ───────────────────────
+        # 规则：
+        #   '-'                → 保留（consonant onset 标记）
+        #   sil / pau / sp     → 转换为 '-' dash 音符（填充间隙，使时间轴连续）
+        #   其他（hai, da ...） → 保留
+
         offset_ratio = config.bpm * 705600000 / 60
 
         all_notes: List[Dict] = []
@@ -848,15 +851,19 @@ class TsubakiProcessor:
             if seg.end_time <= seg.start_time:
                 continue
 
+            # 后续的重构公式保持不变
             onset = int(seg.start_time * offset_ratio / 10000000)
             end_offset = int(seg.end_time * offset_ratio / 10000000)
             dur = max(1, end_offset - onset)
 
+            # 【修改点】如果是 lab 里的显式静音标签（sil/pau/sp），直接跳过不生成音符，使其在 SVP 中保持物理空白
             if self._is_true_silence(seg.label):
                 continue
 
+            # 下面不再需要 else，原本 else 内部的代码直接靠左对齐正常运行即可
             tone = base_tone
             if midi_notes is not None:
+                # ── MIDI 模式：直接从 MIDI 文件读取该段的音符音高 ──
                 from midi_processor import map_segment_to_midi_pitch
                 _start_sec = self._lab_time_to_seconds(seg.start_time)
                 _end_sec   = self._lab_time_to_seconds(seg.end_time)
@@ -869,12 +876,19 @@ class TsubakiProcessor:
                 seg_f0    = f0[mask]
                 voiced    = seg_f0[seg_f0 > 0]
                 if len(voiced) > 0:
+                    # 在 MIDI（半音）空间取中位数，避免 Hz 域平均偏向高频
                     midi_vals = 69.0 + 12.0 * np.log2(voiced / 440.0)
                     tone      = int(round(float(np.median(midi_vals))))
                     tone      = max(12, min(127, tone))
 
+            # 原本就有的 "-" 标签由于不属于 _is_true_silence，会顺利走到这里，被正确保留为 "-" 音符
             note = self._default_svp_note(seg.label, tone, onset, dur)
 
+            # ── word_phoneme_map：英语单词 → ARPABET 音素写入 phonemes 字段 ──
+            # 条件：功能开关已开启 + label 是英语单词（非静音/非辅音占位符）
+            # + 语言守卫：优先用 native_english_words（从原始文本预提取）判断；
+            # 若未提供则回退到词典查询。防止中文拼音 rang/wang/dong 等
+            # 被 g2p_en 误当英语词转换成 ARPABET。
             if (
                 word_phoneme_map
                 and self._is_ascii_word_label(seg.label)
@@ -883,6 +897,10 @@ class TsubakiProcessor:
                 try:
                     resolved_phones: Optional[List[str]] = None
 
+                    # ── 优先查询用户自定义词典（"synthesizerv" 来源，ARPABET 记号）──
+                    # SVP 的 phonemes 字段本就要求 ARPABET 记号，因此这里只消费
+                    # "synthesizerv" 词典；"vocaloid" 词典是 VOCALOID4 记号，
+                    # 不适用于 SVP，命中不到时照常回退到软件默认转换。
                     if dict_source == "synthesizerv":
                         from dictionary_manager import lookup_word as _dict_lookup
                         user_phones_str = _dict_lookup(seg.label, dict_source)
@@ -912,11 +930,19 @@ class TsubakiProcessor:
             if seg.label != "-":
                 voiced_refs.append(note)
 
+        # ── 步骤 2：检查并填补音符之间的空隙 ────────────────────────────────
+        # （正常情况下 LAB 已连续，此步作为保险）
         all_notes.sort(key=lambda n: n["onset"])
 
-        # ── 步骤 2：pitchDelta points（float cents，cubic mode）──────────────
+        # ── 步骤 3：pitchDelta points（float cents，cubic mode）──────────────
         pitch_data: List[float] = []
         voiced_sample_count = 0
+
+        logger.info(
+            f"Pitch Export Debug: export_pitch_line={config.export_pitch_line}, "
+            f"f0_len={0 if f0 is None else len(f0)}, "
+            f"t_len={0 if t is None else len(t)}"
+        )
 
         if config.export_pitch_line and t is not None and f0 is not None and len(f0) > 0:
             for ti, f0i in zip(t, f0):
@@ -924,6 +950,8 @@ class TsubakiProcessor:
                     continue
 
                 voiced_sample_count += 1
+
+                # 音频时间（秒）→ SV blick 轴
                 pos = int(float(ti) * offset_ratio)
 
                 nominal_tone = base_tone
@@ -937,13 +965,76 @@ class TsubakiProcessor:
 
                 pitch_data.extend([pos, deviation_cents])
 
+            logger.info(
+                f"Pitch Export Debug: valid_f0={voiced_sample_count}, "
+                f"generated_points={len(pitch_data)//2}"
+            )
+
             if not pitch_data:
                 logger.warning("pitchDelta 为空：导出前的 F0 基本被清空了，写入零线兜底。")
                 for note in all_notes:
                     pitch_data.extend([note["onset"], 0.0])
                     pitch_data.extend([note["onset"] + note["duration"], 0.0])
 
-        # ── 步骤 3：组装 library_group / track ───────────────────────────────
+        return all_notes, pitch_data
+
+    def _build_svp_project_text(
+        self,
+        title: str,
+        segments: List[LabelSegment],
+        f0: Optional[np.ndarray],
+        t: Optional[np.ndarray],
+        sr: Optional[int],
+        wav_path: str,
+        config: AudioProcessingConfig,
+        audio_duration_sec: Optional[float] = None,
+        midi_notes: Optional[List] = None,   # MIDI 导入：(start_sec, end_sec, pitch) 列表
+        word_phoneme_map: bool = False,       # 英语单词 → ARPABET 音素写入 phonemes 字段
+        language: str = "",                   # 语种（用于 word_phoneme_map 防误判）
+        native_english_words: Optional[set] = None,  # 从原始文本预提取的英语单词集合（防拼音误判）
+        dict_source: str = "default",         # 单词→音素词典来源："default"/"synthesizerv"/"vocaloid"
+    ) -> str:
+        """
+        生成可被 Synthesizer V 正确识别的 SVP JSON 文本（单音轨）。
+
+        修复要点
+        ────────
+        1. blicks = LAB 时间戳（100ns 单位）不可使用，即 blicks_per_second = 10,000,000。
+           需要使用 (bpm/60)*705600000 换算，那个公式会让时间缩小 141 倍。
+
+        2. 音符放入 library[0].notes，而非 mainGroup.notes：
+           • '-' (consonant onset) 保留为实际音符（不跳过）
+           • 'sil/pau/sp/spn' 真正静音段 → 用 '-' 填充其时间范围
+           • 相邻有声音符之间如有剩余间隙 → 再补 '-' 填充
+
+        3. mainGroup 保持空 notes；tracks[0].groups[0] 引用 library[0]。
+
+        4. pitchDelta 格式：mode="cubic"，y 值使用 float cents（不取整）。
+
+        5. time 结构去除 version 7 格式的顶层 bpm 字段，改为 version 119 格式。
+
+        实际的音符 / 音高曲线构建逻辑已提取到 _build_svp_track_payload()，
+        与对话文本框批量处理功能的多音轨生成器共用，本方法只负责组装
+        单音轨的 library/tracks JSON 结构。
+        """
+        if audio_duration_sec is None:
+            audio_duration_sec = 0.0
+
+        import uuid
+
+        all_notes, pitch_data = self._build_svp_track_payload(
+            segments=segments,
+            f0=f0,
+            t=t,
+            config=config,
+            midi_notes=midi_notes,
+            word_phoneme_map=word_phoneme_map,
+            language=language,
+            native_english_words=native_english_words,
+            dict_source=dict_source,
+        )
+
+        # ── 组装 JSON ─────────────────────────────────────────────────
         main_uuid  = str(uuid.uuid4()).lower()
         group_uuid = str(uuid.uuid4()).lower()
 
@@ -973,73 +1064,6 @@ class TsubakiProcessor:
             "notes":      [],
         }
 
-        track = {
-            "name":          title,
-            "dispColor":     disp_color,
-            "dispOrder":     disp_order,
-            "renderEnabled": False,
-            "mixer": {
-                "gainDecibel": 0,
-                "pan":         0,
-                "mute":        False,
-                "solo":        False,
-                "display":     True,
-            },
-            "mainGroup": main_group,
-            "mainRef":   self._group_ref(main_uuid),
-            "groups":    [self._group_ref(group_uuid)],
-        }
-
-        return library_group, track
-
-    def _build_svp_project_text(
-        self,
-        title: str,
-        segments: List[LabelSegment],
-        f0: Optional[np.ndarray],
-        t: Optional[np.ndarray],
-        sr: Optional[int],
-        wav_path: str,
-        config: AudioProcessingConfig,
-        audio_duration_sec: Optional[float] = None,
-        midi_notes: Optional[List] = None,   # MIDI 导入：(start_sec, end_sec, pitch) 列表
-        word_phoneme_map: bool = False,       # 英语单词 → ARPABET 音素写入 phonemes 字段
-        language: str = "",                   # 语种（用于 word_phoneme_map 防误判）
-        native_english_words: Optional[set] = None,  # 从原始文本预提取的英语单词集合（防拼音误判）
-        dict_source: str = "default",         # 单词→音素词典来源："default"/"synthesizerv"/"vocaloid"
-    ) -> str:
-        """
-        生成可被 Synthesizer V 正确识别的 SVP JSON 文本（单轨）。
-
-        修复要点
-        ────────
-        1. blicks = LAB 时间戳（100ns 单位）不可使用，即 blicks_per_second = 10,000,000。
-           需要使用 (bpm/60)*705600000 换算，那个公式会让时间缩小 141 倍。
-
-        2. 音符放入 library[0].notes，而非 mainGroup.notes：
-           • '-' (consonant onset) 保留为实际音符（不跳过）
-           • 'sil/pau/sp/spn' 真正静音段 → 用 '-' 填充其时间范围
-           • 相邻有声音符之间如有剩余间隙 → 再补 '-' 填充
-
-        3. mainGroup 保持空 notes；tracks[0].groups[0] 引用 library[0]。
-
-        4. pitchDelta 格式：mode="cubic"，y 值使用 float cents（不取整）。
-
-        5. time 结构去除 version 7 格式的顶层 bpm 字段，改为 version 119 格式。
-
-        实际的单轨音符/音高计算已抽取到 _build_svp_track_group()，本函数只负责
-        调用一次并组装成完整工程；多轨版本见 _build_svp_multi_track_project_text()。
-        """
-        if audio_duration_sec is None:
-            audio_duration_sec = 0.0
-
-        library_group, track = self._build_svp_track_group(
-            title=title, segments=segments, f0=f0, t=t, config=config,
-            midi_notes=midi_notes, word_phoneme_map=word_phoneme_map,
-            language=language, native_english_words=native_english_words,
-            dict_source=dict_source, disp_order=0,
-        )
-
         project = {
             "version": 119,
             "time": {
@@ -1047,7 +1071,24 @@ class TsubakiProcessor:
                 "tempo": [{"position": 0, "bpm": float(config.bpm)}],
             },
             "library": [library_group],
-            "tracks": [track],
+            "tracks": [
+                {
+                    "name":          title,
+                    "dispColor":     "ff7db235",
+                    "dispOrder":     0,
+                    "renderEnabled": False,
+                    "mixer": {
+                        "gainDecibel": 0,
+                        "pan":         0,
+                        "mute":        False,
+                        "solo":        False,
+                        "display":     True,
+                    },
+                    "mainGroup": main_group,
+                    "mainRef":   self._group_ref(main_uuid),
+                    "groups":    [self._group_ref(group_uuid)],
+                }
+            ],
             "renderConfig": {
                 "destination":     "./",
                 "filename":        title,
@@ -1061,55 +1102,113 @@ class TsubakiProcessor:
 
         return json.dumps(project, ensure_ascii=False, indent=2)
 
-    def _build_svp_multi_track_project_text(
+    # ----------------------------
+    # SVP 多音轨生成（对话文本框批量处理功能专用）
+    # ----------------------------
+    _MULTITRACK_DISP_COLORS = [
+        "ff7db235", "ff2a7de1", "ffe0703a", "ff9b59b6",
+        "ff16a085", "ffe74c3c", "fff39c12", "ff2c3e50",
+        "ff1abc9c", "ffc0392b",
+    ]
+
+    def build_svp_project_text_multitrack(
         self,
-        title: str,
-        track_inputs: List[Dict],
+        project_title: str,
+        tracks: List[Dict],
         config: AudioProcessingConfig,
+        word_phoneme_map: bool = False,
+        language: str = "",
+        dict_source: str = "default",
     ) -> str:
         """
-        生成多轨 SVP 工程（对话文本框批量处理用）：每个 track_inputs 元素
-        对应一个对话框，成为工程文件里的一条独立音轨，而不是分别导出
-        多个工程文件。
+        生成包含多条音轨的 SVP 工程文件（对话文本框批量处理功能）：
+        每个对话框对应一条独立音轨，全部写入*同一个* .svp 工程文件，
+        而不是分别导出多个独立工程文件。
 
         Parameters
         ----------
-        track_inputs : list of dict，每个 dict 支持的键：
-            name (str)                          — 音轨名称
-            segments (List[LabelSegment])        — 必填
-            f0 / t (Optional[np.ndarray])
-            midi_notes (Optional[List])
-            word_phoneme_map (bool)
-            language (str)
-            native_english_words (Optional[set])
-            dict_source (str)
+        project_title : 工程文件标题（写入 renderConfig.filename）
+        tracks : 每个元素描述一条音轨：
+            {
+                "title": str,                            # 音轨名称（对话框文本/文件名）
+                "segments": List[LabelSegment],           # 该音轨的 LAB 段落
+                "f0": Optional[np.ndarray],
+                "t": Optional[np.ndarray],
+                "native_english_words": Optional[set],    # 该行原文预提取的英语单词集合
+            }
+        config : 全局共享的音频处理配置（bpm / base_pitch / f0 参数等，
+                  对话文本框页面顶部的"高级设置"对全部音轨统一生效）
+        word_phoneme_map / language / dict_source : 全局共享的单词→音素映射设置
+            （与单文件处理页面语义一致，参见 _build_svp_track_payload）
 
-        说明：SVP 格式全局只有一条 tempo 曲线，所有音轨共用调用方传入的
-        同一个 config.bpm；每条音轨的音符 onset 都从 0 开始（各轨道相当于
-        彼此独立的时间轴起点一致的片段集合），不做音轨间的时间偏移。
+        Returns
+        -------
+        str : SVP JSON 文本，library / tracks 数组长度均等于 len(tracks)
         """
-        library_list: List[Dict] = []
-        track_list: List[Dict] = []
+        import uuid
 
-        palette = ["ff7db235", "ff4a90d9", "ffd9744a", "ff9b59b6", "ffe6b800", "ff3fbf8f"]
+        library: List[Dict] = []
+        track_entries: List[Dict] = []
 
-        for idx, item in enumerate(track_inputs):
-            library_group, track = self._build_svp_track_group(
-                title=item.get("name") or f"{title} #{idx + 1}",
-                segments=item["segments"],
-                f0=item.get("f0"),
-                t=item.get("t"),
+        for idx, tr in enumerate(tracks):
+            tr_title = tr.get("title") or f"Track {idx + 1}"
+
+            all_notes, pitch_data = self._build_svp_track_payload(
+                segments=tr.get("segments") or [],
+                f0=tr.get("f0"),
+                t=tr.get("t"),
                 config=config,
-                midi_notes=item.get("midi_notes"),
-                word_phoneme_map=item.get("word_phoneme_map", False),
-                language=item.get("language", ""),
-                native_english_words=item.get("native_english_words"),
-                dict_source=item.get("dict_source", "default"),
-                disp_order=idx,
-                disp_color=palette[idx % len(palette)],
+                midi_notes=None,   # 对话文本框批量处理不支持 MIDI 导入
+                word_phoneme_map=word_phoneme_map,
+                language=language,
+                native_english_words=tr.get("native_english_words"),
+                dict_source=dict_source,
             )
-            library_list.append(library_group)
-            track_list.append(track)
+
+            group_uuid = str(uuid.uuid4()).lower()
+            main_uuid  = str(uuid.uuid4()).lower()
+
+            library.append({
+                "name": tr_title,
+                "uuid": group_uuid,
+                "parameters": {
+                    "pitchDelta": {"mode": "cubic", "points": pitch_data},
+                    "vibratoEnv":  {"mode": "cubic", "points": []},
+                    "loudness":    {"mode": "cubic", "points": []},
+                    "tension":     {"mode": "cubic", "points": []},
+                    "breathiness": {"mode": "cubic", "points": []},
+                    "voicing":     {"mode": "cubic", "points": []},
+                    "gender":      {"mode": "cubic", "points": []},
+                    "toneShift":   {"mode": "cubic", "points": []},
+                },
+                "notes": all_notes,
+            })
+
+            main_group = {
+                "name":       "main",
+                "uuid":       main_uuid,
+                "parameters": self._empty_svp_parameters(),
+                "notes":      [],
+            }
+
+            disp_color = self._MULTITRACK_DISP_COLORS[idx % len(self._MULTITRACK_DISP_COLORS)]
+
+            track_entries.append({
+                "name":          tr_title,
+                "dispColor":     disp_color,
+                "dispOrder":     idx,
+                "renderEnabled": False,
+                "mixer": {
+                    "gainDecibel": 0,
+                    "pan":         0,
+                    "mute":        False,
+                    "solo":        False,
+                    "display":     True,
+                },
+                "mainGroup": main_group,
+                "mainRef":   self._group_ref(main_uuid),
+                "groups":    [self._group_ref(group_uuid)],
+            })
 
         project = {
             "version": 119,
@@ -1117,11 +1216,11 @@ class TsubakiProcessor:
                 "meter": [{"index": 0, "numerator": 4, "denominator": 4}],
                 "tempo": [{"position": 0, "bpm": float(config.bpm)}],
             },
-            "library": library_list,
-            "tracks": track_list,
+            "library": library,
+            "tracks": track_entries,
             "renderConfig": {
                 "destination":     "./",
-                "filename":        title,
+                "filename":        project_title,
                 "numChannels":     1,
                 "aspirationFormat":"noAspiration",
                 "bitDepth":        16,
@@ -1135,27 +1234,46 @@ class TsubakiProcessor:
     # ----------------------------
     # USTX 生成（修复版）
     # ----------------------------
-    def _build_ustx_track(
+    def _build_utau_project_text(
         self,
         title: str,
         segments: List[LabelSegment],
         f0: Optional[np.ndarray],
         t: Optional[np.ndarray],
+        sr: Optional[int],
+        wav_path: str,
         config: AudioProcessingConfig,
-        midi_notes: Optional[List] = None,
-        track_no: int = 0,
-    ) -> Tuple[Dict, Dict]:
+        audio_duration_sec: Optional[float] = None,
+        midi_notes: Optional[List] = None,   # MIDI 导入：(start_sec, end_sec, pitch) 列表
+    ) -> str:
         """
-        构建单条 USTX 音轨所需的 (track, voice_part) 结构对。
+        生成 USTX 工程文件内容。
 
-        从 _build_utau_project_text 中抽取出的"单轨"计算逻辑，供单轨
-        （_build_utau_project_text）与多轨（_build_utau_multi_track_project_text，
-        对话文本框批量处理用）共用。抽取过程未改动任何计算细节，单轨调用方
-        输出与抽取前完全一致（track_no 固定为 0）。
+        修复说明
+        ────────
+        Bug 1 — 字段错误：F0 数据原先写入每个 note 的 pitch.data（该字段
+                是 OpenUtau 用于音符间过渡曲线的内部字段，不是音高偏移曲线），
+                导致 PITD 曲线在 OpenUtau 中始终为空。
+                正确做法：写入 voice_part["curves"] 列表，abbr = "pitd"。
+
+        Bug 2 — 单位错误：原代码用 (midi_f0 - tone) × 1000，但 OpenUtau
+                pitd 的单位是 cents（100 = 1 个半音），应为 × 100。
+                原来的 × 1000 让所有偏差放大 10 倍，音高曲线完全错误。
+
+        音符音高说明
+        ────────────
+        · refine_pitch=False：所有音符固定在 base_pitch，pitd 曲线存储
+          相对于 base_pitch 的完整 F0 偏移（偏差较大，但保留真实音高走势）。
+        · refine_pitch=True ：每个音符的 tone 设置为该段 F0 的中位数半音，
+          pitd 曲线存储相对于该 tone 的细粒度偏移（与 SVP 的行为一致）。
         """
+        from ruamel.yaml import YAML
+        from io import StringIO
+
         resolution    = 480
         ticks_per_sec = (float(config.bpm) / 60.0) * resolution
 
+        # ── 工具：默认 pitch 过渡曲线（两端锚点，不携带 F0 数据） ───────────
         def make_default_pitch():
             return {
                 "data": [
@@ -1191,10 +1309,12 @@ class TsubakiProcessor:
 
             tone = int(config.base_pitch)
             if midi_notes is not None:
+                # ── MIDI 模式：直接从 MIDI 文件读取该段的音符音高 ──
                 from midi_processor import map_segment_to_midi_pitch
                 tone = map_segment_to_midi_pitch(start_sec, end_sec, midi_notes,
                                                  base_pitch=int(config.base_pitch))
             elif config.refine_pitch and f0 is not None and t is not None:
+                # refine_pitch：用该段 F0 中位数半音作为音符音高
                 mask   = (t >= start_sec) & (t < end_sec)
                 seg_f0 = f0[mask]
                 voiced = seg_f0[seg_f0 > 0]
@@ -1203,6 +1323,11 @@ class TsubakiProcessor:
                     tone      = int(round(float(np.median(midi_vals))))
                     tone      = max(0, min(127, tone))
 
+            # ── OpenUTAU lyric 规范化 ───────────────────────────────────
+            # OpenUTAU 使用 "+" 作为延音符（音符延续/Tie）：
+            #   "ー"（U+30FC 長音符）→ "+"：日语长音在 USTX 中应写作 "+"
+            #   "-"（辅音起始占位符）→ "+"：OpenUTAU 用 "+" 表示 consonant tie
+            # 此替换仅影响 USTX 输出，SVP/VSQX 格式保持原有语义。
             utau_lyric = "+" if label in ("ー", "-") else label
 
             notes.append({
@@ -1210,6 +1335,7 @@ class TsubakiProcessor:
                 "duration": dur_tick,
                 "tone":     tone,
                 "lyric":    utau_lyric,
+                # pitch.data = 默认两端锚点，不存 F0（F0 走 voice_part curves）
                 "pitch":    make_default_pitch(),
                 "vibrato":  make_default_vibrato(),
                 "phoneme_expressions": [],
@@ -1221,11 +1347,14 @@ class TsubakiProcessor:
             default=0,
         )
 
-        # ── 2. pitd 曲线 ─────────────────────────────────────────────────────
+        # ── 2. 构建全局 pitd 曲线 ────────────────────────────────────────────
+        # OpenUtau pitd 单位：cents（100 = 1 个半音），范围 -1200 ~ +1200。
+        # 数据放在 voice_part["curves"] 而非 note["pitch"]["data"]。
         xs: List[int] = []
         ys: List[int] = []
 
         if config.export_pitch_line and f0 is not None and t is not None and len(f0) > 0:
+            # 预建 note tone 查询表：(start_tick, end_tick, tone) 按 start 排序
             note_ranges = np.array(
                 [(n["position"], n["position"] + n["duration"], n["tone"])
                  for n in notes],
@@ -1242,16 +1371,19 @@ class TsubakiProcessor:
                 tick    = int(round(float(ti) * ticks_per_sec))
                 midi_f0 = 69.0 + 12.0 * np.log2(float(f0i) / 440.0)
 
+                # 找该 tick 所属音符的 tone（二分查找，O(log n)）
                 nominal = int(config.base_pitch)
                 if len(note_starts):
                     idx = int(np.searchsorted(note_starts, tick, side="right")) - 1
                     if 0 <= idx < len(note_tones) and tick <= note_ends[idx]:
                         nominal = int(note_tones[idx])
 
+                # ★ 单位修复：× 100（cents），不是 × 1000
                 deviation = int(round((midi_f0 - nominal) * 100))
                 xs.append(tick)
                 ys.append(deviation)
 
+        # ★ 字段修复：pitd 曲线放在 voice_part["curves"]，而非 note["pitch"]["data"]
         curves = [{"xs": xs, "ys": ys, "abbr": "pitd"}] if xs else []
 
         # ── 3. Track + VoicePart ─────────────────────────────────────────────
@@ -1267,61 +1399,13 @@ class TsubakiProcessor:
             "name":     title,
             "comment":  "",
             "duration": voice_duration,
-            "track_no": track_no,
+            "track_no": 0,
             "position": 0,
             "notes":    notes,
-            "curves":   curves,
+            "curves":   curves,   # ← pitd 写这里
         }
 
-        return track, voice_part
-
-    def _build_utau_project_text(
-        self,
-        title: str,
-        segments: List[LabelSegment],
-        f0: Optional[np.ndarray],
-        t: Optional[np.ndarray],
-        sr: Optional[int],
-        wav_path: str,
-        config: AudioProcessingConfig,
-        audio_duration_sec: Optional[float] = None,
-        midi_notes: Optional[List] = None,   # MIDI 导入：(start_sec, end_sec, pitch) 列表
-    ) -> str:
-        """
-        生成 USTX 工程文件内容（单轨）。
-
-        修复说明
-        ────────
-        Bug 1 — 字段错误：F0 数据原先写入每个 note 的 pitch.data（该字段
-                是 OpenUtau 用于音符间过渡曲线的内部字段，不是音高偏移曲线），
-                导致 PITD 曲线在 OpenUtau 中始终为空。
-                正确做法：写入 voice_part["curves"] 列表，abbr = "pitd"。
-
-        Bug 2 — 单位错误：原代码用 (midi_f0 - tone) × 1000，但 OpenUtau
-                pitd 的单位是 cents（100 = 1 个半音），应为 × 100。
-                原来的 × 1000 让所有偏差放大 10 倍，音高曲线完全错误。
-
-        音符音高说明
-        ────────────
-        · refine_pitch=False：所有音符固定在 base_pitch，pitd 曲线存储
-          相对于 base_pitch 的完整 F0 偏移（偏差较大，但保留真实音高走势）。
-        · refine_pitch=True ：每个音符的 tone 设置为该段 F0 的中位数半音，
-          pitd 曲线存储相对于该 tone 的细粒度偏移（与 SVP 的行为一致）。
-
-        实际的单轨音符/音高计算已抽取到 _build_ustx_track()，本函数只负责
-        调用一次（track_no=0）并组装成完整工程；多轨版本见
-        _build_utau_multi_track_project_text()。
-        """
-        from ruamel.yaml import YAML
-        from io import StringIO
-
-        resolution = 480
-
-        track, voice_part = self._build_ustx_track(
-            title=title, segments=segments, f0=f0, t=t, config=config,
-            midi_notes=midi_notes, track_no=0,
-        )
-
+        # ── 4. 顶层项目结构 ──────────────────────────────────────────────────
         project_obj = {
             "name":        title,
             "comment":     "",
@@ -1337,75 +1421,6 @@ class TsubakiProcessor:
             "expressions":      self._get_default_expressions(),
             "tracks":           [track],
             "voice_parts":      [voice_part],
-            "wave_parts":       [],
-        }
-
-        yaml = YAML()
-        yaml.default_flow_style               = False
-        yaml.allow_unicode                    = True
-        yaml.sort_base_mapping_type_on_output = False
-
-        stream = StringIO()
-        yaml.dump(project_obj, stream)
-        return stream.getvalue()
-
-    def _build_utau_multi_track_project_text(
-        self,
-        title: str,
-        track_inputs: List[Dict],
-        config: AudioProcessingConfig,
-    ) -> str:
-        """
-        生成多轨 USTX 工程（对话文本框批量处理用）：每个 track_inputs 元素
-        对应一个对话框，成为工程文件里的一条独立音轨 + voice_part，而不是
-        分别导出多个工程文件。
-
-        Parameters
-        ----------
-        track_inputs : list of dict，每个 dict 支持的键：
-            name (str), segments (List[LabelSegment]),
-            f0 / t (Optional[np.ndarray]), midi_notes (Optional[List])
-
-        说明：与 SVP/VSQX 一样，USTX 全局只有一条 tempo，所有音轨共用
-        调用方传入的同一个 config.bpm；每条音轨的音符 position 都从 0
-        开始，不做音轨间的时间偏移。
-        """
-        from ruamel.yaml import YAML
-        from io import StringIO
-
-        resolution = 480
-
-        tracks: List[Dict] = []
-        voice_parts: List[Dict] = []
-
-        for idx, item in enumerate(track_inputs):
-            track, voice_part = self._build_ustx_track(
-                title=item.get("name") or f"{title} #{idx + 1}",
-                segments=item["segments"],
-                f0=item.get("f0"),
-                t=item.get("t"),
-                config=config,
-                midi_notes=item.get("midi_notes"),
-                track_no=idx,
-            )
-            tracks.append(track)
-            voice_parts.append(voice_part)
-
-        project_obj = {
-            "name":        title,
-            "comment":     "",
-            "output_dir":  "Vocal",
-            "cache_dir":   "UCache",
-            "ustx_version": "0.6",
-            "resolution":  resolution,
-            "bpm":         float(config.bpm),
-            "beat_per_bar": 4,
-            "beat_unit":    4,
-            "time_signatures": [{"bar_position": 0, "beat_per_bar": 4, "beat_unit": 4}],
-            "tempos":          [{"position": 0, "bpm": float(config.bpm)}],
-            "expressions":      self._get_default_expressions(),
-            "tracks":           tracks,
-            "voice_parts":      voice_parts,
             "wave_parts":       [],
         }
 
@@ -1666,6 +1681,149 @@ class TsubakiProcessor:
             logger.error(f"工程文件生成失败: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
+    # ----------------------------
+    # 多音轨工程文件生成（对话文本框批量处理功能专用）
+    # ----------------------------
+    def build_multitrack_project(
+        self,
+        project_title: str,
+        track_inputs: List[Dict],
+        output_format: str,
+        config: AudioProcessingConfig,
+        word_phoneme_map: bool = False,
+        language: str = "",
+        dict_source: str = "default",
+        vsqx_singer: str = "MIKU_V4_Chinese",
+        vsqx_singer_id: str = "BNGE7CP7EMTRSNC3",
+        vsqx_singer_bs: int = 4,
+    ) -> Dict:
+        """
+        对话文本框批量处理功能的工程文件生成入口：每个对话框对应一条音轨，
+        全部写入同一个工程文件（而非分别导出多个独立工程文件）。
+
+        Parameters
+        ----------
+        project_title : 工程文件标题 / 输出文件名（不含扩展名）
+        track_inputs : 每个元素描述一个已完成对齐的对话框：
+            {
+                "title": str,             # 音轨名称（对话框文本前若干字符，或文件名）
+                "wav_path": str,          # 该对话框的音频文件路径（必须存在）
+                "lab_path": str,          # 该对话框的 LAB 标注文件路径（必须存在）
+                "original_text": str,     # 原始歌词/台词文本，用于 word_phoneme_map 防误判（可选）
+            }
+            调用方负责保证列表顺序即为对话框顺序（tNo / dispOrder 按此顺序递增）。
+        output_format : 仅支持 "sv"（Synthesizer V .svp）与 "vsqx"（VOCALOID4 .vsqx）；
+            多音轨概念不适用于 MIDI（单一音轨标准）与 USTX（当前未实现多轨支持）。
+        config : 全局共享的音频处理配置（对话文本框页面顶部"高级设置"统一生效，
+            所有音轨共用同一个 bpm / F0 提取参数）
+        word_phoneme_map / language / dict_source : 全局共享的单词→音素映射设置
+        vsqx_singer / vsqx_singer_id / vsqx_singer_bs : 全部音轨共用同一个 VSQX 声库
+
+        Returns
+        -------
+        Dict : {"success": True, "output_path": str, "format": str, "track_count": int}
+               或 {"success": False, "error": str}
+        """
+        try:
+            fmt = self._normalize_output_format(output_format)
+            if fmt not in ("sv", "vsqx"):
+                return {
+                    "success": False,
+                    "error": f"对话文本框批量处理暂不支持多音轨输出格式: {output_format}（仅支持 sv / vsqx）",
+                }
+
+            if not track_inputs:
+                return {"success": False, "error": "没有可用于生成工程文件的音轨（所有对话框均被跳过）"}
+
+            resolved_tracks: List[Dict] = []
+            for tr in track_inputs:
+                wav_path = tr.get("wav_path")
+                lab_path = tr.get("lab_path")
+                tr_title = tr.get("title") or Path(str(wav_path)).stem
+                original_text = tr.get("original_text", "") or ""
+
+                if not wav_path or not Path(str(wav_path)).exists():
+                    logger.warning("[多音轨] 跳过音轨 %r：WAV 文件不存在 (%s)", tr_title, wav_path)
+                    continue
+                if not lab_path or not Path(str(lab_path)).exists():
+                    logger.warning("[多音轨] 跳过音轨 %r：LAB 文件不存在 (%s)", tr_title, lab_path)
+                    continue
+
+                segments = self._load_lab_segments(str(lab_path))
+
+                # F0 提取（每条音轨独立提取，使用共享的 config 参数）
+                f0_arr, t_arr = None, None
+                try:
+                    audio_data = self.process_audio_f0(str(wav_path), config)
+                    if audio_data and audio_data.get("success"):
+                        f0_arr = audio_data.get("f0")
+                        t_arr  = audio_data.get("t")
+                    else:
+                        logger.warning(
+                            "[多音轨] 音轨 %r F0 提取失败(%s)，该音轨将不含音高曲线",
+                            tr_title, (audio_data or {}).get("error", "unknown"),
+                        )
+                except Exception as _f0_err:
+                    logger.warning("[多音轨] 音轨 %r F0 提取异常: %s，该音轨将不含音高曲线", tr_title, _f0_err)
+
+                # word_phoneme_map 的原始文本预提取英语单词集合（防拼音误判）
+                native_english_words: Optional[set] = None
+                _lang_norm = (language or "").lower().strip().rstrip("-")
+                if word_phoneme_map and _lang_norm not in ("en", "eng", "english") and original_text:
+                    try:
+                        from phoneme_converter import extract_native_english_words
+                        native_english_words = extract_native_english_words(original_text)
+                    except Exception as _nee_err:
+                        logger.warning("[多音轨] 音轨 %r 预提取英语单词失败: %s，回退词典查询", tr_title, _nee_err)
+
+                resolved_tracks.append({
+                    "title": tr_title,
+                    "segments": segments,
+                    "f0": f0_arr,
+                    "t": t_arr,
+                    "native_english_words": native_english_words,
+                })
+
+            if not resolved_tracks:
+                return {"success": False, "error": "没有任何音轨成功加载（WAV/LAB 均缺失或无法读取）"}
+
+            if fmt == "sv":
+                project_text = self.build_svp_project_text_multitrack(
+                    project_title=project_title,
+                    tracks=resolved_tracks,
+                    config=config,
+                    word_phoneme_map=word_phoneme_map,
+                    language=language,
+                    dict_source=dict_source,
+                )
+                out_path = self.work_dir / f"{project_title}.svp"
+            else:  # fmt == "vsqx"
+                project_text = self.build_vsqx_project_text_multitrack(
+                    project_title=project_title,
+                    tracks=resolved_tracks,
+                    config=config,
+                    vsqx_singer=vsqx_singer,
+                    vsqx_singer_id=vsqx_singer_id,
+                    vsqx_singer_bs=vsqx_singer_bs,
+                    word_phoneme_map=word_phoneme_map,
+                    language=language,
+                    dict_source=dict_source,
+                )
+                out_path = self.work_dir / f"{project_title}.vsqx"
+
+            out_path.write_text(project_text, encoding="utf-8")
+
+            return {
+                "success":     True,
+                "output_path": str(out_path),
+                "format":      fmt,
+                "track_count": len(resolved_tracks),
+            }
+
+        except Exception as e:
+            logger.error(f"多音轨工程文件生成失败: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+
     def _midi_lyrics_to_words(self, midi_lyrics) -> List[str]:
         """
         把 MIDI lyrics meta event 转成顺序词表。
@@ -1733,9 +1891,10 @@ class TsubakiProcessor:
     # ----------------------------
     # VSQX 生成
     # ----------------------------
-    def _build_vsqx_track_xml(
+    def _build_vsqx_track_block(
         self,
-        title: str,
+        tNo: int,
+        name: str,
         segments: List[LabelSegment],
         f0: Optional[np.ndarray],
         t: Optional[np.ndarray],
@@ -1746,30 +1905,33 @@ class TsubakiProcessor:
         language: str = "",
         native_english_words: Optional[set] = None,
         dict_source: str = "default",
-        track_no: int = 0,
     ) -> str:
         """
-        构建单条 VSQX 音轨（<vsTrack>...</vsTrack> 完整片段）。
+        构建单条 VSQX <vsTrack> XML 块（tNo / vsPart / 音符 / 音高曲线）。
 
-        从 _build_vsqx_project_text 中抽取出的"单轨"计算逻辑，供单轨
-        （_build_vsqx_project_text）与多轨（_build_vsqx_multi_track_project_text，
-        对话文本框批量处理用）共用。抽取过程未改动任何计算细节，单轨调用方
-        输出与抽取前完全一致（track_no 固定为 0）。
+        供单音轨 (_build_vsqx_project_text) 与多音轨
+        (build_vsqx_project_text_multitrack，对话文本框批量处理功能) 共用，
+        避免逻辑重复导致行为不一致。tNo 由调用方指定（单音轨固定为 0，
+        多音轨按对话框顺序 0..N-1 递增）。
         """
-        RESOLUTION  = 480
-        PBS         = 12
-        PART_OFFSET = 1920
+        RESOLUTION  = 480        # ticks per quarter note
+        PBS         = 12         # pitch bend sensitivity (semitones)
+        PART_OFFSET = 1920       # vsPart start tick (preMeasure=1, 4/4)
         VELOCITY    = 64
         bpm = float(config.bpm)
 
         def sec_to_ticks(sec: float) -> int:
+            """秒 → vsPart 内部 tick（相对偏移）"""
             return int(round(float(sec) * (bpm / 60.0) * RESOLUTION))
 
         base_tone = int(config.base_pitch)
 
-        note_entries: List[Tuple[int, int, int, str, str]] = []
-        voiced_refs:  List[Tuple[int, int, int]]           = []
+        # ── ① 构建音符列表 ──────────────────────────────────────────────────
+        # voiced_refs 用于音高曲线中查找该 tick 对应的音符 tone
+        note_entries: List[Tuple[int, int, int, str, str]] = []  # (t_on, dur, tone, lyric, p_tag)
+        voiced_refs:  List[Tuple[int, int, int]]           = []  # (t_on, t_off, tone)
 
+        # 预加载 word_phoneme_map 所需函数（惰性导入，只在功能开启时触发）
         _word_to_arpabet   = None
         _arpabet_to_vocaloid4 = None
         if word_phoneme_map:
@@ -1792,6 +1954,7 @@ class TsubakiProcessor:
             t_off = max(t_on + 1, sec_to_ticks(end_sec))
             dur   = t_off - t_on
 
+            # 音高：MIDI / F0细化 / base_pitch 三级优先
             tone = base_tone
             if midi_notes is not None:
                 from midi_processor import map_segment_to_midi_pitch
@@ -1808,6 +1971,12 @@ class TsubakiProcessor:
 
             label = seg.label
 
+            # ── word_phoneme_map：英语单词 → VOCALOID4 音素 + 锁定 ───────────
+            # <p></p>                    → VOCALOID 自带 G2P（默认）
+            # <p lock="1"><![CDATA[…]]></p>  → 手工音素 + 锁定（phoneme lock）
+            # 语言守卫：优先用 native_english_words（从原始文本预提取的集合）
+            # 判断，彻底消除"拼音碰巧是英语词"的误判（rang/wang/dong/shi 等）。
+            # 若未提供集合则回退词典查询（兼容旧调用路径）。
             p_tag = '<p></p>'
             if (
                 word_phoneme_map
@@ -1817,6 +1986,11 @@ class TsubakiProcessor:
                 try:
                     v4_phones: Optional[str] = None
 
+                    # ── 优先查询用户自定义词典 ──────────────────────────────
+                    # "vocaloid" 来源：词条已是 VOCALOID4 记号，直接使用，
+                    #   跳过 arpabet_to_vocaloid4 转换（否则会被错误地二次转换）。
+                    # "synthesizerv" 来源：词条是 ARPABET 记号，仍需转换成
+                    #   VOCALOID4 记号后才能写入 <p lock="1">。
                     if dict_source in ("vocaloid", "synthesizerv"):
                         from dictionary_manager import lookup_word as _dict_lookup
                         user_phones_str = _dict_lookup(label, dict_source)
@@ -1850,10 +2024,11 @@ class TsubakiProcessor:
             note_entries.append((t_on, dur, tone, label, p_tag))
             voiced_refs.append((t_on, t_off, tone))
 
-        # ── 音高曲线（P 控制器）───────────────────────────────────────────
+        # ── ② 音高曲线（P 控制器）───────────────────────────────────────────
         pit_lines: List[str] = []
         if config.export_pitch_line and f0 is not None and t is not None and len(f0) > 0:
             prev_val: Optional[int] = None
+            # voiced_refs 已按时间顺序
             vr_arr = np.array(voiced_refs, dtype=np.int64) if voiced_refs else None
 
             for ti, f0i in zip(t, f0):
@@ -1862,30 +2037,37 @@ class TsubakiProcessor:
                 tick    = sec_to_ticks(float(ti))
                 midi_f0 = 69.0 + 12.0 * np.log2(float(f0i) / 440.0)
 
+                # 二分查找当前 tick 所属音符的 tone
                 nominal = base_tone
                 if vr_arr is not None and len(vr_arr):
                     idx = int(np.searchsorted(vr_arr[:, 0], tick, side="right")) - 1
                     if 0 <= idx < len(vr_arr) and tick <= vr_arr[idx, 1]:
                         nominal = int(vr_arr[idx, 2])
 
+                # 偏移量（半音）→ P 控制器值（范围 ±8190）
                 p_val = int(round((midi_f0 - nominal) / PBS * 8190))
                 p_val = max(-8190, min(8190, p_val))
 
+                # 压缩相邻重复值
                 if p_val != prev_val:
                     pit_lines.append(
                         f'\t\t\t<cc><t>{tick}</t><v id="P">{p_val}</v></cc>'
                     )
                     prev_val = p_val
 
+        # ── ③ 计算 vsPart 总长度 ─────────────────────────────────────────────
         if note_entries:
             play_time = max(t_on + dur for t_on, dur, *_ in note_entries) + RESOLUTION
         else:
-            play_time = RESOLUTION * 4
+            play_time = RESOLUTION * 4   # 至少一小节
 
+        # ── ④ 生成 XML ───────────────────────────────────────────────────────
+        # 首行：PBS 设置（必须在其他 cc 之前）
         pit_block = f'\t\t\t<cc><t>0</t><v id="S">{PBS}</v></cc>\n'
         if pit_lines:
             pit_block += "\n".join(pit_lines) + "\n"
 
+        # 音符块
         note_block = ""
         for t_on, dur, tone, lyric, p_tag in note_entries:
             note_block += (
@@ -1904,17 +2086,17 @@ class TsubakiProcessor:
 
         track_xml = (
             '\t<vsTrack>\n'
-            f'\t\t<tNo>{track_no}</tNo>\n'
-            f'\t\t<name><![CDATA[{title}]]></name>\n'
+            f'\t\t<tNo>{tNo}</tNo>\n'
+            f'\t\t<n><![CDATA[{name}]]></n>\n'
             '\t\t<comment><![CDATA[Track]]></comment>\n'
             '\t\t<vsPart>\n'
             f'\t\t\t<t>{PART_OFFSET}</t>\n'
             f'\t\t\t<playTime>{play_time}</playTime>\n'
-            '\t\t\t<name><![CDATA[NewPart]]></name>\n'
+            '\t\t\t<n><![CDATA[NewPart]]></n>\n'
             '\t\t\t<comment><![CDATA[New Musical Part]]></comment>\n'
             '\t\t\t<sPlug>\n'
             '\t\t\t\t<id><![CDATA[ACA9C502-A04B-42b5-B2EB-5CEA36D16FCE]]></id>\n'
-            '\t\t\t\t<name><![CDATA[VOCALOID2 Compatible Style]]></name>\n'
+            '\t\t\t\t<n><![CDATA[VOCALOID2 Compatible Style]]></n>\n'
             '\t\t\t\t<version><![CDATA[3.0.0.1]]></version>\n'
             '\t\t\t</sPlug>\n'
             '\t\t\t<pStyle>\n'
@@ -1939,11 +2121,11 @@ class TsubakiProcessor:
         return track_xml
 
     @staticmethod
-    def _vsqx_unit_xml(track_no: int) -> str:
-        """构建单条 <vsUnit>（mixer 中每条音轨对应的音量/声像单元）。"""
+    def _vsqx_vs_unit_block(tNo: int) -> str:
+        """mixer.vsUnit 块（每条音轨一个，tNo 与对应 vsTrack 一致）。"""
         return (
             '\t\t<vsUnit>\n'
-            f'\t\t\t<tNo>{track_no}</tNo>\n'
+            f'\t\t\t<tNo>{tNo}</tNo>\n'
             '\t\t\t<iGin>0</iGin>\n'
             '\t\t\t<sLvl>-898</sLvl>\n'
             '\t\t\t<sEnable>0</sEnable>\n'
@@ -1974,7 +2156,7 @@ class TsubakiProcessor:
         dict_source: str = "default",      # 单词→音素词典来源："default"/"synthesizerv"/"vocaloid"
     ) -> str:
         """
-        生成 VOCALOID4 VSQX 工程文件（XML 格式，单轨）。
+        生成 VOCALOID4 VSQX 工程文件（XML 格式，单音轨）。
 
         格式要点
         ────────
@@ -1988,21 +2170,28 @@ class TsubakiProcessor:
         • 歌词 <y>：使用 segment label；<p> 音素字段留空，
           由 VOCALOID 自带 G2P 处理（用户可在 VOCALOID Editor 中手动编辑）。
 
-        实际的单轨音符/音高计算已抽取到 _build_vsqx_track_xml()，本函数只负责
-        调用一次（track_no=0）并组装成完整工程；多轨版本见
-        _build_vsqx_multi_track_project_text()。
+        实际的音符 / 音高曲线 / <vsTrack> XML 构建逻辑已提取到
+        _build_vsqx_track_block()，与对话文本框批量处理功能的多音轨生成器
+        共用，本方法只负责组装单音轨的 vVoiceTable/mixer/masterTrack 等
+        工程级别结构，并拼接唯一一条 <vsTrack>（tNo=0）。
         """
         bpm = float(config.bpm)
-        tempo_v = int(round(bpm * 100))
+        tempo_v = int(round(bpm * 100))   # VSQX tempo value = BPM × 100
 
-        track_xml = self._build_vsqx_track_xml(
-            title=title, segments=segments, f0=f0, t=t, config=config,
-            midi_notes=midi_notes, vsqx_singer_bs=vsqx_singer_bs,
-            word_phoneme_map=word_phoneme_map, language=language,
-            native_english_words=native_english_words, dict_source=dict_source,
-            track_no=0,
+        track_xml = self._build_vsqx_track_block(
+            tNo=0,
+            name=title,
+            segments=segments,
+            f0=f0,
+            t=t,
+            config=config,
+            midi_notes=midi_notes,
+            vsqx_singer_bs=vsqx_singer_bs,
+            word_phoneme_map=word_phoneme_map,
+            language=language,
+            native_english_words=native_english_words,
+            dict_source=dict_source,
         )
-        vs_unit_xml = self._vsqx_unit_xml(0)
 
         xml = (
             '<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n'
@@ -2017,7 +2206,7 @@ class TsubakiProcessor:
             f'\t\t\t<bs>{vsqx_singer_bs}</bs>\n'
             '\t\t\t<pc>0</pc>\n'
             f'\t\t\t<id><![CDATA[{vsqx_singer_id}]]></id>\n'
-            f'\t\t\t<name><![CDATA[{vsqx_singer}]]></name>\n'
+            f'\t\t\t<n><![CDATA[{vsqx_singer}]]></n>\n'
             '\t\t\t<vPrm>\n'
             '\t\t\t\t<bre>0</bre>\n'
             '\t\t\t\t<bri>0</bri>\n'
@@ -2033,8 +2222,8 @@ class TsubakiProcessor:
             '\t\t\t<rLvl>0</rLvl>\n'
             '\t\t\t<vol>0</vol>\n'
             '\t\t</masterUnit>\n'
-            + vs_unit_xml +
-            '\t\t<monoUnit>\n'
+            + self._vsqx_vs_unit_block(0)
+            + '\t\t<monoUnit>\n'
             '\t\t\t<iGin>0</iGin>\n'
             '\t\t\t<sLvl>-898</sLvl>\n'
             '\t\t\t<sEnable>0</sEnable>\n'
@@ -2058,8 +2247,8 @@ class TsubakiProcessor:
             '\t\t<timeSig><m>0</m><nu>4</nu><de>4</de></timeSig>\n'
             f'\t\t<tempo><t>0</t><v>{tempo_v}</v></tempo>\n'
             '\t</masterTrack>\n'
-            + track_xml +
-            '\t<monoTrack>\n'
+            + track_xml
+            + '\t<monoTrack>\n'
             '\t</monoTrack>\n'
             '\t<stTrack>\n'
             '\t</stTrack>\n'
@@ -2073,49 +2262,70 @@ class TsubakiProcessor:
         )
         return xml
 
-    def _build_vsqx_multi_track_project_text(
+    # ----------------------------
+    # VSQX 多音轨生成（对话文本框批量处理功能专用）
+    # ----------------------------
+    def build_vsqx_project_text_multitrack(
         self,
-        title: str,
-        track_inputs: List[Dict],
+        project_title: str,
+        tracks: List[Dict],
         config: AudioProcessingConfig,
         vsqx_singer: str = "MIKU_V4_Chinese",
         vsqx_singer_id: str = "BNGE7CP7EMTRSNC3",
         vsqx_singer_bs: int = 4,
+        word_phoneme_map: bool = False,
+        language: str = "",
+        dict_source: str = "default",
     ) -> str:
         """
-        生成多轨 VSQX 工程（对话文本框批量处理用）：每个 track_inputs 元素
-        对应一个对话框，成为工程文件里的一条独立 <vsTrack>，而不是分别导出
-        多个工程文件。所有音轨共用同一个 VOCALOID 声库（与单文件处理页面
-        "相同的高级功能"面板保持一致，批量页面不支持逐行单独选择音源）。
+        生成包含多条音轨的 VSQX 工程文件（对话文本框批量处理功能）：
+        每个对话框对应一条独立 <vsTrack>，全部写入*同一个* .vsqx 工程文件。
 
         Parameters
         ----------
-        track_inputs : list of dict，每个 dict 支持的键：
-            name, segments, f0, t, midi_notes,
-            word_phoneme_map, language, native_english_words, dict_source
+        project_title : 工程文件标题（写入 masterTrack.seqName）
+        tracks : 每个元素描述一条音轨：
+            {
+                "title": str,                            # 音轨名称（对话框文本/文件名）
+                "segments": List[LabelSegment],
+                "f0": Optional[np.ndarray],
+                "t": Optional[np.ndarray],
+                "native_english_words": Optional[set],
+            }
+        config : 全局共享的音频处理配置（对话文本框页面顶部"高级设置"统一生效）
+        vsqx_singer / vsqx_singer_id / vsqx_singer_bs : 全部音轨共用同一个声库
+            （与单文件处理页面一致，本功能不支持逐音轨指定不同声库）
+        word_phoneme_map / language / dict_source : 全局共享的单词→音素映射设置
+
+        Returns
+        -------
+        str : VSQX XML 文本，包含 len(tracks) 条 <vsTrack> 与对应数量的
+              mixer.vsUnit（tNo 与 vsTrack 一一对应，从 0 开始）
         """
         bpm = float(config.bpm)
         tempo_v = int(round(bpm * 100))
 
-        track_xmls: List[str] = []
-        unit_xmls: List[str] = []
+        track_blocks = ""
+        vs_unit_blocks = ""
 
-        for idx, item in enumerate(track_inputs):
-            track_xmls.append(self._build_vsqx_track_xml(
-                title=item.get("name") or f"{title} #{idx + 1}",
-                segments=item["segments"],
-                f0=item.get("f0"),
-                t=item.get("t"),
+        for idx, tr in enumerate(tracks):
+            tr_title = tr.get("title") or f"Track {idx + 1}"
+
+            track_blocks += self._build_vsqx_track_block(
+                tNo=idx,
+                name=tr_title,
+                segments=tr.get("segments") or [],
+                f0=tr.get("f0"),
+                t=tr.get("t"),
                 config=config,
-                midi_notes=item.get("midi_notes"),
+                midi_notes=None,   # 对话文本框批量处理不支持 MIDI 导入
                 vsqx_singer_bs=vsqx_singer_bs,
-                word_phoneme_map=item.get("word_phoneme_map", False),
-                language=item.get("language", ""),
-                native_english_words=item.get("native_english_words"),
-                dict_source=item.get("dict_source", "default"),
-                track_no=idx,
-            ))
-            unit_xmls.append(self._vsqx_unit_xml(idx))
+                word_phoneme_map=word_phoneme_map,
+                language=language,
+                native_english_words=tr.get("native_english_words"),
+                dict_source=dict_source,
+            )
+            vs_unit_blocks += self._vsqx_vs_unit_block(idx)
 
         xml = (
             '<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n'
@@ -2130,7 +2340,7 @@ class TsubakiProcessor:
             f'\t\t\t<bs>{vsqx_singer_bs}</bs>\n'
             '\t\t\t<pc>0</pc>\n'
             f'\t\t\t<id><![CDATA[{vsqx_singer_id}]]></id>\n'
-            f'\t\t\t<name><![CDATA[{vsqx_singer}]]></name>\n'
+            f'\t\t\t<n><![CDATA[{vsqx_singer}]]></n>\n'
             '\t\t\t<vPrm>\n'
             '\t\t\t\t<bre>0</bre>\n'
             '\t\t\t\t<bri>0</bri>\n'
@@ -2146,8 +2356,8 @@ class TsubakiProcessor:
             '\t\t\t<rLvl>0</rLvl>\n'
             '\t\t\t<vol>0</vol>\n'
             '\t\t</masterUnit>\n'
-            + "".join(unit_xmls) +
-            '\t\t<monoUnit>\n'
+            + vs_unit_blocks
+            + '\t\t<monoUnit>\n'
             '\t\t\t<iGin>0</iGin>\n'
             '\t\t\t<sLvl>-898</sLvl>\n'
             '\t\t\t<sEnable>0</sEnable>\n'
@@ -2164,15 +2374,15 @@ class TsubakiProcessor:
             '\t\t</stUnit>\n'
             '\t</mixer>\n'
             '\t<masterTrack>\n'
-            f'\t\t<seqName><![CDATA[{title}]]></seqName>\n'
+            f'\t\t<seqName><![CDATA[{project_title}]]></seqName>\n'
             '\t\t<comment><![CDATA[New VSQ File]]></comment>\n'
             '\t\t<resolution>480</resolution>\n'
             '\t\t<preMeasure>1</preMeasure>\n'
             '\t\t<timeSig><m>0</m><nu>4</nu><de>4</de></timeSig>\n'
             f'\t\t<tempo><t>0</t><v>{tempo_v}</v></tempo>\n'
             '\t</masterTrack>\n'
-            + "".join(track_xmls) +
-            '\t<monoTrack>\n'
+            + track_blocks
+            + '\t<monoTrack>\n'
             '\t</monoTrack>\n'
             '\t<stTrack>\n'
             '\t</stTrack>\n'
