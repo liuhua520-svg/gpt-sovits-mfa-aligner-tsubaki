@@ -530,6 +530,19 @@
 				  </el-col>
 				</el-row>
 
+				<el-row v-if="showWordPhonemeMap && wordPhonemeMap" :gutter="20">
+				  <el-col :span="24">
+					<el-form-item :label="t('processor.dictSource')">
+					  <el-select v-model="dictSource" style="width: 240px">
+						<el-option value="default" :label="t('processor.dictSourceDefault')" />
+						<el-option value="synthesizerv" :label="t('processor.dictSourceSynthesizerV')" />
+						<el-option value="vocaloid" :label="t('processor.dictSourceVocaloid')" />
+					  </el-select>
+					  <div class="dict-source-hint">{{ t('processor.dictSourceHint') }}</div>
+					</el-form-item>
+				  </el-col>
+				</el-row>
+
             <el-alert type="info" :closable="false" show-icon class="settings-info">
               <template #title>💡 {{ t('processor.advancedHelpTitle') }}</template>
               <p><strong>BPM:</strong> {{ t('processor.advancedHelpBpm') }}</p>
@@ -886,6 +899,7 @@ interface SystemStatus {
 const processingMode = ref<ProcessingMode>('mfa-only')
 const englishWordAlign = ref<boolean>(false)  // 英语单词级对齐（不做 ARPABET 音素拆分）
 const wordPhonemeMap   = ref<boolean>(false)  // 英语单词 → 音素映射（SVP phonemes / VSQX <p lock="1">）
+const dictSource        = ref<string>('default')  // 单词→音素词典来源："default"/"synthesizerv"/"vocaloid"
 const alignerBackend = ref<string>('mfa')   // 对齐后端选择
 const alignerStatus = ref<Record<string, any>>({
   whisperx:      { available: false, message: t('processor.backendStatusChecking') },
@@ -1003,13 +1017,21 @@ const isTextOptional = computed(() =>
 )
 
 // 控制整个表单项是否显示
+// 【历史 bug 修复】原逻辑写死要求 processingMode === 'full'，导致
+// project-only 模式下选择 vsqx/sv 输出格式时，该开关永远不出现——
+// project-only 模式下并不存在"对齐"环节，本就不该被 englishWordAlign
+// 约束；只有 full 模式（触发 MFA/WhisperX 等对齐）下才需要这个前置条件，
+// 因为 word_phoneme_map 假设 LAB 的每个 label 是完整单词而非拆分后的
+// 单个音素（这正是 englishWordAlign 控制的行为）。
 const showWordPhonemeMap = computed(() => {
   const format = formData.value.outputFormat?.toLowerCase() || ''
   const isSupportedFormat = format.includes('sv') || format.includes('vsqx')
-  
-  return englishWordAlign.value &&
-    processingMode.value === 'full' &&
-    isSupportedFormat
+  const isProjectProducingMode =
+    processingMode.value === 'full' || processingMode.value === 'project-only'
+  const alignGuardOk =
+    processingMode.value === 'full' ? englishWordAlign.value : true
+
+  return isProjectProducingMode && isSupportedFormat && alignGuardOk
 })
 
 // 根据格式动态返回提示文本
@@ -1377,7 +1399,13 @@ if (processingMode.value === 'project-only') {
     formDataObj.append('f0_ceil', advancedConfig.value.f0_ceil.toString())
     formDataObj.append('auto_note_pitch', advancedConfig.value.auto_note_pitch.toString())
     formDataObj.append('export_pitch_line', advancedConfig.value.export_pitch_line.toString())
-    formDataObj.append('word_phoneme_map', 'false')  // project-only 模式不依赖 englishWordAlign，默认关闭
+    // 【历史 bug 修复】project-only 模式此前写死传 'false'，导致开关形同虚设；
+    // project-only 不存在对齐环节，不受 englishWordAlign 约束，只看开关本身 + 输出格式。
+    formDataObj.append('word_phoneme_map', (
+      wordPhonemeMap.value &&
+      (formData.value.outputFormat === 'sv' || formData.value.outputFormat === 'vsqx')
+    ).toString())
+    formDataObj.append('dict_source', dictSource.value)
 
     // 只传一个标注文件：LAB 或 MIDI 二选一
     if (notationExt === 'lab') {
@@ -1500,6 +1528,7 @@ if (processingMode.value === 'project-only') {
         englishWordAlign.value &&
         (formData.value.outputFormat === 'sv' || formData.value.outputFormat === 'vsqx')
       ).toString())
+      formDataObj.append('dict_source', dictSource.value)
     }
 
     progressTimer = window.setInterval(() => {
@@ -1685,6 +1714,13 @@ const newProcess = () => {
 /* 样式部分保持不变 */
 .processor-container {
   width: 100%;
+}
+
+.dict-source-hint {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #909399;
+  line-height: 1.5;
 }
 
 .processor-card {
