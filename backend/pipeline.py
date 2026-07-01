@@ -190,6 +190,7 @@ class AudioProcessingPipeline:
         vsqx_singer_id: str = "BNGE7CP7EMTRSNC3",       # ← VSQX 声库 ID
         vsqx_singer_bs: int = 4,                         # ← VSQX 声库 Bank Select（VOCALOID4 内部编号）
         word_phoneme_map: bool = False,                  # ← 英语单词 → 音素写入（SVP/VSQX）
+        dict_source: str = "default",                     # ← 单词→音素词典来源
     ) -> Dict:
         config = AudioProcessingConfig(
             bpm=bpm,
@@ -274,6 +275,7 @@ class AudioProcessingPipeline:
                 word_phoneme_map=word_phoneme_map,
                 language=language,
                 original_text=text,        # ← 原始汉字/韩文文本，用于预提取真实英语单词
+                dict_source=dict_source,
             )
 
             if not project_result.get("success"):
@@ -395,6 +397,7 @@ class AudioProcessingPipeline:
         word_phoneme_map: bool = False,                   # ← 英语单词 → 音素写入（SVP/VSQX）
         language: str = "",                               # ← 语种，传给构建器防误判
         original_text: str = "",                          # ← 原始歌词文本（汉字/韩文），用于预提取英语单词
+        dict_source: str = "default",                      # ← 单词→音素词典来源
     ) -> Dict:
         """仅执行工程文件生成（已有 WAV 以及 LAB/MIDI 之一）"""
         import time
@@ -461,6 +464,7 @@ class AudioProcessingPipeline:
                 word_phoneme_map=word_phoneme_map,
                 language=language,
                 original_text=original_text,   # ← 透传原始文本（仅生成工程模式下可选提供）
+                dict_source=dict_source,
             )
 
             result["processing_time"] = int((time.time() - start_time) * 1000)

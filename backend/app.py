@@ -13,19 +13,22 @@ import os
 import re
 import sys
 import uuid
+import json
 import logging
 import webbrowser
 from threading import Thread
 from time import sleep
 from pathlib import Path
 
-from flask import Flask, request, jsonify, send_from_directory, abort
+from flask import Flask, request, jsonify, send_from_directory, abort, Response
 from flask_cors import CORS
 
 from mfa_utils import MFAChecker
 from mfa_processor import MFAProcessor
 from pipeline import AudioProcessingPipeline
 from alt_aligners import get_alt_aligner_status
+import dictionary_manager
+import app_settings
 
 logging.basicConfig(
     level=logging.INFO,
@@ -304,6 +307,145 @@ def pipeline_formats():
         }), 500
 
 
+# =====================================================================
+# 单词 → 音素 用户词典（功能 1）
+# 来源固定为 "synthesizerv" / "vocaloid" 两种，不支持 OpenUTAU。
+# =====================================================================
+
+@app.route("/api/dictionary/<source>", methods=["GET"])
+def dictionary_list(source):
+    """列出指定来源词典的全部词条"""
+    try:
+        entries = dictionary_manager.list_entries(source)
+        return jsonify({
+            "success": True,
+            "source": source,
+            "entries": entries,
+            "count": len(entries),
+        }), 200
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+@app.route("/api/dictionary/<source>/entry", methods=["POST"])
+def dictionary_upsert(source):
+    """新增或更新单个词条"""
+    data = request.get_json(force=True, silent=True) or {}
+    word = data.get("word", "")
+    phonemes = data.get("phonemes", "")
+    try:
+        dictionary_manager.upsert_entry(source, word, phonemes)
+        return jsonify({"success": True}), 200
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+@app.route("/api/dictionary/<source>/entry", methods=["DELETE"])
+def dictionary_delete(source):
+    """删除单个词条"""
+    data = request.get_json(force=True, silent=True) or {}
+    word = data.get("word", "") or request.args.get("word", "")
+    try:
+        existed = dictionary_manager.delete_entry(source, word)
+        if not existed:
+            return jsonify({"success": False, "error": "词条不存在"}), 404
+        return jsonify({"success": True}), 200
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+@app.route("/api/dictionary/<source>/export", methods=["GET"])
+def dictionary_export(source):
+    """导出词典。?format=json（默认，直接返回 JSON）或 ?format=csv（文件下载）"""
+    fmt = request.args.get("format", "json").lower()
+    try:
+        if fmt == "csv":
+            csv_text = dictionary_manager.export_csv(source)
+            return Response(
+                csv_text,
+                mimetype="text/csv",
+                headers={
+                    "Content-Disposition": f"attachment; filename={source}_dictionary.csv"
+                },
+            )
+        data = dictionary_manager.export_json(source)
+        return jsonify({"success": True, "source": source, "data": data}), 200
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+@app.route("/api/dictionary/<source>/import", methods=["POST"])
+def dictionary_import(source):
+    """
+    导入词典。支持两种方式：
+      1) multipart/form-data 上传文件（file 字段，.csv 或 .json），
+         可选 overwrite 表单字段（默认 true）
+      2) application/json 请求体 {"entries": {"WORD": "phones", ...}, "overwrite": true}
+    """
+    try:
+        if "file" in request.files:
+            f = request.files["file"]
+            overwrite = request.form.get("overwrite", "true").lower() != "false"
+            filename = (f.filename or "").lower()
+            raw = f.read().decode("utf-8-sig")
+
+            if filename.endswith(".json"):
+                payload = json.loads(raw)
+                entries = payload.get(source, payload) if isinstance(payload, dict) else {}
+                if not isinstance(entries, dict):
+                    return jsonify({"success": False, "error": "JSON 格式不正确"}), 400
+                added, updated = dictionary_manager.bulk_import(source, entries, overwrite=overwrite)
+            else:
+                added, updated = dictionary_manager.import_csv_text(source, raw, overwrite=overwrite)
+        else:
+            payload = request.get_json(force=True, silent=True) or {}
+            entries = payload.get("entries", {})
+            overwrite = bool(payload.get("overwrite", True))
+            added, updated = dictionary_manager.bulk_import(source, entries, overwrite=overwrite)
+
+        return jsonify({"success": True, "added": added, "updated": updated}), 200
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"词典导入失败: {e}", exc_info=True)
+        return jsonify({"success": False, "error": f"导入失败: {str(e)}"}), 500
+
+
+# =====================================================================
+# 应用设置：模型自动更新 / 镜像站下载（功能 2）
+# =====================================================================
+
+@app.route("/api/settings", methods=["GET"])
+def get_settings():
+    try:
+        settings = app_settings.load_settings()
+        return jsonify({"success": True, "settings": settings}), 200
+    except Exception as e:
+        logger.error(f"读取设置失败: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/settings", methods=["POST"])
+def update_settings():
+    """
+    更新设置并写入共享配置文件。
+    注意：HF_HUB_OFFLINE / HF_ENDPOINT 只在进程启动时读取一次，
+    保存后需要重启 Qwen3 / NeMo 微服务（以及必要时重启主服务）才会真正生效，
+    这一点由前端在保存成功后用提示告知用户。
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        settings = app_settings.save_settings(data)
+        return jsonify({
+            "success": True,
+            "settings": settings,
+            "message": "设置已保存，需要重启对应后端进程（Qwen3 / NeMo 微服务）后生效",
+        }), 200
+    except Exception as e:
+        logger.error(f"保存设置失败: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/upload", methods=["POST"])
 def upload_wav_and_text():
     """上传音频和文本（仅保存，不处理）"""
@@ -399,6 +541,7 @@ def run_pipeline_job(
     vsqx_singer_id: str = "BNGE7CP7EMTRSNC3",
     vsqx_singer_bs: int = 4,
     word_phoneme_map: bool = False,
+    dict_source: str = "default",
 ):
     try: # <--- Added the missing try block here
         class FileStorageWrapper:
@@ -446,6 +589,7 @@ def run_pipeline_job(
             vsqx_singer_id=vsqx_singer_id,
             vsqx_singer_bs=vsqx_singer_bs,
             word_phoneme_map=word_phoneme_map,
+            dict_source=dict_source,
         )
 
         if result.get("success"):
@@ -543,6 +687,10 @@ def pipeline_full_process():
         english_word_align = request.form.get("english_word_align", "false").lower() == "true"
         word_phoneme_map   = request.form.get("word_phoneme_map",   "false").lower() == "true"
 
+        dict_source = request.form.get("dict_source", "default").strip().lower()
+        if dict_source not in ("default", "synthesizerv", "vocaloid"):
+            dict_source = "default"
+
         vsqx_singer    = request.form.get("vsqx_singer",    "MIKU_V4_Chinese")
         vsqx_singer_id = request.form.get("vsqx_singer_id", "BNGE7CP7EMTRSNC3")
         vsqx_singer_bs = int(request.form.get("vsqx_singer_bs", 4))
@@ -602,6 +750,7 @@ def pipeline_full_process():
                 vsqx_singer_id,
                 vsqx_singer_bs,
                 word_phoneme_map,
+                dict_source,
             ),
         ).start()
 
@@ -776,6 +925,7 @@ def run_project_only_job(
     vsqx_singer_id: str = "BNGE7CP7EMTRSNC3",
     vsqx_singer_bs: int = 4,
     word_phoneme_map: bool = False,
+    dict_source: str = "default",
 ):
     try:
         set_job(
@@ -807,6 +957,7 @@ def run_project_only_job(
             vsqx_singer_id=vsqx_singer_id,
             vsqx_singer_bs=vsqx_singer_bs,
             word_phoneme_map=word_phoneme_map,
+            dict_source=dict_source,
         )
 
         if result.get("success"):
@@ -875,6 +1026,10 @@ def pipeline_project_only():
         vsqx_singer_id = request.form.get("vsqx_singer_id", vsqx_singer_id)
         vsqx_singer_bs = int(request.form.get("vsqx_singer_bs", vsqx_singer_bs))
         word_phoneme_map = request.form.get("word_phoneme_map", "false").lower() == "true"
+
+        dict_source = request.form.get("dict_source", "default").strip().lower()
+        if dict_source not in ("default", "synthesizerv", "vocaloid"):
+            dict_source = "default"
 
         if phoneme_mode not in ("none", "merge", "hiragana", "katakana"):
             logger.warning(f"未知 phoneme_mode '{phoneme_mode}'，回退到 'none'")
@@ -987,6 +1142,7 @@ def pipeline_project_only():
                 vsqx_singer_id,
                 vsqx_singer_bs,
                 word_phoneme_map,
+                dict_source,
             ),
         ).start()
 

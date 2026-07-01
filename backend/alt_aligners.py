@@ -155,8 +155,15 @@ os.environ.setdefault("TRANSFORMERS_CACHE",            str(_HF_HUB))
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")   # 消除 Windows 警告
 os.environ["TORCH_HOME"] = str(_TORCH_CACHE)
 
-# 👇 新增这一行，强制 Hugging Face 进入完全离线模式
-os.environ["HF_HUB_OFFLINE"] = "1"
+# HF_HUB_OFFLINE / HF_ENDPOINT（镜像站）由设置页面统一管理，见 app_settings.py。
+# 必须在本文件下方任何 transformers / whisperx 相关的懒加载 import 触发之前
+# 完成设置——此处属于模块顶层，早于所有懒加载函数体，满足这个要求。
+try:
+    from app_settings import apply_env_from_settings as _apply_hf_env_settings
+    _apply_hf_env_settings()
+except Exception as _settings_err:
+    logger.warning(f"⚠️  读取模型下载设置失败（{_settings_err}），回退到默认离线模式")
+    os.environ["HF_HUB_OFFLINE"] = "1"
 
 logger.info(
     f"[alt_aligners] 模型目录: {_MODELS_DIR}\n"
