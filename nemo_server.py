@@ -53,9 +53,15 @@ os.environ["HF_HOME"] = str(CACHE_DIR)
 os.environ["HF_HUB_CACHE"] = str(HUB_CACHE_DIR)
 os.environ["NEMO_CACHE_DIR"] = str(NEMO_CACHE_DIR)
 
-# 首次启动允许联网下载模型；下载完成后想强制离线运行，可以手动把这一行
-# 改成 "1"（与 qwen3_server.py 的 HF_HUB_OFFLINE 用法一致）。
-os.environ.setdefault("HF_HUB_OFFLINE", "0")
+# HF_HUB_OFFLINE / HF_ENDPOINT（镜像站）由设置页面统一管理，见 app_settings.py，
+# 与 qwen3_server.py / alt_aligners.py 共用同一份配置文件，保持三个进程行为一致。
+# 必须在下面 import nemo 相关模块之前完成设置。
+try:
+    from app_settings import apply_env_from_settings as _apply_hf_env_settings
+    _apply_hf_env_settings()
+except Exception as _settings_err:
+    logger.warning(f"⚠️  读取模型下载设置失败（{_settings_err}），回退到默认联网模式")
+    os.environ.setdefault("HF_HUB_OFFLINE", "0")
 
 logger.info(f"HF_HOME = {os.environ['HF_HOME']}")
 logger.info(f"HF_HUB_CACHE = {os.environ['HF_HUB_CACHE']}")
